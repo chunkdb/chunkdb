@@ -158,11 +158,13 @@ class Reader {
         }
         return value;
     }
-    [[nodiscard]] std::string ShortString() {
+    [[nodiscard]] std::string_view ShortString() {
         const std::uint16_t size = U16();
         const auto* data = Take(size);
-        return std::string(reinterpret_cast<const char*>(data), size);
+        return {reinterpret_cast<const char*>(data), size};
     }
+    [[nodiscard]] std::uint32_t Offset() const noexcept { return static_cast<std::uint32_t>(at_); }
+    [[nodiscard]] std::size_t Remaining() const noexcept { return end_ - at_; }
     [[nodiscard]] bool AtEnd() const noexcept { return at_ == end_; }
 
   private:
@@ -305,7 +307,25 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
     return out;
 }
 
-Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
+namespace {
+
+// Validation needs duplicate detection, but no copy of the users or grants.
+// Offsets refer to checked, length-prefixed names in the original image.
+static_assert(kMaxUsersFileBytes <= std::numeric_limits<std::uint32_t>::max());
+void RequireUniqueNames(const std::vector<std::uint8_t>& bytes, std::vector<std::uint32_t>& offsets,
+                        std::string_view description) {
+    const auto name_at = [&](std::uint32_t at) {
+        const auto size = ReadLe16(bytes, at);
+        return std::string_view(reinterpret_cast<const char*>(bytes.data() + at + 2U), size);
+    };
+    const auto less = [&](std::uint32_t lhs, std::uint32_t rhs) { return name_at(lhs) < name_at(rhs); };
+    if (!std::is_sorted(offsets.begin(), offsets.end(), less)) std::sort(offsets.begin(), offsets.end(), less);
+    if (std::adjacent_find(offsets.begin(), offsets.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) { return name_at(lhs) == name_at(rhs); }) != offsets.end())
+        throw std::invalid_argument("chunkdb.users repeats " + std::string(description));
+}
+
+Users ParseUsers(const std::vector<std::uint8_t>& bytes, bool materialize) {
     if (bytes.size() > kMaxUsersFileBytes) {
         throw std::invalid_argument("chunkdb.users is larger than " + std::to_string(kMaxUsersFileBytes) + " bytes");
     }
@@ -333,8 +353,16 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
     Users users;
     std::copy_n(reader.Take(users.secret.size()), users.secret.size(), users.secret.begin());
     const std::uint32_t count = reader.U32();
+    constexpr std::size_t kLimitsBytes = 16U;
+    constexpr std::size_t kMinUserBytes = 3U + 1U + 4U + 2U + scram::kMinSaltBytes + 64U + 4U + kLimitsBytes;
+    // Minimum valid record sizes bound the scratch space. Check fields in
+    // order so a short but fully encoded invalid name still gets its own error.
+    const auto user_slots = materialize ? 0U : std::min<std::size_t>(count, reader.Remaining() / kMinUserBytes);
+    std::vector<std::uint32_t> user_names;
+    if (!materialize) user_names.reserve(user_slots);
     for (std::uint32_t i = 0; i < count; ++i) {
-        std::string name = reader.ShortString();
+        const auto user_offset = reader.Offset();
+        const std::string name(reader.ShortString());
         if (!IsValidUserName(name)) {
             throw std::invalid_argument("chunkdb.users has an invalid user name");
         }
@@ -362,7 +390,9 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
                 "-byte verifier salt, outside " + SaltBounds());
         }
         const auto* salt = reader.Take(salt_size);
-        user.verifier.salt.assign(salt, salt + salt_size);
+        // Both verifiers share this checked salt. Validation only needs
+        // their keys to detect duplicate verifiers.
+        if (materialize) user.verifier.salt.assign(salt, salt + salt_size);
         std::copy_n(reader.Take(32), 32, user.verifier.stored_key.begin());
         std::copy_n(reader.Take(32), 32, user.verifier.server_key.begin());
         if (version >= kVersion) {
@@ -382,8 +412,18 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
             }
         }
         const std::uint32_t grants = reader.U32();
+        std::size_t grant_slots = 0U;
+        std::vector<std::uint32_t> grant_names;
+        if (!materialize) {
+            constexpr std::size_t kMinGrantBytes = 4U; // length, one name byte and right
+            // Both offset arrays together use at most the input image size.
+            const auto remaining_slots = bytes.size() / sizeof(std::uint32_t) - user_slots;
+            grant_slots = std::min<std::size_t>({grants, reader.Remaining() / kMinGrantBytes, remaining_slots});
+            grant_names.reserve(grant_slots);
+        }
         for (std::uint32_t g = 0; g < grants; ++g) {
-            std::string table = reader.ShortString();
+            const auto grant_offset = reader.Offset();
+            auto table = reader.ShortString();
             if (!IsValidGrantTable(table) || (version < kVersion && IsPrefixGrant(table))) {
                 throw std::invalid_argument(
                     "chunkdb.users grants user " + name + " a right on an invalid table name");
@@ -392,26 +432,46 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
             if (right < static_cast<std::uint8_t>(Right::kRead) || right > static_cast<std::uint8_t>(Right::kAdmin)) {
                 throw std::invalid_argument("chunkdb.users has an unknown right for user " + name);
             }
-            const bool prefix = IsPrefixGrant(table);
-            if (prefix) table.pop_back();
-            if (!(prefix ? user.prefix_grants : user.grants).emplace(std::move(table), static_cast<Right>(right)).second) {
-                throw std::invalid_argument("chunkdb.users repeats a grant of user " + name);
+            if (materialize) {
+                const bool prefix = IsPrefixGrant(table);
+                if (prefix) table.remove_suffix(1U);
+                if (!(prefix ? user.prefix_grants : user.grants).emplace(table, static_cast<Right>(right)).second)
+                    throw std::invalid_argument("chunkdb.users repeats a grant of user " + name);
+            } else {
+                if (grant_names.size() == grant_slots) throw std::invalid_argument("chunkdb.users is truncated");
+                grant_names.push_back(grant_offset);
             }
         }
+        if (!materialize && !grant_names.empty()) RequireUniqueNames(bytes, grant_names, "a grant of user " + name);
         user.max_connections = reader.U64();
         user.statements_per_sec = reader.U64();
         ValidateLimits(user);
-        if (!users.users.emplace(name, std::move(user)).second) {
-            throw std::invalid_argument("chunkdb.users repeats user " + name);
+        if (materialize) {
+            if (!users.users.emplace(name, std::move(user)).second)
+                throw std::invalid_argument("chunkdb.users repeats user " + name);
+        } else {
+            // A complete valid record accounts for one reserved user slot.
+            user_names.push_back(user_offset);
         }
     }
     if (!reader.AtEnd()) {
         throw std::invalid_argument("chunkdb.users has bytes after its users");
     }
+    if (!materialize) RequireUniqueNames(bytes, user_names, "user");
     return users;
 }
 
-std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
+}  // namespace
+
+Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
+    return ParseUsers(bytes, true);
+}
+
+void ValidateUsersImage(const std::vector<std::uint8_t>& bytes) {
+    (void)ParseUsers(bytes, false);
+}
+
+std::optional<std::vector<std::uint8_t>> ReadUsersFileImage(const std::filesystem::path& data_dir) {
     const auto path = data_dir / kUsersFileName;
     if (!std::filesystem::exists(path)) {
         return std::nullopt;
@@ -420,7 +480,13 @@ std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
     if (std::filesystem::file_size(path) > kMaxUsersFileBytes) {
         throw std::invalid_argument("chunkdb.users is larger than " + std::to_string(kMaxUsersFileBytes) + " bytes");
     }
-    return DecodeUsers(LoadFile(path));
+    return LoadFile(path);
+}
+
+std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
+    const auto image = ReadUsersFileImage(data_dir);
+    if (!image) return std::nullopt;
+    return DecodeUsers(*image);
 }
 
 void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users, bool* out_replaced) {

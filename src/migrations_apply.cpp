@@ -18,8 +18,7 @@ void Crash(const char* key) {
 void ApplyFile(const std::filesystem::path& root, const MigrationFileChange& file, std::size_t index) {
     const auto prefix = "CHUNKDB_FAILPOINT_CRASH_MIGRATION_FILE_" + std::to_string(index);
     Crash((prefix + "_BEFORE_PUBLISH_ONCE").c_str());
-    // Each replacement is atomic and synced. No filesystem mutation occurs
-    // before CompleteMigrationJournal has validated every participant.
+    // Each replacement is atomic and synced, after validation of every participant.
     const auto sync_failure = "CHUNKDB_FAILPOINT_MIGRATION_FILE_" + std::to_string(index) + "_SYNC_FAIL_ONCE";
     // A migration that changes grants republishes chunkdb.users, which keeps
     // the owner-only mode WriteUsersFile gives it.
@@ -30,8 +29,26 @@ void ApplyFile(const std::filesystem::path& root, const MigrationFileChange& fil
 
 }  // namespace
 
-void CompleteMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
-    ValidateMigrationJournal(root, journal);
+void DiscardCatalogOperation(const std::filesystem::path& root) {
+    std::error_code ec;
+    std::filesystem::remove(root / kMigrationPendingFileName, ec);
+    if (ec) throw std::runtime_error("cannot remove " + (root / kMigrationPendingFileName).string() + ": " + ec.message());
+    SyncDirectoryPath(root);
+}
+
+namespace {
+
+void ApplyValidatedJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
+    if (journal.catalog_operation) {
+        // The directory move decided the operation; only the users file is left.
+        if (!CatalogOperationMoved(root, journal)) throw std::logic_error("catalog operation completed before its move");
+        for (std::size_t i = 0; i < journal.files.size(); ++i) ApplyFile(root, journal.files[i], i);
+        Crash("CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_PENDING_REMOVE_ONCE");
+        if (!std::filesystem::remove(root / kMigrationPendingFileName))
+            throw std::runtime_error("catalog operation journal disappeared before completion");
+        SyncDirectoryPath(root);
+        return;
+    }
     std::size_t first = 0;
     // DROP's version floor must be durable before removing the live name.
     if (journal.files.front().path == kDataDirManifestFileName) {
@@ -63,15 +80,37 @@ void CompleteMigrationJournal(const std::filesystem::path& root, const Migration
     Crash("CHUNKDB_FAILPOINT_CRASH_MIGRATION_AFTER_PENDING_REMOVE_ONCE");
 }
 
+}  // namespace
+
+void CompleteMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
+    ValidateMigrationJournal(root, journal);
+    ApplyValidatedJournal(root, journal);
+}
+
 void RecoverMigrations(const std::filesystem::path& root, AccessMode access_mode) {
     (void)ReadMigrationRecords(root);
     if (const auto journal = ReadMigrationJournal(root)) {
         ValidateMigrationJournal(root, *journal);
         if (access_mode == AccessMode::kReadOnly)
             throw std::runtime_error(
-                "the data directory needs recovery: a decided migration has not finished; a running writer may "
+                std::string("the data directory needs recovery: a ") +
+                (journal->catalog_operation ? "DROP TABLE or RENAME TO" : "decided migration") +
+                " has not finished; a running writer may "
                 "be finishing it, so try again, and with no writer running open it read-write once to recover it");
-        CompleteMigrationJournal(root, *journal);
+        // A catalog operation whose directory move did not happen changed
+        // nothing: its table keeps its name and grants.
+        if (journal->catalog_operation && !CatalogOperationMoved(root, *journal)) {
+            DiscardCatalogOperation(root);
+        } else {
+            if (journal->catalog_operation) {
+                // A process restart can see a move that was never synced.
+                // Make it durable before writing the grants or removing the journal.
+                SyncDirectoryPath(root / "tables");
+                if (journal->directory_action == MigrationDirectoryAction::kDrop)
+                    SyncDirectoryPath(root / ".chunkdb.dropped");
+            }
+            ApplyValidatedJournal(root, *journal);
+        }
     }
     if (access_mode == AccessMode::kReadWrite) {
         CleanupAtomicTmpArtifacts(root / kMigrationPendingFileName);

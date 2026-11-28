@@ -124,8 +124,12 @@ void RequireAddableVerifier(const scram::Verifier& verifier, const scram::Verifi
 // unknown file, or a user name, grant table name, iteration count or salt
 // length outside what CREATE USER, ALTER USER and GRANT accept.
 [[nodiscard]] Users DecodeUsers(const std::vector<std::uint8_t>& bytes);
+// Checks the same format and duplicates without building a users registry.
+void ValidateUsersImage(const std::vector<std::uint8_t>& bytes);
 
-// std::nullopt when the file does not exist.
+// The exact bytes for journaling, bounded by kMaxUsersFileBytes and not decoded.
+// Both readers return std::nullopt when the file does not exist.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadUsersFileImage(const std::filesystem::path& data_dir);
 [[nodiscard]] std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir);
 // Replaces the file atomically, the file and its directory synced: a crash
 // leaves the old or the new file.

@@ -1173,7 +1173,9 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             if (const auto journal = chunkdb::ReadMigrationJournal(data_dir)) {
                 chunkdb::ValidateMigrationJournal(data_dir, *journal);
                 Report(counters, false, "migration_recovery_pending", data_dir / chunkdb::kMigrationPendingFileName,
-                       "migration '" + journal->record.name + "' requires a writer start to finish publication");
+                       (journal->catalog_operation ? "DROP TABLE or RENAME TO of table '" + journal->table + "'"
+                                                   : "migration '" + journal->record.name + "'") +
+                           " requires a writer start to finish publication");
             }
         } catch (const std::exception& error) {
             Report(counters, true, "migration_pending_invalid", data_dir / chunkdb::kMigrationPendingFileName, error.what());
@@ -1209,7 +1211,9 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             try {
                 if (!std::filesystem::is_regular_file(entry.symlink_status()))
                     throw std::runtime_error("users record is not a regular file");
-                (void)chunkdb::DecodeUsers(chunkdb::LoadFile(entry.path()));
+                const auto image = chunkdb::ReadUsersFileImage(data_dir);
+                if (!image) throw std::runtime_error("users record disappeared");
+                chunkdb::ValidateUsersImage(*image);
             } catch (const std::exception& error) {
                 Report(counters, true, "users_invalid", entry.path(), error.what());
             }

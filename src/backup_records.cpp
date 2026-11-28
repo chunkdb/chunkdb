@@ -672,9 +672,14 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (!completing && (Present(root / kRestoreIncompleteName) || Present(root / kBackupIncompleteName)))
         throw std::runtime_error("backup publication is incomplete");
     std::set<std::string> expected_files, expected_dirs{"tables"};
+    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
     for (const auto& table : record.tables) expected_dirs.insert("tables/" + table.name);
     for (const auto& file : record.files) {
         const auto relative = file.relative_path.generic_string();
+        // Reject unrecognized root artifacts before opening any of them.
+        // The root owner, if present, is checked against the manifest below.
+        if (!file.relative_path.has_parent_path() && !allowed.contains(relative) && relative != "chunkdb.groups.owner")
+            throw std::runtime_error("unknown backup inventory artifact: " + relative);
         expected_files.insert(relative);
         auto parent = file.relative_path.parent_path();
         while (!parent.empty()) { expected_dirs.insert(parent.generic_string()); parent = parent.parent_path(); }
@@ -700,7 +705,6 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     const auto directory_manifest = ReadDataDirManifest(root);
     if (!directory_manifest) throw std::runtime_error("backup data-directory manifest is missing");
     RequireOpenableFeatures(directory_manifest->features, AccessMode::kReadOnly);
-    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
     if (directory_manifest->commit_owner) {
         (void)CommitOwnerBootstrap::ReadInactiveRoot(root, *directory_manifest->commit_owner);
         allowed.insert("chunkdb.groups.owner");
@@ -717,7 +721,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         if (actual.size != file.size || actual.crc32 != file.crc32)
             throw std::runtime_error("backup inventory checksum or length mismatch: " + file.relative_path.generic_string());
     }
-    if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
+    if (const auto users = ReadUsersFileImage(root)) ValidateUsersImage(*users);
     (void)ReadMigrationRecords(root);
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);

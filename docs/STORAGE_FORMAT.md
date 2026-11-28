@@ -29,7 +29,7 @@ data_dir/
   chunkdb.manifest                    data-directory identity, features, version floor
   chunkdb.users                       user verifiers and grants, when authentication is configured
   chunkdb.migrations                  completed named migration records, when present
-  chunkdb.migration.pending           decided migration awaiting completion, when present
+  chunkdb.migration.pending           decided migration, or DROP TABLE or RENAME TO grant change, awaiting completion, when present
   chunkdb.groups.owner                commit owner root, initially INACTIVE
   chunkdb.bootstrap.pending           creation decision, until creation completes
   .chunkdb.lock/                      writer-process lock
@@ -595,7 +595,7 @@ Times are positive and fit a signed protocol integer; record order is append ord
 Statements are nonempty UTF-8, at most 65536 bytes, without CR/LF/NUL; completed-ledger decoding validates bytes without reparsing them as current CQL.
 MIGRATE preserves keyword case and interior whitespace after trimming its separator and trailing spaces/tabs, and requires one supported schema statement without parameter frames.
 
-`data_dir/chunkdb.migration.pending` is the durable redo decision, at most 64 MiB:
+`data_dir/chunkdb.migration.pending` stores the version-1 durable redo decision, at most 64 MiB:
 
 1. `CKMJ`, version `1:u16`, reserved zero `u16`, data-directory ID (16 bytes), one record encoded as above.
 2. Directory action `u8` (0 none, 1 create, 2 drop), table length `u32` and name, table StoreId (16 bytes), operation-name length `u32` and name.
@@ -624,6 +624,25 @@ Writer recovery validates every participant before changing any.
 
 Current bytes must equal before or after bytes, and prepared CREATE must match its image.
 A directory move must have exactly one expected identity at its two names.
+
+DROP TABLE and ALTER TABLE ... RENAME TO outside MIGRATE use format version 2 for the grant change, written only when the users file holds grants the change alters:
+
+1. `CKMJ`, version `2:u16`, reserved zero `u16`, data-directory ID (16 bytes); no record.
+2. Directory action `u8` (2 drop, 3 rename), table length `u32` and name, table StoreId (16 bytes), operation-name length `u32` and name: `<table>.<16 lowercase hex digits>` under `.chunkdb.dropped/` for a drop, the new table name for a rename.
+3. Participant count `u32` (0 or 1): only `chunkdb.users`, with its before-image, encoded as in version 1 with each image bounded by the users-file limit of 64 MiB.
+4. CRC32 over all preceding bytes.
+
+It needs no `migrations` feature and has no ledger. A build that reads only version 1 refuses it and does not open the directory.
+The maximum version-2 record size is twice the users-file limit plus the maximum encoded record metadata, including the checksum.
+Readers check the version-specific file bound and reject image lengths that exceed the users-file limit or the remaining record bytes before allocating an image.
+The journal is synced before the directory move, and the move, not the journal, commits the operation; the table directory and the moved name must hold exactly one table of the journal's identity.
+That table's manifest must also match the data directory's commit-owner scope.
+After the move and its directory sync, the server publishes the grants to any live users registry, writes the users file and removes the journal.
+If the move was refused, the server removes the journal.
+A failure to remove the journal, an indeterminate move or a failure to complete the grants after the move fences the catalog until restart.
+Writer recovery removes a version-2 journal whose `tables/<table>` still holds the journal's table identity.
+If the moved name holds the journal's table identity, recovery syncs the affected parent directories before it publishes grants and removes the journal.
+This also applies when a table of another identity has the old name, and completes before interrupted drops are removed.
 Recovery redoes exact images rather than executing statement text; read-only and multi-process opening refuse pending recovery.
 Malformed, foreign, or inconsistent journal state refuses opening without partial completion.
 

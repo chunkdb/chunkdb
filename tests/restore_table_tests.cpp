@@ -1,10 +1,12 @@
 // RESTORE TABLE into a running catalog, SWAP TABLES and ALTER TABLE ... RENAME
 // TO (docs/design/RESTORE_TABLE.md).
 #include <algorithm>
+#include <new>
 #include <stop_token>
 
 #include "feed_slots.hpp"
 #include "feature_flags.hpp"
+#include "migrations_records.hpp"
 #include "restore_table_test_utils.hpp"
 #include "statement_control.hpp"
 #include "txn_test_utils.hpp"
@@ -111,6 +113,108 @@ void RestoreKeepsOwnerStableDuringRewrite() {
     const auto table = catalog.Require(request.name);
     assert(table->store_id() == restored.epoch);
     assert(table->Acquire()->store().GetBlockBits(8, 0) == "00000011");
+}
+
+// DROP TABLE and RENAME TO whose grants cannot be written after the move:
+// the users in memory already follow the change, the catalog refuses
+// statements, and the next start writes the grants (#306).
+void GrantWriteFailures() {
+    for (const bool rename : {false, true}) {
+        Source source;
+        {
+            TableCatalog catalog(source.Config());
+            const auto users = OpenUsers(source.data);
+            users->Grant("admin", "t", Right::kWrite);
+            {
+                txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_CATALOG_GRANTS_WRITE_FAIL_ONCE", "1");
+                Throws([&] {
+                    if (rename) catalog.RenameTable("t", "t_old", users.get());
+                    else catalog.Drop("t", users.get(), false);
+                });
+            }
+            assert(!users->Find("admin")->grants.contains("t"));
+            assert(GrantOn(source.data, "t") == Right::kWrite && std::filesystem::exists(source.data / "chunkdb.migration.pending"));
+            Throws<MigrationRecoveryRequiredError>([&] { (void)catalog.Migrations(); });
+        }
+        TableCatalog catalog(source.Config());
+        assert(!std::filesystem::exists(source.data / "chunkdb.migration.pending"));
+        assert(!GrantOn(source.data, "t") && (catalog.Find("t") == nullptr));
+        if (rename) {
+            assert(catalog.Require("t_old")->store_id() == source.epoch && GrantOn(source.data, "t_old") == Right::kWrite);
+        } else {
+            assert(catalog.TableCount() == 0U);
+        }
+    }
+}
+
+// A refused rename whose grant journal cannot be removed, and a rename whose
+// move reports an error after it took effect, fence the catalog: the next
+// start removes the journal of the table still in place, or completes the
+// one of the table under its new name (#306).
+void GrantJournalRefusals() {
+    const auto pending = [](const Source& source) { return std::filesystem::exists(source.data / "chunkdb.migration.pending"); };
+    for (const bool moved : {false, true}) {
+        Source source;
+        {
+            TableCatalog catalog(source.Config());
+            const auto users = OpenUsers(source.data);
+            users->Grant("admin", "t", Right::kWrite);
+            {
+                txn_test::ScopedEnv move(moved ? "CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_AFTER_RENAME_ONCE"
+                                               : "CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE", "1");
+                txn_test::ScopedEnv discard("CHUNKDB_FAILPOINT_CATALOG_JOURNAL_DISCARD_FAIL_ONCE", "1");
+                Throws([&] { catalog.RenameTable("t", "t_old", users.get()); });
+            }
+            assert(pending(source));
+            Throws<MigrationRecoveryRequiredError>([&] { (void)catalog.Migrations(); });
+            Throws<MigrationRecoveryRequiredError>([&] { catalog.RecoverTable(moved ? "t_old" : "t"); });
+        }
+        TableCatalog catalog(source.Config());
+        assert(!pending(source));
+        const std::string name = moved ? "t_old" : "t", other = moved ? "t" : "t_old";
+        assert(catalog.Require(name)->store_id() == source.epoch && catalog.Find(other) == nullptr);
+        assert(GrantOn(source.data, name) == Right::kWrite && !GrantOn(source.data, other));
+    }
+}
+
+void SharedWriterRefusesGrantJournal() {
+    test::ScopedTempDir directory("chunkdb-shared-grant-journal");
+    CatalogConfig config;
+    config.data_dir = directory.path();
+    config.allow_multiple_processes = true;
+    TableCatalog catalog(config);
+    const auto table = catalog.Create("t", GeometryConfig{}, catalog.default_options());
+    const auto users = OpenUsers(config.data_dir);
+    users->Grant("admin", "t", Right::kWrite);
+    for (const bool rename : {false, true}) {
+        const auto error = Throws<std::invalid_argument>([&] {
+            if (rename) catalog.RenameTable("t", "t_old", users.get());
+            else catalog.Drop("t", users.get(), false);
+        });
+        assert(error.find("single-process catalog") != std::string::npos);
+        assert(catalog.Find("t") == table && catalog.Find("t_old") == nullptr);
+        assert(GrantOn(config.data_dir, "t") == Right::kWrite);
+        assert(!ReadMigrationJournal(config.data_dir));
+    }
+}
+
+void DropGrantPreparationAllocationFailure() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto users = OpenUsers(source.data);
+    users->Grant("admin", "t", Right::kWrite);
+    struct FailAfterPublication final : MigrationTestHook {
+        void Run(Point point, std::string_view) override {
+            if (point == Point::kPrepared) throw std::bad_alloc();
+        }
+    } hook;
+    catalog.SetMigrationTestHook(&hook);
+    Throws<std::bad_alloc>([&] { catalog.Drop("t", users.get(), false); });
+    catalog.SetMigrationTestHook(nullptr);
+    assert(!ReadMigrationJournal(source.data));
+    assert(GrantOn(source.data, "t") == Right::kWrite);
+    (void)catalog.Migrations();
+    assert(catalog.Fences().empty() && catalog.Require("t")->store_id() == source.epoch);
 }
 
 void LeavesNothingAfterRefusal(const Source& source, TableCatalog& catalog) {
@@ -666,6 +770,15 @@ void RenameRefusals() {
     std::filesystem::create_directory(source.data / "tables" / "squatted");
     assert(Throws<TableExistsError>([&] { catalog.RenameTable("t", "squatted", nullptr); }).find("not a table this server opened") !=
            std::string::npos);
+    {
+        const auto users = OpenUsers(source.data);
+        users->Grant("admin", "t", Right::kWrite);
+        assert(Throws<TableExistsError>([&] { catalog.RenameTable("t", "squatted", users.get()); })
+                   .find("not a table this server opened") != std::string::npos);
+        assert(!ReadMigrationJournal(source.data));
+        assert(GrantOn(source.data, "t") == Right::kWrite && !GrantOn(source.data, "squatted"));
+        users->Revoke("admin", "t", Right::kWrite);
+    }
     std::filesystem::remove(source.data / "tables" / "squatted");
     {
         // A rename that fails serves the table again under its name.
@@ -738,6 +851,10 @@ int main() {
     RenamesTable();
     RenameRefusals();
     RenameStatementStops();
+    GrantWriteFailures();
+    GrantJournalRefusals();
+    SharedWriterRefusesGrantJournal();
+    DropGrantPreparationAllocationFailure();
     if (kAtomicExchange) {
         SwapsNames();
         SwapSurvivesRestart();

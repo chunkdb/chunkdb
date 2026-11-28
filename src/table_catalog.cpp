@@ -1170,7 +1170,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     }
     config_.data_dir = std::filesystem::weakly_canonical(config_.data_dir);
     // Read-only admission must precede any writer-lock or recovery records.
-    (void)ReadUsersFile(config_.data_dir);
+    if (const auto users = ReadUsersFileImage(config_.data_dir)) ValidateUsersImage(*users);
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
@@ -1958,9 +1958,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     return table;
 }
 
-void TableCatalog::MoveToDropped(const std::filesystem::path& dir, const std::string& name) {
+void TableCatalog::MoveToDropped(const std::filesystem::path& dir, const std::string& name, const std::string& operation,
+    bool remove_tree) {
     EnsureDirectoryPathExists(DroppedDir(), /*durable_sync=*/true);
-    const auto dropped = DroppedDir() / UniqueOperationName(name);
+    const auto dropped = DroppedDir() / (operation.empty() ? UniqueOperationName(name) : operation);
     EnterStatementDecision();
     const auto moved = MoveDirectoryNoReplace(dir, dropped);
     if (moved) {
@@ -1972,7 +1973,108 @@ void TableCatalog::MoveToDropped(const std::filesystem::path& dir, const std::st
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_TABLE_DROP_AFTER_RENAME_ONCE");
     SyncDirectoryPath(TablesDir());
     SyncDirectoryPath(DroppedDir());
-    RemoveDroppedTree(dropped);
+    if (remove_tree) RemoveDroppedTree(dropped);
+}
+
+struct TableCatalog::GrantJournal {
+    explicit GrantJournal(UserRegistry* registry) noexcept : users(registry), wakes(registry) {}
+    UserRegistry* users;
+    // Declared before `lock`: runs the users' OnChange once it is released.
+    UserRegistry::Wakes wakes;
+    std::unique_lock<StatementMutex> lock;
+    MigrationJournal journal;
+    Users next;
+    UserPublication publication;
+};
+
+std::shared_ptr<TableCatalog::GrantJournal> TableCatalog::PrepareGrantJournal(UserRegistry* users, const Table& table,
+    bool rename, const std::string& operation, const std::function<bool(Users&)>& change) {
+    std::shared_ptr<GrantJournal> prepared;
+    if (users) {
+        if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
+            throw std::invalid_argument("the users belong to another data directory");
+        prepared = std::make_shared<GrantJournal>(users);
+        // As MIGRATE, keep the registry locked until publication or refusal.
+        prepared->lock = std::unique_lock(users->mutex_);
+        if (users->migration_health_) users->migration_health_->Check();
+        users->ConfirmPublication();
+        users->migration_health_ = migration_health_;
+    }
+    // The on-disk grants still follow their tables while authentication is disabled.
+    auto before = ReadUsersFileImage(config_.data_dir);
+    if (!before) return nullptr;
+    auto next = DecodeUsers(*before);
+    if (users && users->users_ != next)
+        users->CommitPublication(next, users->PreparePublication(std::make_shared<const Users>(next)), prepared->wakes);
+    if (!change(next)) return nullptr;
+    if (config_.allow_multiple_processes)
+        throw std::invalid_argument("changing table grants requires a single-process catalog");
+    if (!prepared) prepared = std::make_shared<GrantJournal>(nullptr);
+    const auto root = ReadDataDirManifest(config_.data_dir);
+    if (!root) throw std::runtime_error("data directory manifest disappeared");
+    auto& journal = prepared->journal;
+    journal.catalog_operation = true;
+    journal.data_dir_id = root->data_dir_id;
+    journal.directory_action = rename ? MigrationDirectoryAction::kRename : MigrationDirectoryAction::kDrop;
+    journal.table = table.name_;
+    journal.table_id = table.store_id_;
+    journal.operation_name = operation;
+    journal.files.push_back({std::string(kUsersFileName), std::move(before), EncodeUsers(next)});
+    if (users) {
+        // Built before the move, so publishing the users cannot fail after it.
+        prepared->publication = users->PreparePublication(std::make_shared<const Users>(next));
+        prepared->next = std::move(next);
+    }
+    return prepared;
+}
+
+void TableCatalog::WriteGrantJournal(GrantJournal& prepared) {
+    ValidateMigrationJournal(config_.data_dir, prepared.journal);
+    bool published = false;
+    try {
+        WriteMigrationJournal(config_.data_dir, prepared.journal, &published);
+        if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+            hook->Run(MigrationTestHook::Point::kPrepared, prepared.journal.table);
+    } catch (const std::exception&) {
+        if (published) DiscardGrantJournal(prepared);
+        throw;
+    }
+}
+
+void TableCatalog::DiscardGrantJournal(GrantJournal& prepared) noexcept {
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CATALOG_JOURNAL_DISCARD_FAIL_ONCE"))
+            throw std::runtime_error("injected failure removing a grant journal");
+        DiscardCatalogOperation(config_.data_dir);
+    } catch (const std::exception& error) {
+        // A journal left behind would be taken for the next decision: the
+        // catalog refuses statements until the restart that removes it.
+        migration_health_->failed.store(true, std::memory_order_release);
+        try {
+            LogMessage(LogLevel::kError, LogComponent::kStore,
+                "the grant journal of a table that kept its name could not be removed; the catalog refuses statements "
+                "until a restart removes it",
+                {{"table", prepared.journal.table}, {"error", error.what()}});
+        } catch (...) {
+        }
+    }
+}
+
+void TableCatalog::CompleteGrantJournal(GrantJournal& prepared) {
+    // The move is durable and the journal holds the change: memory follows
+    // it now, so no statement sees the grants of the old name again.
+    if (prepared.users)
+        prepared.users->CommitPublication(std::move(prepared.next), std::move(prepared.publication), prepared.wakes);
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CATALOG_GRANTS_WRITE_FAIL_ONCE"))
+            throw std::runtime_error("injected failure writing the grants of a dropped or renamed table");
+        CompleteMigrationJournal(config_.data_dir, prepared.journal);
+    } catch (...) {
+        // As after a decided migration: until a restart completes the journal,
+        // the catalog refuses statements.
+        migration_health_->failed.store(true, std::memory_order_release);
+        throw;
+    }
 }
 
 void TableCatalog::RemoveDroppedTree(const std::filesystem::path& dropped) noexcept {
@@ -2075,32 +2177,52 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
     // commands on it would wait forever. Unless it is served again or gone,
     // it is fenced, with a fence made now, while a failure still serves it.
     auto fence = PrepareFence(table, table->name_, kFenceDropUnknown);
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     // A table created later under this name must not issue this table's
     // tokens again: the data directory keeps a floor above all of them,
     // durably before the drop. Failing here fails the drop.
     RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
+    // The grant removal is part of the drop: journaled before the move that
+    // commits both, it is completed by this statement or by the next writer
+    // start, and dropped with the journal when the move does not happen.
+    // Inside catalog admission, so a statement creating or granting the same
+    // name follows the whole drop.
+    const auto operation = UniqueOperationName(table->name_);
+    const auto grants = PrepareGrantJournal(users, *table, /*rename=*/false, operation, [&](Users& next) {
+        bool changed = false;
+        for (auto& [_, user] : next.users) {
+            if (user.grants.erase(table->name_) != 0U) changed = true;
+        }
+        return changed;
+    });
+    if (grants) WriteGrantJournal(*grants);
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_TABLE_DROP_AFTER_JOURNAL_ONCE");
     admission.Dismiss();
     bool gone = false;
     ScopeExit retire([&] {
         if (gone) RetireTable(*table, options);
         else FenceTable(*table, options, std::move(fence));
     });
-    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE")) {
             throw std::runtime_error("injected failure before moving a dropped table");
         }
-        MoveToDropped(table->dir_, table->name_);
+        MoveToDropped(table->dir_, table->name_, operation, /*remove_tree=*/grants == nullptr);
     } catch (const std::exception& e) {
         std::error_code status_ec;
         const bool in_place = std::filesystem::exists(table->dir_, status_ec);
         if (status_ec) {
-            throw;  // state unknown: fenced until recovered
+            // State unknown: fenced until recovered. A grant journal waits
+            // for the restart that decides it by the directory.
+            if (grants) migration_health_->failed.store(true, std::memory_order_release);
+            throw;
         }
         if (in_place) {
-            // Still in place: serve it again and report the failure.
+            // Still in place: serve it again, with its grants, and report the
+            // failure.
+            if (grants) DiscardGrantJournal(*grants);
             try {
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_DROP_REOPEN_FAIL_ONCE"))
                     throw std::runtime_error("injected failure reopening a table that was not dropped");
@@ -2120,17 +2242,21 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
             throw;
         }
         // Moved out, but a later step (directory sync) failed: the table is
-        // gone from this server; the failure is still reported.
+        // gone from this server; the failure is still reported. A crash could
+        // still undo the move, so a grant journal waits for the restart that
+        // decides it by the directory.
         gone = true;
+        if (grants) migration_health_->failed.store(true, std::memory_order_release);
         throw std::runtime_error(
             "table '" + table->name_ + "' was removed but the change may not be durable: " +
             e.what());
     }
     retire.Dismiss();
     RetireTable(*table, options);
-    // Keep grant cleanup inside catalog admission: a migration creating or
-    // granting the same name must follow the entire DROP operation.
-    if (users) users->ForgetTable(table->name_);
+    if (grants) {
+        CompleteGrantJournal(*grants);
+        RemoveDroppedTree(DroppedDir() / operation);
+    }
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,

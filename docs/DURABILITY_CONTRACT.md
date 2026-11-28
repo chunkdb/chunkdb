@@ -18,7 +18,8 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
 | RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |
 | SWAP TABLES | Writes acknowledged before it are durable, and both names are exchanged durably. |
-| ALTER TABLE ... RENAME TO | Writes acknowledged before it are durable, and the table is renamed durably; after a crash it has one of the two names. |
+| ALTER TABLE ... RENAME TO | Writes acknowledged before it are durable, and the table is renamed durably; after a crash it has one of the two names, with the grants on that name. |
+| DROP TABLE | The table and the grants on its name are gone durably; after a crash either both remain or neither does. |
 
 The **WAL**, or write-ahead log, records changes used during recovery.
 A **checkpoint** saves a chunk image so recovery can discard earlier log records safely.
@@ -67,6 +68,8 @@ A failed rollback also requires that recovery before durability-changing operati
 
 Named migrations use a durable decision containing their metadata change and completion record.
 After an unknown migration outcome, restart and retry the same name and text.
+DROP TABLE and RENAME TO journal their grant change before the directory move that commits them; writer recovery writes the grants when the move happened and drops the journal when it did not.
+When grants change, a failure after the move, or a failure to remove the journal after a refused move, refuses catalog commands until a restart completes or removes it.
 Checkpoint or collection failures do not silently weaken synced durability.
 Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 

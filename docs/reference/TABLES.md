@@ -193,7 +193,7 @@ A chunk with metadata differing from that baseline is populated even when it has
 
 At least one fixed-width column must remain.
 A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
-DROP TABLE deletes its data, durable slots, and table-specific grants.
+DROP TABLE deletes its data, durable slots, and table-specific grants together: after a crash either the table and its grants remain or neither does, and a table created later under the name gets none of them.
 It waits for a running backup to pin its tables and save their grants, so a backup holds the table with its grants or neither.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
 
@@ -212,10 +212,14 @@ CANCEL, KILL CONNECTION or a statement timeout stops it only before the rename.
 Open transactions on the table answer CONFLICT, and watches end with INTERNAL `watched table was renamed; watch it again`.
 A consumer watches the new name and resumes in the same epoch; slots keep their positions.
 GRANT and REVOKE wait for a running RENAME TO, so each applies before or after it.
-A crash during RENAME TO leaves the table under one of the two names; the grants then may name both, and REVOKE removes those no longer wanted.
-A failure to make the rename durable fences both names until RECOVER TABLE of each, and the grants may then name both too.
+A crash during RENAME TO leaves the table under one of the two names, with the grants on that name only.
+A failure to make the rename durable fences both names until RECOVER TABLE of each; when grants move with the table, the server instead refuses catalog statements until a restart, which keeps the grants with whichever name the table then has.
 A failure to open the renamed table fences the new name until RECOVER TABLE; the old name is free and keeps no grants.
 RENAME TO is not taken inside [MIGRATE](MIGRATIONS.md).
+
+DROP TABLE and RENAME TO update grants in an existing users file even when the server runs with `--auth none`.
+The grant journal holds both the old and new users files up to the usual 64 MiB users-file limit per image.
+If the resulting users file would exceed that limit, the statement is refused before the directory move.
 
 A failure that leaves a table out of service fences it, while other tables keep serving.
 Statements on that table return INTERNAL with the fenced message and its reason.
