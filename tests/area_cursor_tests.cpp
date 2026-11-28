@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -153,6 +154,54 @@ void ExactCountAdmission() {
     assert(!AreaRequestedExceeds({.first = {minimum, 0}, .last = {maximum - 1, 0}}, umaximum));
     assert(AreaRequestedExceeds({.first = {minimum, 0}, .last = {maximum, 0}}, umaximum));
 }
+
+// FirstAfter is the first enumerated cell after any key, inside or outside
+// the area, and SegmentEnd the last cell of the same y (2D) or z (3D) column.
+void SeeksMatchEnumeration() {
+    const std::vector<ChunkAreaSelector> areas{
+        {.dims = 2U, .first = {-2, 1, 0}, .last = {1, 3, 0}},
+        {.dims = 2U, .first = {0, 0, 0}, .around = true, .radius = 2},
+        {.dims = 3U, .first = {-1, 0, -1}, .last = {1, 2, 0}},
+        {.dims = 3U, .first = {1, -1, 0}, .around = true, .radius = 2},
+        {.dims = 2U, .first = {maximum - 1, maximum - 1, 0}, .last = {maximum, maximum, 0}},
+    };
+    for (const auto& area : areas) {
+        const AreaCursor cursor(area);
+        const auto cells = Collect(cursor);
+        std::vector<std::int64_t> axis, depth;
+        if (area.first.x > maximum - 8) {
+            for (std::int64_t value = maximum - 4;; ++value) {
+                axis.push_back(value);
+                if (value == maximum) break;
+            }
+        } else {
+            for (std::int64_t value = -5; value <= 4; ++value) axis.push_back(value);
+        }
+        for (std::int64_t value = area.dims == 3U ? -4 : -1; value <= (area.dims == 3U ? 4 : 1); ++value)
+            depth.push_back(value);
+        const auto keys = [&](auto&& visit) {
+            for (const auto x : axis)
+                for (const auto y : axis)
+                    for (const auto z : depth) visit(ChunkCoord{x, y, z});
+        };
+        ChunkCoord found;
+        assert(cursor.FirstAfter(false, {}, &found) && found == cells.front());
+        keys([&](const ChunkCoord& key) {
+            const auto next = std::upper_bound(cells.begin(), cells.end(), key);
+            const bool has = cursor.FirstAfter(true, key, &found);
+            assert(has == (next != cells.end()));
+            if (has) assert(found == *next);
+        });
+        for (auto at = cells.begin(); at != cells.end(); ++at) {
+            auto last = at;
+            while (std::next(last) != cells.end() && std::next(last)->x == at->x &&
+                   (area.dims == 2U || std::next(last)->y == at->y))
+                ++last;
+            assert(cursor.SegmentEnd(*at) == *last);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -160,4 +209,5 @@ int main() {
     ExtremeProgress();
     InvalidSelectors();
     ExactCountAdmission();
+    SeeksMatchEnumeration();
 }

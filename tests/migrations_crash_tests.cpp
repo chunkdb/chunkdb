@@ -44,7 +44,9 @@ const Operation kOperations[] = {
     {"noop_unit", "ALTER TABLE realm ADD COLUMN IF NOT EXISTS v u8; DROP SLOT IF EXISTS 'absent' ON realm", 1U, false},
     {"unit_alter", "ALTER TABLE realm ADD COLUMN a u8 NULL; ALTER TABLE realm RENAME COLUMN v TO renamed; ALTER TABLE realm SET checkpoint_updates = 64", 2U, false},
     {"unit_narrow", "ALTER TABLE realm ALTER COLUMN v TYPE u8; ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
-    {"unit_slot", "ALTER TABLE realm ADD COLUMN a u8 NULL; CREATE SLOT 'second' ON realm COLUMNS (a); GRANT WRITE ON realm TO limited", 4U, false},
+    {"unit_slot", "ALTER TABLE realm ADD COLUMN a u8 NULL; "
+                  "CREATE SLOT 'second' ON realm AREA 2 2 TO 3 3, AREA 0 0 TO 1 1 COLUMNS (a); "
+                  "GRANT WRITE ON realm TO limited", 4U, false},
     {"unit_create", "CREATE TABLE realm (v u16 REQUIRED) CHUNK 2 x 2 LARGE 1 x 1; ALTER TABLE realm ADD COLUMN a u8 NULL; GRANT WRITE ON realm TO limited", 4U, true},
     {"unit_check", "ALTER TABLE realm ADD CHECK (v < 100); ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
     {"unit_drop_null", "ALTER TABLE realm ALTER COLUMN extra DROP NULL; ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
@@ -135,8 +137,8 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         assert(ReadLe16(LoadFile(root / "tables/space" / kFeedSlotsFileName), 4U) == 4U);
         if (applied) {
             const auto& filters = slots[1].filters;
-            assert(slots[1].owner == "limited" && filters.chunks && filters.area && filters.area->dims == 3U);
-            assert(filters.area->first.z == -1 && filters.area->last.z == 1);
+            assert(slots[1].owner == "limited" && filters.chunks && filters.areas.size() == 1U && filters.areas[0].dims == 3U);
+            assert(filters.areas[0].first.z == -1 && filters.areas[0].last.z == 1);
         }
         auto lease = space->Acquire();
         assert(lease && lease->store().ReadChunkState(ChunkCoord{0, 0, -1}).written);
@@ -180,8 +182,10 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
             const auto slots = table->ListFeedSlots();
             assert(slots.size() == (applied ? 2U : 1U) && slots[0].name == "first");
             if (applied) {
-                assert(slots[1].name == "second" && slots[1].filters.column_ids && slots[1].filters.column_ids->size() == 1U);
-                assert(slots[1].filters.column_ids->front() == info.schema.columns[1].id);
+                const auto& filters = slots[1].filters;
+                assert(slots[1].name == "second" && filters.column_ids && filters.column_ids->size() == 1U);
+                assert(filters.column_ids->front() == info.schema.columns[1].id);
+                assert(filters.areas.size() == 2U && filters.areas[0].first.x == 0 && filters.areas[1].first.x == 2);
             }
             assert(e.users->Find("limited")->grants.at("realm") == (applied ? Right::kWrite : Right::kRead));
         }

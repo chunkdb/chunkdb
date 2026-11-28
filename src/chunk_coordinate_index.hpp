@@ -113,13 +113,17 @@ class ChunkCoordinateIndex {
     [[nodiscard]] ChunkCoordinateNode* Find(const ChunkCoord& coord);
     [[nodiscard]] bool IsPopulationCandidate(const ChunkCoord& coord) const;
     [[nodiscard]] CoordinateReservation Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot);
+    // Pages stop after `until` (inclusive) when it is given.
     [[nodiscard]] CoordinatePage Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
-        std::optional<std::uint64_t> since = {}) const;
+        std::optional<std::uint64_t> since = {}, const ChunkCoord* until = nullptr) const;
     // The coordinates populated at revision `snapshot`, with every write up to
     // it published: those populated now and those changed after it. A reader
     // checks each one against the snapshot.
     [[nodiscard]] CoordinatePage SnapshotPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
-        std::uint64_t snapshot) const;
+        std::uint64_t snapshot, const ChunkCoord* until = nullptr) const;
+    // The first indexed coordinate at or after `from`, written or retained;
+    // every coordinate a page can list is one.
+    [[nodiscard]] bool FirstCoordinateFrom(const ChunkCoord& from, ChunkCoord* found) const;
     // Exclusive current-state preparation does not make a history promise.
     [[nodiscard]] CoordinatePage CurrentPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit) const;
     [[nodiscard]] std::optional<ChunkIndexRecord> EmptyBoundary(const ChunkCoord& coord) const;
@@ -155,10 +159,11 @@ class ChunkCoordinateIndex {
     // coordinate whose revision exceeds `since`, skipping runs whose maximum
     // does not. Stops before a coordinate `visit` refuses, or once `budget`
     // runs and coordinates are examined, setting where to resume
-    // (inclusive) in `resume` and returning true; returns false at the end.
+    // (inclusive) in `resume` and returning true; returns false at the end or
+    // past `until` (inclusive) when it is given.
     template <class Visit>
     bool WalkChanged(bool has_from, const ChunkCoord& from, bool inclusive, std::uint64_t since,
-        std::size_t budget, ChunkCoord& resume, Visit&& visit) const;
+        std::size_t budget, ChunkCoord& resume, const ChunkCoord* until, Visit&& visit) const;
     void ReleaseReservation(CoordinateReservation& reservation) noexcept;
     void PublishReservation(CoordinateReservation& reservation, bool populated, std::uint64_t revision) noexcept;
     void PublishInventory(const IndexInventoryHeader& header, std::span<const IndexInventoryEntry> entries);

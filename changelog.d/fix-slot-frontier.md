@@ -1,0 +1,3 @@
+- A slot pass that takes at least 1 s logs a WARN with its flush, sync and persist times, the number of chunks visited and the number of file sync attempts, including directory sweeps (#140).
+- The slot worker logs a WARN with elapsed time and slot count when its acknowledgement and retention step takes at least 1 s (#140).
+- A slot watch that loses its live feed position logs at INFO once it opens the archive for catch-up, and any slot archive reader that takes at least 1 s to open logs a WARN (#140).

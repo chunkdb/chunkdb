@@ -38,6 +38,7 @@ avg(height) = 4.5
 AGGREGATE CHUNK cx cy [cz] FROM table function, ... [WHERE condition] [BY CHUNK]
 AGGREGATE AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table function, ... [WHERE condition] [BY CHUNK]
 AGGREGATE AREA AROUND cx cy [cz] RADIUS radius FROM table function, ... [WHERE condition] [BY CHUNK]
+AGGREGATE BLOCKS x0 y0 [z0] TO x1 y1 [z1] FROM table function, ... [WHERE condition] [BY CHUNK]
 ```
 
 A function is `COUNT(*)`, `SUM(column)`, `MIN(column)`, `MAX(column)` or `AVG(column)`.
@@ -45,6 +46,7 @@ A function is `COUNT(*)`, `SUM(column)`, `MIN(column)`, `MAX(column)` or `AVG(co
 ## Arguments
 
 - `CHUNK`, `AREA`, `TO`, `AROUND`, `RADIUS`: the chunks, with chunk coordinates as in [GET CHUNK and GET AREA](CHUNKS.md#arguments).
+- `BLOCKS`: only the blocks from one corner to the other, in block coordinates, as in [GET BLOCKS](CHUNKS.md#arguments).
 - `COUNT(*)`: the present blocks.
 - `SUM`, `MIN`, `MAX`, `AVG`: a block column of an integer (`uN`, `iN`) or float (`f32`, `f64`) type.
 - Each function appears at most once.

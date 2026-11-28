@@ -613,7 +613,7 @@ void PersistentFilters() {
         catalog.ChangeColumns("default", [](const auto& schema) {
             return AddColumn(schema, Column{.name = "extra", .type = {ColumnKind::kUnsigned, 8}, .default_value = {}});
         });
-        filters = {.area = FeedArea{{-5, -4}, {8, 9}}, .column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
+        filters = {.areas = {FeedArea{{-5, -4}, {8, 9}}}, .column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
         const auto slot = table->CreateFeedSlot("filtered", false, filters);
         assert(slot.filters == filters && !slot.lost);
         assert((ReadStoreManifest(root)->features.incompat & kFeatureSlotFilters) != 0U);

@@ -309,6 +309,14 @@ std::size_t ChunkStore::TxnRegisteredCountForTests() const {
     return txn_history_->RegisteredCount();
 }
 
+std::size_t ChunkStore::TxnHistoryBytes() const noexcept {
+    return txn_history_->KeptBytesCounter().load(std::memory_order_acquire);
+}
+
+std::size_t ChunkStore::OpenTransactionCount() const {
+    return txn_history_->RegisteredCount();
+}
+
 void ChunkStore::ArmTxnPauseForTests(TxnPausePoint point) {
     txn_history_->ArmPauseForTests(point);
 }

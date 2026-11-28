@@ -28,8 +28,9 @@ Each run opens a fresh store in relaxed mode with 16,384 loaded chunks of 16x16 
 At 15 bits the string a read returns fits the small-string buffer of libstdc++ and libc++, so no timed read allocates.
 It times windows of 204,800 point reads (`GetBlockBits`) and point writes (`SetBlockBits`, each changing its block), once with each operation's chunk drawn uniformly from all loaded chunks and once with every operation in one chunk, both with the same sequence of block positions inside the chunk from a fixed seed.
 It also times the two lookups alone, with their mutexes, on maps of the same types, hash, keys, sizes and insertion order outside the store, over the same chunk sequences.
-Every window follows an untimed pass of the same sequence and is timed in segments of 1,024 operations; its figure is the median segment's ns per operation, which leaves out rare stalls such as the durable write of the version clock every 16,384 versions.
-A timed write's WAL frame stays in its chunk's in-memory batch: group commit and checkpoint thresholds are above anything a run writes, and the untimed pass, drained by a WAL barrier, has grown each batch, so timed writes flush no batch, do no file I/O and no WAL allocation.
+Every window follows an untimed pass of the same sequence and is timed in segments of 1,024 operations, with ns per operation taken from the median segment to limit the effect of rare stalls such as waiting for a version clock reservation.
+The published run used the older clock, which wrote its record synchronously every 16,384 versions.
+A timed write's WAL frame stays in its chunk's in-memory batch because group commit and checkpoint thresholds are above anything a run writes and the untimed pass, drained by a WAL barrier, has already grown each batch.
 The benchmark fails a run in which a timed operation loaded, evicted, checkpointed or flushed a chunk, or a read returned another value than the last one written to its block.
 Runs alternate which side goes first; the result is the median, minimum and maximum over 15 runs, and the same of the per-run difference between many chunks and one chunk.
 In the store that difference also includes reaching the chunk's object and arrays outside the CPU caches, and for writes appending to 16,384 WAL batches instead of one, so the lookups timed alone give the share of the maps.

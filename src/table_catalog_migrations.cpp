@@ -33,11 +33,13 @@ void CrashAtFailpoint(const char* key) {
 // The slot filters of `request` on a table of `dims` with block columns `schema`.
 FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, std::uint8_t dims, const TableSchema& schema) {
     auto filters = request.slot_filters;
-    if (filters.area && filters.area->dims != dims)
-        throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
-                                    std::to_string(dims) + " and the slot area " +
-                                    std::to_string(filters.area->dims) +
-                                    "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    for (const auto& area : filters.areas)
+        if (area.dims != dims)
+            throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
+                                        std::to_string(dims) + " and the slot area " +
+                                        std::to_string(area.dims) +
+                                        "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    SortFeedAreas(filters.areas);
     if (request.slot_columns) {
         filters.column_ids.emplace();
         for (const auto& name : *request.slot_columns) {
