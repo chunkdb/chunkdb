@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <filesystem>
@@ -14,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "../bench/server_bench_cpu.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "catalog_test_utils.hpp"
@@ -927,6 +929,21 @@ void TestWatchCountAndSlots() {
     }
 }
 
+void TestCpuCounterDeltas() {
+    using chunkdb::server_bench::detail::CpuCounterDelta;
+    const std::optional<double> cpu_start{2.0}, cpu_end{2.5};
+    const std::optional<std::uint64_t> switches_start{20U}, switches_end{25U};
+    assert(CpuCounterDelta(cpu_start, cpu_end) == 0.5);
+    assert(CpuCounterDelta(std::optional<double>{0.0}, cpu_end) == 2.5);
+    assert(CpuCounterDelta(std::optional<double>{}, cpu_end) == 0.0);
+    assert(CpuCounterDelta(cpu_start, std::optional<double>{}) == 0.0);
+    assert(CpuCounterDelta(cpu_end, cpu_start) == 0.0);
+    assert(CpuCounterDelta(switches_start, switches_end) == 5U);
+    assert(CpuCounterDelta(std::optional<std::uint64_t>{}, switches_end) == 0U);
+    assert(CpuCounterDelta(switches_start, std::optional<std::uint64_t>{}) == 0U);
+    assert(CpuCounterDelta(switches_end, switches_start) == 0U);
+}
+
 // --watch-delivery measure reports each watch; strict stays the default and
 // keeps the report unchanged.
 void TestWatchDeliveryMeasure() {
@@ -973,10 +990,19 @@ void TestWatchDeliveryMeasure() {
         assert(json.find("\"watch_delivery\":\"measure\"") != std::string::npos);
         assert(json.find("\"watchers\":[{\"index\":0,\"slot\":" + std::string(slots ? "true" : "false")) != std::string::npos);
         assert(json.find("\"lag_revisions_at_end\":") != std::string::npos);
-        // Each run reports CPU seconds of the process, the clients and the watch readers.
-        for (const auto& result : report.results)
+        for (const auto& result : report.results) {
             assert(result.cpu_s >= 0.0 && result.client_cpu_s >= 0.0 && result.watch_cpu_s >= 0.0);
-        assert(json.find(",\"client_cpu_s\":") != std::string::npos && json.find(",\"context_switches\":") != std::string::npos);
+#ifdef __linux__
+            assert(result.cpu_s > 0.0 && result.client_cpu_s > 0.0 && result.watch_cpu_s > 0.0);
+#endif
+#ifdef _WIN32
+            assert(result.context_switches == 0U);
+#endif
+        }
+        for (const auto* field : {",\"cpu_s\":", ",\"client_cpu_s\":", ",\"watch_cpu_s\":", ",\"context_switches\":"}) {
+            const auto first = json.find(field);
+            assert(first != std::string::npos && json.find(field, first + 1U) != std::string::npos);
+        }
         assert(chunkdb::server_bench::RenderHumanReport(report).find("CPU: process_s=") != std::string::npos);
         assert(chunkdb::server_bench::RenderHumanReport(report).find(slots ? "Watcher 1 slot: events=" : "Watcher 2: events=") !=
                std::string::npos);
@@ -988,9 +1014,12 @@ void TestWatchDeliveryMeasure() {
     plain.tests = {chunkdb::server_bench::Scenario::kSimulation};
     plain.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(plain);
+    const auto& result = report.results.front();
+    assert(result.cpu_s == 0.0 && result.client_cpu_s == 0.0 && result.watch_cpu_s == 0.0 && result.context_switches == 0U);
     const auto json = chunkdb::server_bench::RenderJsonReport(report);
     assert(json.find("watchers") == std::string::npos && json.find("watch_delivery") == std::string::npos);
-    assert(json.find("cpu_s") == std::string::npos);
+    assert(json.find("cpu_s") == std::string::npos && json.find("context_switches") == std::string::npos);
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("CPU:") == std::string::npos);
     assert(chunkdb::server_bench::RenderHumanReport(report).find("Watcher") == std::string::npos);
 }
 
@@ -1084,13 +1113,17 @@ void TestEnabledBenchmarkOptions() {
         else if (std::string(mode) == "chunks") assert(result.watch_chunks > 0U);
         else assert(result.watch_changes > 0U);
     }
-    auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover"});
+    auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover", "--report-cpu"});
     args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
     args.port = 0; args.requests = 3; args.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(args);
     const auto& result = report.results.front();
     assert(result.ownership_cycles == 3U && result.completed_requests == 6U);
     assert(result.completed_blocks == 0U && result.response_bytes > 0U);
+    assert(result.cpu_s >= 0.0 && result.client_cpu_s >= 0.0 && result.watch_cpu_s == 0.0);
+#ifdef __linux__
+    assert(result.cpu_s > 0.0 && result.client_cpu_s > 0.0);
+#endif
     assert(result.request_mix == (std::vector<std::pair<std::string, std::size_t>>{{"hello", 3}, {"watch_takeover", 3}}));
     assert(chunkdb::server_bench::RenderJsonReport(report).find("ownership_cycles_s") != std::string::npos);
     args.user = "bench"; args.password = "test-password"; args.port = 0; args.requests = 1;
@@ -1383,6 +1416,7 @@ int main(int argc, char** argv) {
     TestCompatibleWatchReplies();
     TestWatchCompletedWriteCut();
     TestWatchCountAndSlots();
+    TestCpuCounterDeltas();
     TestWatchDeliveryMeasure();
 #ifndef _WIN32
     TestWatchAboveFdSetSize();

@@ -1,5 +1,6 @@
 #include "chunkdb/server_bench.hpp"
 #include "chunkdb/bench_build.hpp"
+#include "server_bench_cpu.hpp"
 
 #include <algorithm>
 #include <array>
@@ -76,28 +77,28 @@ double FileTimeSeconds(const FILETIME& value) {
     return static_cast<double>((static_cast<std::uint64_t>(value.dwHighDateTime) << 32U) | value.dwLowDateTime) / 1e7;
 }
 #endif
-// CPU seconds the calling thread has used; 0 where the platform cannot say.
-double ThreadCpuSeconds() {
+// CPU seconds the calling thread has used, if the counter is available.
+std::optional<double> ThreadCpuSeconds() {
 #ifdef _WIN32
     FILETIME creation{}, exited{}, kernel{}, user{};
-    if (!GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) return 0.0;
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) return std::nullopt;
     return FileTimeSeconds(kernel) + FileTimeSeconds(user);
 #else
     timespec now{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return 0.0;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return std::nullopt;
     return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1e9;
 #endif
 }
 // CPU seconds and context switches of this process so far; switches stay 0 on Windows.
 struct ProcessUsage {
-    double cpu_s = 0.0;
-    std::uint64_t switches = 0;
+    std::optional<double> cpu_s{};
+    std::optional<std::uint64_t> switches{};
 };
 ProcessUsage SampleProcessUsage() {
 #ifdef _WIN32
     FILETIME creation{}, exited{}, kernel{}, user{};
     if (!GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user)) return {};
-    return {FileTimeSeconds(kernel) + FileTimeSeconds(user), 0U};
+    return {.cpu_s = FileTimeSeconds(kernel) + FileTimeSeconds(user)};
 #else
     rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage) != 0) return {};
@@ -105,6 +106,11 @@ ProcessUsage SampleProcessUsage() {
     return {seconds(usage.ru_utime) + seconds(usage.ru_stime),
         static_cast<std::uint64_t>(usage.ru_nvcsw) + static_cast<std::uint64_t>(usage.ru_nivcsw)};
 #endif
+}
+
+void RecordProcessUsage(ScenarioResult& result, const ProcessUsage& start, const ProcessUsage& end) {
+    result.cpu_s = detail::CpuCounterDelta(start.cpu_s, end.cpu_s);
+    result.context_switches = detail::CpuCounterDelta(start.switches, end.switches);
 }
 
 constexpr std::array<double, 8> kPercentiles{
@@ -863,8 +869,6 @@ class WatchingClient {
         start_ = Clock::now();
         client_.SetStopDeadline(&stop_deadline_);
         reader_ = std::thread([this] {
-            // The reader's CPU from WATCH to UNWATCH, read after the join.
-            struct CpuRecord { double& out; ~CpuRecord() { out = ThreadCpuSeconds(); } } record{cpu_s_};
             try {
                 for (;;) {
                     const auto deadline = stop_deadline_.load(std::memory_order_acquire);
@@ -875,6 +879,7 @@ class WatchingClient {
                     if (value.type == '+' && value.text == "OK") {
                         if (stop_deadline_.load(std::memory_order_acquire) == 0)
                             throw std::runtime_error("unsolicited UNWATCH completion");
+                        if (args_.report_cpu) cpu_s_ = ThreadCpuSeconds().value_or(0.0);
                         return;
                     }
                     std::uint64_t read;
@@ -928,7 +933,7 @@ class WatchingClient {
     void Finish(ScenarioResult* result) {
         reader_.join();
         if (error_) std::rethrow_exception(error_);
-        result->watch_cpu_s += cpu_s_;
+        if (args_.report_cpu) result->watch_cpu_s += cpu_s_;
         result->watch_bytes += client_.consumed_bytes() - initial_bytes_;
         result->watch_changes += changes_; result->watch_progress += progress_; result->watch_chunks += chunks_; result->watch_other += other_;
         result->watch_duration_s = std::max(result->watch_duration_s, std::chrono::duration<double>(Clock::now() - start_).count());
@@ -1709,7 +1714,7 @@ struct ThreadWork {
     std::atomic<std::size_t> failed_logins{0};
     double client_cpu_s = 0.0;
 
-    const auto usage_start = SampleProcessUsage();
+    const auto usage_start = args.report_cpu ? SampleProcessUsage() : ProcessUsage{};
     const auto start = Clock::now();
     std::vector<std::thread> workers;
     workers.reserve(work_split.size());
@@ -1719,7 +1724,7 @@ struct ThreadWork {
             continue;
         }
         workers.emplace_back([&, work]() {
-            const auto cpu_start = ThreadCpuSeconds();
+            const auto cpu_start = args.report_cpu ? ThreadCpuSeconds() : std::nullopt;
             try {
                 Client client(args.host, args.port, args.io_timeout_ms);
                 Hello(client, args);
@@ -1806,6 +1811,7 @@ struct ThreadWork {
                 while (!pending.empty()) {
                     consume_one();
                 }
+                const double cpu_s = args.report_cpu ? detail::CpuCounterDelta(cpu_start, ThreadCpuSeconds()) : 0.0;
 
                 {
                     std::lock_guard lock(latencies_mutex);
@@ -1813,7 +1819,7 @@ struct ThreadWork {
                     returned_area_chunks += local_area_chunks;
                     response_bytes += local_response_bytes;
                     metadata_envelopes += local_metadata_envelopes;
-                    client_cpu_s += ThreadCpuSeconds() - cpu_start;
+                    if (args.report_cpu) client_cpu_s += cpu_s;
                     if (local_write_frontier) write_frontier = std::max(write_frontier.value_or(0U), *local_write_frontier);
                     for (std::size_t i = 0; i < request_mix.size(); ++i) request_mix[i] += local_mix[i];
                     latencies_ms.insert(
@@ -1869,7 +1875,7 @@ struct ThreadWork {
         }
     }
     const auto end = Clock::now();
-    const auto usage_end = SampleProcessUsage();
+    const auto usage_end = args.report_cpu ? SampleProcessUsage() : ProcessUsage{};
     for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
     {
         std::lock_guard lock(login_mutex);
@@ -1901,9 +1907,10 @@ struct ThreadWork {
     result.response_bytes = response_bytes;
     result.metadata_envelopes = metadata_envelopes;
     result.failed_logins = failed_logins.load();
-    result.cpu_s = usage_end.cpu_s - usage_start.cpu_s;
-    result.client_cpu_s = client_cpu_s;
-    result.context_switches = usage_end.switches - usage_start.switches;
+    if (args.report_cpu) {
+        RecordProcessUsage(result, usage_start, usage_end);
+        result.client_cpu_s = client_cpu_s;
+    }
     result.blocks_per_request = static_cast<double>(completed_blocks) / result.completed_requests;
     for (std::size_t i = 0; i < request_mix.size(); ++i) result.request_mix.emplace_back(kRequestNames[i], request_mix[i]);
     result.duration_s = std::chrono::duration<double>(end - start).count();
@@ -1999,6 +2006,8 @@ bool TakeoverTerminal(std::string_view line) {
     latencies.reserve(args.requests);
     ScenarioResult result; result.name = "takeover"; result.max_in_flight = 1;
     result.payload_label = "ownership_cycles (connect+HELLO+WATCH TAKEOVER+old closure), ACKs=0";
+    const auto usage_start = args.report_cpu ? SampleProcessUsage() : ProcessUsage{};
+    const auto cpu_start = args.report_cpu ? ThreadCpuSeconds() : std::nullopt;
     const auto start = Clock::now();
     for (std::size_t i = 0; i < args.requests; ++i) {
         const auto cycle_start = Clock::now();
@@ -2039,6 +2048,11 @@ bool TakeoverTerminal(std::string_view line) {
         latencies.push_back(std::chrono::duration<double, std::milli>(Clock::now() - cycle_start).count());
     }
     const auto end = Clock::now();
+    if (args.report_cpu) {
+        const auto cpu_end = ThreadCpuSeconds();
+        RecordProcessUsage(result, usage_start, SampleProcessUsage());
+        result.client_cpu_s = detail::CpuCounterDelta(cpu_start, cpu_end);
+    }
     owner->SendLine("UNWATCH");
     const auto cleanup_deadline = Clock::now() + std::chrono::milliseconds(args.io_timeout_ms);
     const std::atomic<Clock::duration::rep> cleanup_read_deadline{cleanup_deadline.time_since_epoch().count()};

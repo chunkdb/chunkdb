@@ -123,10 +123,11 @@ struct ScenarioResult {
     double watch_duration_s = 0.0;
     // Failed-login and ban replies the --failed-logins clients received.
     std::size_t failed_logins = 0;
-    // --report-cpu: CPU seconds of this process from the first client start to
-    // the last client reply, of the measured client threads, and of the watch
-    // readers from WATCH to UNWATCH; context switches of the process in the
-    // timed window. Where a platform cannot say, a value stays 0.
+    // --report-cpu: process CPU seconds and context switches during the timed
+    // scenario, from worker launch through join or during takeover cycles.
+    // Client CPU covers the measured workers or the takeover driver.
+    // Watch CPU covers each reader through UNWATCH completion.
+    // Unavailable counters report zero.
     double cpu_s = 0.0;
     double client_cpu_s = 0.0;
     double watch_cpu_s = 0.0;

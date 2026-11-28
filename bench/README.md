@@ -9,8 +9,12 @@ Default workloads and JSON fields stay unchanged when these additions are unused
 - `ordinary` delivers mutations, `progress` excludes workload positions with AREA -1 -1 TO -1 -1, `filtered` selects chunk 0,0 and column bits with NO BEFORE, and `chunks` delivers whole chunk forms.
 - `--watch-delivery strict|measure` defaults to `strict`, where a resync or a drain longer than `--io-timeout-ms` fails the run; `measure` requires `--watch` and is meant for measuring many subscribers.
 - `--slot-create-timeout-ms N` bounds the CREATE SLOT reply in `measure` mode (default 600000); the first slot on a table checkpoints every chunk with WAL data before it replies, outside the timed window.
-- `--report-cpu` adds to each result `cpu_s`, the CPU seconds of the bench process from the first client start to the last client reply, with a spawned server inside it; `client_cpu_s`, those of the measured client threads; `watch_cpu_s`, those of the watch readers from WATCH to UNWATCH; and `context_switches` of the process in the timed window, 0 on Windows.
-- `cpu_s` minus `client_cpu_s` and `watch_cpu_s` is about what a spawned server used, so runs with 0, 1, 10 and 100 watches show whether a slower write comes from the server or from the readers sharing the host.
+- `--report-cpu` adds `cpu_s` and `context_switches` for the benchmark process during each timed scenario, including the spawned server in spawn mode.
+- The process window covers measured worker launch through join, or the timed ownership cycles in takeover.
+- `client_cpu_s` covers measured workers through validation of their final replies, or the benchmark thread during takeover cycles.
+- `watch_cpu_s` covers watch-reader threads from their start after WATCH acceptance through UNWATCH completion, including any drain after the timed scenario.
+- Unavailable counter samples contribute zero, including `context_switches` on Windows.
+- The process total also includes benchmark overhead and any failed-login client work during the timed window, so the report gives process and reader costs without isolating server CPU.
 - `--tests takeover --clients 1 --pipeline 1` measures idle connect→HELLO→WATCH TAKEOVER→old-owner closure cycles and requires no watch or read metadata.
 - Takeover performs no mutations or ACKs; initial slot creation/ownership and final UNWATCH/DROP are excluded from its timing and request counts.
 - `--failed-logins N` requires `--user` and starts N clients once every measured client has logged in; each logs in as that user with a wrong password, one login after another, until the measured clients finish, and makes at least one attempt.
