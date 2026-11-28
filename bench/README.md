@@ -40,7 +40,8 @@ See [artifact formats](artifacts/README.md) for stored results.
 `--flushes N` sets the number of timed barriers after one write to every table and of timed barriers with nothing to sync.
 `--background-maintenance off` measures the default server configuration, where only barriers use the pool.
 The defaults are 200,000 writes, 20 flushes and two workers.
-Run measurements on the benchmark server through its `measure.sh` wrapper, one `--tables` case per process so memory figures are not shared between cases.
+Run `./build/chunkdb_maintenance_bench --data-dir NEW_PATH --tables N`, with one case per process so memory figures are not shared between cases.
+Record the processor, memory, storage, operating system and complete benchmark command with the results.
 The executable creates only a new data-directory path and leaves its data for inspection.
 
 Each JSON row records the request count, write duration, writes per second and the duration in milliseconds of the first catalog WAL barrier after the write window.
