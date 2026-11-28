@@ -998,6 +998,19 @@ std::optional<Table::Lease> Table::TryAcquire() {
     return std::nullopt;
 }
 
+std::optional<Table::Lease> Table::TryAcquireForArchive(const char** fence_reason) {
+    // The archiver must make progress on other tables while an exclusive
+    // operation holds this table, including while it is draining its feed.
+    *fence_reason = nullptr;
+    const std::unique_lock lock(mutex_, std::try_to_lock);
+    if (feed_cleanup_failed_.load(std::memory_order_acquire)) *fence_reason = kFenceFeed;
+    if (*fence_reason || !lock || state_.load(std::memory_order_seq_cst) != State::kOpen) return std::nullopt;
+    *fence_reason = StoreFenceReason(*store_);
+    if (*fence_reason) return std::nullopt;
+    active_leases_.fetch_add(1U, std::memory_order_seq_cst);
+    return Lease(this, store_.get());
+}
+
 void Table::ReleaseLease() noexcept {
     if (active_leases_.fetch_sub(1, std::memory_order_seq_cst) == 1 &&
         state_.load(std::memory_order_seq_cst) == State::kBusy) {

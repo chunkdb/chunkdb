@@ -63,6 +63,20 @@ After later crashes or restarts, missing chunk files cannot prove that no histor
 Without durable proof, an exact-cut request also resyncs.
 Restore, offline or with RESTORE TABLE, refuses a backed-up table without `table_lineage`; every table a 2.0 build creates has it.
 
+### Restore to a WAL archive seal
+
+Use a backup of the same data directory and the capture timestamp from the chosen `seal.<timestamp>` archive record.
+The archive must retain a chain back to a seal captured by the time the backup started.
+
+```sh
+chunkdb_verify --archive /backups/archive
+chunkdb_restore /backups/snapshot /var/lib/chunkdb/restored --archive /backups/archive --seal-ms 1760000000000
+```
+
+Restore rolls each sealed table forward to the revision recorded for it and prints a diagnostic for every busy, fenced or otherwise unsealed table it omits.
+The diagnostic gives the table's last sealed revision when known and its fence reason when present.
+Point the tools at a complete local copy if you shipped the archive with `--archive-command`.
+
 ## 3. Inspect a backup
 
 Serve a backup without restoring it:

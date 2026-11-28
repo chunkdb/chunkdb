@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -33,12 +34,15 @@ struct WalArchiveFile {
     friend bool operator==(const WalArchiveFile&, const WalArchiveFile&) = default;
 };
 
+enum class WalArchiveTableState : std::uint8_t { kUnsealed = 0U, kSealed = 1U, kBusy = 2U, kFenced = 3U, kDetached = 4U };
+[[nodiscard]] std::string_view WalArchiveStateName(WalArchiveTableState state) noexcept;
+
 struct WalArchiveTableEntry {
     // Empty for a table whose files a later pass shipped after it was dropped.
     std::string name;
     StoreId epoch{};
-    // The table's seal point; std::nullopt when this pass shipped its files
-    // without sealing it.
+    // The current seal point, or the last recorded one for an unsealed,
+    // busy or fenced table.
     std::optional<std::uint64_t> revision{};
     // With `revision`: issued from the table's commit-time counter before the
     // seal point was sampled.
@@ -48,6 +52,8 @@ struct WalArchiveTableEntry {
     std::string manifest;
     // Shipped since the predecessor, in `table.<epoch>/`.
     std::vector<WalArchiveFile> files;
+    WalArchiveTableState state = WalArchiveTableState::kUnsealed;
+    std::string reason{};
     friend bool operator==(const WalArchiveTableEntry&, const WalArchiveTableEntry&) = default;
 };
 
@@ -66,6 +72,10 @@ struct WalArchiveRecord {
 
 [[nodiscard]] std::vector<std::uint8_t> SerializeWalArchiveRecord(const WalArchiveRecord& record);
 [[nodiscard]] WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes);
+[[nodiscard]] WalArchiveRecord ReadWalArchiveRecord(const std::filesystem::path& path);
+void VerifyWalArchiveFile(const std::filesystem::path& path, const WalArchiveFile& expected);
+[[nodiscard]] std::vector<std::uint8_t> ReadWalArchiveMetadata(const std::filesystem::path& path,
+    std::string_view prefix, std::string_view suffix, std::uint64_t limit);
 // The chain file: the data-directory id and the capture time of the last
 // published record.
 [[nodiscard]] std::vector<std::uint8_t> SerializeWalArchiveChain(const StoreId& directory, std::uint64_t captured_ms);
@@ -114,12 +124,13 @@ class WalArchiver {
     [[nodiscard]] WalArchiveStatus Status() const;
 
   private:
+    friend struct WalArchiveTestAccess;
     // What the pass captured under the backup metadata gate.
     struct CatalogCapture {
         struct TableCapture {
-            std::shared_ptr<Table> table;
-            std::uint64_t schema_version = 0;
-            std::string manifest;
+            std::shared_ptr<Table> table{};
+            WalArchiveTableEntry entry{};
+            std::optional<std::string> manifest_error{};
         };
         std::vector<TableCapture> tables;
         std::string users;
@@ -134,12 +145,19 @@ class WalArchiver {
     [[nodiscard]] CatalogCapture CaptureCatalog(std::stop_token cancel);
     // Stages `bytes` as `<directory>/<name>` unless that file is already staged.
     void StageBytes(const std::filesystem::path& directory, const std::string& name, const std::vector<std::uint8_t>& bytes);
-    void StageTable(const CatalogCapture::TableCapture& capture, std::map<StoreId, WalArchiveTableEntry>& entries);
+    void UseLastCapture(WalArchiveTableEntry& entry) const;
+    void StageTable(CatalogCapture::TableCapture& capture);
     // Also ships the current users and ledger files; superseded ones are dropped.
     void ShipStaged(std::map<StoreId, WalArchiveTableEntry>& entries, const CatalogCapture& capture);
     void PublishRecord(const WalArchiveRecord& record);
+    void RememberRecord(const WalArchiveRecord& record);
     void RemoveShipped(const WalArchiveRecord& record);
-    void RetainArchive(std::uint64_t now_ms);
+    struct RetentionPlan {
+        std::vector<std::filesystem::path> records{};
+        std::set<std::filesystem::path> files{};
+    };
+    [[nodiscard]] RetentionPlan PlanRetention(WalArchiveRecord& record) const;
+    void ApplyRetention(const RetentionPlan& plan) const;
     [[nodiscard]] std::uint64_t StagedBytes() const;
     // Ships the local file `source` as `<relative_dir>/<name>`.
     [[nodiscard]] WalArchiveFile Ship(const std::filesystem::path& source, const std::string& relative_dir,
@@ -159,6 +177,7 @@ class WalArchiver {
     // Names already shipped by this process, so unchanged manifests, users
     // and ledger files are not shipped again each pass. Under pass_mutex_.
     std::map<StoreId, std::string> shipped_manifests_;
+    std::map<StoreId, WalArchiveTableEntry> last_captured_;
     std::string shipped_users_;
     std::string shipped_ledger_;
     mutable std::mutex status_mutex_;

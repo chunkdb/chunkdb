@@ -142,11 +142,12 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 |---|---|---|
 | `--archive-dir` | unset | Copies every table's sealed WAL segments, manifests, users file and migrations ledger to this directory, which must not contain or lie in `--data-dir`. |
 | `--archive-command` | unset | Instead of `--archive-dir`, runs this command through the system shell for each file: `%p` is its local path, `%f` its name in the archive, `%%` a `%`; exit status 0 means archived. |
-| `--archive-interval-ms` | `60000` | 100 to 86400000; how often every table is sealed and its files shipped. |
+| `--archive-interval-ms` | `60000` | 100 to 86400000; how often the server attempts a seal and ships its files. |
 | `--archive-retention-ms` | `0` | With `--archive-dir`, how long seal records and the segments they reference are kept; a segment stays while any kept record lists it, and `0` keeps everything. |
 
 The two archive flags exclude each other, and `--read-only` refuses them.
 A pass also runs when the server starts and at clean shutdown; see [WAL archive](DURABILITY_CONTRACT.md#wal-archive) for what a seal record guarantees.
+Busy and fenced tables appear in the seal record with their last published positions when available; other tables continue to receive new seal points.
 `--archive-command` must succeed again for a file it already archived with the same bytes.
 Substitutions are inserted as shell text, so quote them as your shell and paths require, for example `--archive-command 'aws s3 cp "%p" "s3://bucket/chunkdb/%f"'` in a POSIX shell.
 If a pass fails, SHOW STATUS reports `archive` with the error and `staged_bytes`; files waiting to ship stay in the data directory.

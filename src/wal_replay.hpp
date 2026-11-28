@@ -163,5 +163,9 @@ struct WalStreamInfo {
 [[nodiscard]] WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
     const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
     const std::function<void()>& read_checkpoint = {});
+// Same validation, with a borrowed frame for each validated revision.
+[[nodiscard]] WalStreamInfo VisitWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    const std::function<void(const FeedFrameInfo&, std::span<const std::uint8_t>)>& visit);
 
 }  // namespace chunkdb

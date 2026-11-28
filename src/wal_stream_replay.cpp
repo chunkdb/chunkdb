@@ -172,9 +172,11 @@ std::optional<FeedFrameInfo> InspectFirstWalFrameStream(std::istream& input,
     return InspectFeedFrame(frame, geometry, features);
 }
 
-WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
+namespace {
+template <typename Visit>
+WalStreamInfo InspectWalStreamImpl(std::istream& input, std::uint64_t measured_bytes,
     const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
-    const std::function<void()>& read_checkpoint) {
+    const std::function<void()>& read_checkpoint, const Visit& visit) {
     StreamSource source(input, measured_bytes, geometry.dims(), read_checkpoint);
     const auto& header = source.Header();
     ValidateWalHeader(header, coord, table_id, features, geometry.dims());
@@ -187,9 +189,24 @@ WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes
         if (info.revision <= result.last) throw std::runtime_error("archive WAL revisions do not increase");
         if (result.first == 0U) { result.first = info.revision; result.first_schema = info.schema_version; }
         result.last = info.revision;
+        visit(info, window.bytes);
         position += window.bytes.size();
     }
     return result;
+}
+}  // namespace
+
+WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    const std::function<void()>& read_checkpoint) {
+    return InspectWalStreamImpl(input, measured_bytes, geometry, coord, table_id, features, read_checkpoint,
+        [](const FeedFrameInfo&, std::span<const std::uint8_t>) {});
+}
+
+WalStreamInfo VisitWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    const std::function<void(const FeedFrameInfo&, std::span<const std::uint8_t>)>& visit) {
+    return InspectWalStreamImpl(input, measured_bytes, geometry, coord, table_id, features, {}, visit);
 }
 
 }  // namespace chunkdb

@@ -295,6 +295,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend class SlotWatch;
     friend class TableCatalog;
     friend struct FeedSlotTestAccess;
+    friend class WalArchiver;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
@@ -331,6 +332,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
                       bool check_feed_error = false);
     void ReleaseLease() noexcept;
+    [[nodiscard]] std::optional<Lease> TryAcquireForArchive(const char** fence_reason);
     // Snapshot capture drains ordinary admission without detaching the feed,
     // closing the store or changing its maintenance owner.
     class AdmissionPause {
@@ -632,6 +634,7 @@ class TableCatalog {
   private:
     friend class WalArchiver;
     [[nodiscard]] std::filesystem::path TablesDir() const;
+    friend struct WalArchiveTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;

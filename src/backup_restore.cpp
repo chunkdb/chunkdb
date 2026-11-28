@@ -3,12 +3,18 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <fstream>
+#include <iterator>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <system_error>
 
 #include "checkpoint.hpp"
+#include "chunk_file_header.hpp"
+#include "feed_archive.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
@@ -17,6 +23,7 @@
 #include "verify.hpp"
 #include "migrations_records.hpp"
 #include "wal_replay.hpp"
+#include "wal_archive.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
 
@@ -57,7 +64,8 @@ ChunkCoord Coordinate(const std::filesystem::path& path, const Geometry& geometr
     return coord;
 }
 std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Geometry& geometry,
-    ChunkCoord coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained) {
+    ChunkCoord coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained,
+    std::uint64_t* latest = nullptr) {
     std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
     ChunkVars vars; std::uint64_t revision = 0U, schema = 0U, time = 0U;
     std::shared_ptr<const ChunkColumnState> chunk_columns;
@@ -73,6 +81,10 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
     if (boundary)
         (void)ApplyRetainedEmptyBase(geometry, *boundary, revision, time, schema,
             payload, presence, vars, chunk_columns);
+    if (latest) {
+        *latest = revision;
+        if (!std::filesystem::exists(path)) return {};
+    }
     auto bytes = LoadFile(path);
     const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema,
         &payload, &presence, &vars, nullptr, &chunk_columns, time,
@@ -80,6 +92,7 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
     if (replay.torn_creation) return {};
     if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
         throw std::runtime_error("restored WAL is damaged: " + path.string());
+    if (latest) *latest = std::max(revision, replay.revision);
     if (replay.tail_truncated_or_corrupt) bytes.resize(replay.valid_end);
     return bytes;
 }
@@ -215,7 +228,159 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
     return new_epoch;
 }
-void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
+namespace {
+struct ArchiveRestorePlan {
+    WalArchiveRecord seal{};
+    std::map<StoreId, std::map<std::string, WalArchiveFile>> files{};
+    std::map<std::string, std::string> source_names{};
+    std::vector<std::string> skipped{};
+};
+
+ArchiveRestorePlan ReadArchivePlan(const std::filesystem::path& archive, const StoreId& directory,
+    std::uint64_t captured_ms, const BackupRecord& backup) {
+    if (captured_ms < backup.created_at_ms) throw std::runtime_error("the archive seal predates the backup");
+    ArchiveRestorePlan plan;
+    const auto root = archive / WalArchiveDirectoryDirName(directory);
+    if (!std::filesystem::is_directory(std::filesystem::symlink_status(root)))
+        throw std::runtime_error("the archive has no records for the backup's data directory");
+    std::set<std::uint64_t> predecessors;
+    for (const auto& item : backup_detail::DirectoryEntries(root)) {
+        const auto stamp = ParseWalArchiveRecordName(item.path().filename().string());
+        if (!stamp) continue;
+        const auto record = ReadWalArchiveRecord(item.path());
+        if (record.directory != directory || record.captured_ms != *stamp)
+            throw std::runtime_error("WAL archive seal does not match its path");
+        if (record.predecessor_ms != 0U && !predecessors.insert(record.predecessor_ms).second)
+            throw std::runtime_error("WAL archive seal chain has a fork");
+    }
+    auto next = captured_ms;
+    std::set<StoreId> boundary_epochs;
+    while (next != 0U) {
+        const auto path = root / WalArchiveRecordName(next);
+        if (!std::filesystem::exists(path)) throw std::runtime_error("WAL archive chain is missing " + path.string());
+        auto record = ReadWalArchiveRecord(path);
+        if (record.directory != directory || record.captured_ms != next)
+            throw std::runtime_error("WAL archive seal does not match its path");
+        for (const auto& table : record.tables) {
+            for (const auto& file : table.files) {
+                const auto [it, inserted] = plan.files[table.epoch].try_emplace(file.name, file);
+                if (!inserted && it->second != file) throw std::runtime_error("conflicting WAL archive inventory for " + file.name);
+            }
+        }
+        if (record.captured_ms <= backup.created_at_ms) {
+            for (const auto& table : record.tables)
+                if (table.state != WalArchiveTableState::kDetached) boundary_epochs.insert(table.epoch);
+            next = 0U;
+        } else next = record.predecessor_ms;
+        if (next == 0U && record.captured_ms > backup.created_at_ms)
+            throw std::runtime_error("the WAL archive chain starts after this backup");
+        if (record.captured_ms == captured_ms) plan.seal = std::move(record);
+    }
+    for (const auto& entry : plan.seal.tables) {
+        if (entry.state == WalArchiveTableState::kDetached) continue;
+        if (entry.state != WalArchiveTableState::kSealed) {
+            auto reason = "skipped table '" + entry.name + "': " + std::string(WalArchiveStateName(entry.state));
+            if (!entry.reason.empty()) reason += " (" + entry.reason + ")";
+            if (entry.revision) reason += "; last sealed revision " + std::to_string(*entry.revision);
+            else reason += "; no previous seal";
+            plan.skipped.push_back(std::move(reason));
+            continue;
+        }
+        const auto base = std::find_if(backup.tables.begin(), backup.tables.end(), [&](const auto& table) {
+            return table.epoch == entry.epoch;
+        });
+        if (base != backup.tables.end()) {
+            if (*entry.revision < base->revision) throw std::runtime_error("archive seal predates backup cut of '" + entry.name + "'");
+            plan.source_names.emplace(base->name, entry.name);
+        } else if (boundary_epochs.contains(entry.epoch))
+            throw std::runtime_error("the backup does not contain the existing epoch of '" + entry.name + "'");
+    }
+    return plan;
+}
+
+struct ArchivedSegment {
+    const WalArchiveFile* file = nullptr;
+    std::uint64_t first = 0U;
+    std::uint64_t last = 0U;
+};
+
+void RollForwardTable(const std::filesystem::path& copy, const std::filesystem::path& archive,
+    const WalArchiveTableEntry& table, const std::map<std::string, WalArchiveFile>& inventory, std::uint64_t base_cut) {
+    const auto prefix = "table." + std::to_string(table.schema_version);
+    const auto bytes = ReadWalArchiveMetadata(archive / table.manifest, prefix, ".manifest", kStoreManifestMaxSize);
+    const auto manifest = ParseStoreManifest(bytes);
+    if (manifest.store_id != table.epoch || manifest.schema.version != table.schema_version)
+        throw std::runtime_error("WAL archive manifest has the wrong identity for '" + table.name + "'");
+    RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
+    if ((manifest.features.incompat & kFeatureTableLineage) == 0U)
+        throw std::runtime_error("archive restore requires table_lineage for '" + table.name + "'");
+    Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+    if (!std::filesystem::exists(copy)) {
+        if (manifest.lineage) throw std::runtime_error("archive table '" + table.name + "' needs a backup of its restored epoch");
+        EnsureDirectoryPathExists(copy, true);
+        if (!ChunkCoordinateIndex::InitializeEmpty(copy, geometry, table.epoch))
+            throw std::runtime_error("restore table coordinate inventory already exists");
+        AtomicWrite(copy / "chunkdb.snapshot", SerializeSnapshotGenerationRecord(2U), true, true);
+        AtomicWrite(copy / ".chunkdb.initialized", SerializeInitializedStoreMarker(), true, true);
+    }
+    AtomicWrite(StoreManifestPath(copy), bytes, true, true);
+    const ChunkCoordinateIndex retained(copy, geometry, table.epoch, true);
+    std::map<ChunkCoord, std::vector<ArchivedSegment>> chunks;
+    for (const auto& [name, file] : inventory) {
+        if (!name.ends_with(".wal")) continue;
+        const auto last = WalArchiveSegmentLast(name);
+        const auto dot = name.find('.');
+        const auto dash = name.find('-', dot);
+        std::uint64_t first = 0U;
+        ChunkCoord coord;
+        if (!last || dash == std::string::npos || !ParseChunkFileStem(std::string_view(name).substr(0, dot), geometry.dims(), &coord))
+            throw std::runtime_error("invalid archived WAL name " + name);
+        const auto [end, error] = std::from_chars(name.data() + dot + 1U, name.data() + dash, first);
+        if (error != std::errc{} || end != name.data() + dash || first == 0U || first > *last ||
+            ChunkFileStem(coord, geometry.dims()) + "." + std::to_string(first) + "-" + std::to_string(*last) + ".wal" != name)
+            throw std::runtime_error("invalid archived WAL range " + name);
+        if (*last > base_cut && first <= *table.revision) chunks[coord].push_back({&file, first, *last});
+    }
+    for (auto& [coord, segments] : chunks) {
+        std::sort(segments.begin(), segments.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+        const auto wal = ChunkWalPath(copy, geometry, coord);
+        std::uint64_t latest = 0U;
+        const auto base = RecoverWal(wal, geometry, coord, table.epoch, manifest.features, retained, &latest);
+        AtomicWriteStream(wal, [&](const AtomicFileSink& sink) {
+            if (base.empty()) sink(BuildWalHeader(coord, table.epoch, manifest.features, geometry.dims()));
+            else sink(base);
+            bool first_segment = true;
+            for (const auto& segment : segments) {
+                const auto descriptor_name = ArchiveBaseFileName(coord, geometry.dims(), segment.first);
+                const auto listed = inventory.find(descriptor_name);
+                if (listed == inventory.end()) throw std::runtime_error("WAL archive does not list " + descriptor_name);
+                const auto descriptor_path = archive / descriptor_name;
+                VerifyWalArchiveFile(descriptor_path, listed->second);
+                const auto descriptor = ReadFeedArchiveBaseDescriptor(descriptor_path, geometry, table.epoch, coord, segment.first);
+                if (!descriptor || descriptor->base_revision > latest || (!first_segment && descriptor->base_revision != latest))
+                    throw std::runtime_error("WAL archive chunk chain has a gap before " + segment.file->name);
+                const auto path = archive / segment.file->name;
+                VerifyWalArchiveFile(path, *segment.file);
+                SharedFileInput input(path);
+                const auto inspected = VisitWalStream(input, segment.file->size, geometry, coord, table.epoch, manifest.features,
+                    [&](const FeedFrameInfo& frame, std::span<const std::uint8_t> raw) {
+                        if (frame.revision <= base_cut && frame.revision > latest)
+                            throw std::runtime_error("backup is missing a frame at its cut: " + path.string());
+                        if (frame.revision <= base_cut || frame.revision > *table.revision) return;
+                        if (frame.revision <= latest) throw std::runtime_error("overlapping WAL archive segments: " + path.string());
+                        sink(raw);
+                        latest = frame.revision;
+                    });
+                if (inspected.first != segment.first || inspected.last != segment.last)
+                    throw std::runtime_error("archive WAL range differs from its name: " + path.string());
+                first_segment = false;
+            }
+        }, true, true);
+    }
+}
+
+std::vector<std::string> RestoreBackupImpl(const std::filesystem::path& source, const std::filesystem::path& destination,
+    const std::filesystem::path& archive, std::uint64_t captured_ms) {
     RequireBackupTarget(source, destination);
 #ifdef _WIN32
     const auto backup = CanonicalBackupPath(source);
@@ -223,9 +388,17 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     const auto backup = std::filesystem::canonical(source);
 #endif
     const auto target = CanonicalBackupPath(destination);
-    auto record = ReadBackupRecord(backup);
-    ValidateBackupInventory(backup, record);
-    for (const auto& cut : record.tables) {
+    const auto source_record = ReadBackupRecord(backup);
+    ValidateBackupInventory(backup, source_record);
+    auto record = source_record;
+    std::optional<ArchiveRestorePlan> archive_plan;
+    if (!archive.empty()) {
+        RequireBackupTarget(archive, target);
+        const auto directory = ReadDataDirManifest(backup)->data_dir_id;
+        archive_plan = ReadArchivePlan(archive, directory, captured_ms, source_record);
+    }
+    for (const auto& cut : source_record.tables) {
+        if (archive_plan && !archive_plan->source_names.contains(cut.name)) continue;
         const auto manifest = ReadStoreManifest(backup / "tables" / cut.name);
         if (!manifest || (manifest->features.incompat & kFeatureTableLineage) == 0U)
             throw FeatureAdmissionError("feature_disabled", "table_lineage",
@@ -252,8 +425,16 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         SyncDirectoryPath(target.parent_path());
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_GUARD_ONCE");
         EnsureDirectoryPathExists(temporary / "tables", true);
-        for (const auto& file : record.files) {
-            const auto copied = CopyBackupFile(backup / file.relative_path, temporary, file.relative_path, file.size);
+        for (const auto& file : source_record.files) {
+            auto target_path = file.relative_path;
+            if (archive_plan && *target_path.begin() == "tables") {
+                const auto old_name = *std::next(target_path.begin());
+                const auto it = archive_plan->source_names.find(old_name.string());
+                if (it == archive_plan->source_names.end()) continue;
+                target_path = std::filesystem::path("tables") / it->second /
+                    target_path.lexically_relative(std::filesystem::path("tables") / old_name);
+            }
+            const auto copied = CopyBackupFile(backup / file.relative_path, temporary, target_path, file.size);
             if (copied.crc32 != file.crc32) throw std::runtime_error("backup changed while being restored");
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE"))
                 throw std::runtime_error("injected restore copy failure");
@@ -263,6 +444,38 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         auto directory_manifest = *ReadDataDirManifest(temporary);
         RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadWrite);
         const auto old_directory_id = directory_manifest.data_dir_id;
+        if (archive_plan) {
+            const auto& seal = archive_plan->seal;
+            const auto archive_directory = archive / WalArchiveDirectoryDirName(seal.directory);
+            if (seal.users.empty()) std::filesystem::remove(temporary / kUsersFileName);
+            else AtomicWrite(temporary / kUsersFileName,
+                ReadWalArchiveMetadata(archive_directory / seal.users, "users", "", kMaxUsersFileBytes), true, true);
+            if (seal.ledger.empty()) std::filesystem::remove(temporary / kMigrationsFileName);
+            else AtomicWrite(temporary / kMigrationsFileName,
+                ReadWalArchiveMetadata(archive_directory / seal.ledger, "migrations", "", kMaxMigrationRecordsBytes), true, true);
+            record.tables.clear();
+            for (const auto& entry : seal.tables) {
+                if (entry.state != WalArchiveTableState::kSealed) continue;
+                const auto archived_table = archive / WalArchiveTableDirName(entry.epoch);
+                if (!std::filesystem::is_directory(std::filesystem::symlink_status(archived_table)))
+                    throw std::runtime_error("archive table directory is missing: " + archived_table.string());
+                const auto base = std::find_if(source_record.tables.begin(), source_record.tables.end(), [&](const auto& table) {
+                    return table.epoch == entry.epoch;
+                });
+                RollForwardTable(temporary / "tables" / entry.name, archived_table, entry,
+                    archive_plan->files[entry.epoch], base == source_record.tables.end() ? 0U : base->revision);
+                record.tables.push_back({entry.name, entry.epoch, *entry.revision});
+            }
+            record.files.clear();
+            backup_detail::WalkDirectory(temporary, [&](const auto& entry) {
+                if (!entry.is_regular_file() || entry.path().filename() == kRestoreIncompleteName) return;
+                const auto path = entry.path().lexically_relative(temporary);
+                record.files.push_back(InspectBackupFile(temporary, path));
+            });
+            std::sort(record.files.begin(), record.files.end(), [](const auto& left, const auto& right) {
+                return left.relative_path.generic_string() < right.relative_path.generic_string();
+            });
+        }
         const auto migrations = ReadMigrationRecords(temporary);
         directory_manifest.data_dir_id = NewStoreId();
         if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
@@ -302,5 +515,17 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         }
         throw;
     }
+    return archive_plan ? std::move(archive_plan->skipped) : std::vector<std::string>{};
+}
+} // namespace
+
+void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
+    (void)RestoreBackupImpl(source, destination, {}, 0U);
+}
+
+std::vector<std::string> RestoreArchiveSeal(const std::filesystem::path& backup, const std::filesystem::path& target,
+    const std::filesystem::path& archive, std::uint64_t captured_ms) {
+    if (archive.empty() || captured_ms == 0U) throw std::invalid_argument("archive restore requires an archive and a seal timestamp");
+    return RestoreBackupImpl(backup, target, CanonicalBackupPath(archive), captured_ms);
 }
 } // namespace chunkdb

@@ -1,8 +1,8 @@
 # WAL archive, streamed backup and point-in-time restore: design
 
 A writer started with `--archive-dir <path>` or `--archive-command <cmd>` copies every sealed WAL segment of every table to an archive, with a retention bound (#149).
-`chunkdb_restore <backup> <target> --archive <path> --until-time ms | --until-revision n` restores a full backup and rolls it forward with the archive to a point in time.
-`BACKUP STREAM [TABLES a, b]` sends a backup over the connection instead of writing it under `--backup-dir`.
+`chunkdb_restore <backup> <target> --archive <path> --seal-ms <capture-ms>` rolls a full backup forward to a chosen seal.
+The design also describes future selection by arbitrary time or revision and streamed backup.
 The [backup design](BACKUP_DESIGN.md) defines cuts, pins and publication; [Feed slots and archives](../STORAGE_FORMAT.md#feed-slots-and-archives) defines segments and base descriptors.
 
 ## Terms
@@ -31,8 +31,11 @@ One archiver thread serves the server and runs a pass at start, every `--archive
 
 A checkpoint deferred by a running backup leaves the table without a seal point in this pass; its staged files still ship.
 The catalog part of a record (names, epochs, manifests, users file, migrations ledger) is captured under the backup metadata gate, so names, schemas and grants agree; the gate is held only for that capture.
-If a busy or fenced table prevents a complete catalog capture, the pass fails before publishing a new record.
-If a table's manifest changes between capture and sealing, the record keeps the captured manifest and leaves the table unsealed for this pass.
+An unavailable table lease records `busy`; a catalog or store fence records `fenced` with its reason; either state lets the other tables seal normally.
+An unsealed, busy or fenced table carries its last published seal revision, time bound and matching manifest when available.
+A busy table that has never had a captured manifest appears with no manifest or position.
+If a table's manifest changes between capture and sealing, or a backup defers its checkpoint, it is unsealed for this pass.
+A catalog-wide pending migration decision blocks the complete capture until startup recovers it.
 The lease is released before shipping, so a slow archive never delays DDL; staged links survive DROP TABLE.
 
 ## Shipping and seal records
@@ -45,8 +48,8 @@ The staged record is the intent: a writer start that finds one ships the same by
 A failed pass is retried every interval; staged files stay in the data directory meanwhile, and SHOW STATUS shows `archive` with the error and the staged bytes.
 
 Layout: `table.<epoch>/` holds segments, descriptors and manifests `table.<schema version>.<SHA-256>.manifest`; `directory.<data-directory id>/` holds `seal.<capture Unix ms, 20 digits>`, `users.<SHA-256>` and `migrations.<SHA-256>`.
-A seal record holds the data-directory id, its capture time, its predecessor's capture time (zero at a chain start), the users and ledger file names, and per table: name, epoch, seal point and time bound (absent when unsealed), schema version, manifest name, and the files shipped since the predecessor with length and CRC32.
-Every table of the catalog appears in every record, so an idle table gets a new seal point each pass.
+A seal record holds the data-directory id, its capture time, its predecessor's capture time (zero at a chain start), the users and ledger file names, and each table's name, epoch, state, manifest, position when known and file inventory.
+Every table of the catalog appears in every record, including idle, busy and fenced tables.
 A record is published only after every file it names is durable in the archive.
 `.chunkdb.archive/chain` holds the last published record's name; a writer start with archiving reads it as the predecessor after finishing a staged record, and a writer start without archiving, or an offline tool that changes table files, removes `.chunkdb.archive/` before any table opens, so the next record starts a new chain.
 Two records naming the same predecessor are a fork, which only two writers of one copied data directory can make; restore refuses it.
@@ -56,6 +59,8 @@ Two records naming the same predecessor are a fork, which only two writers of on
 `--archive-retention-ms` (0, keep all) applies to `--archive-dir`; a command's destination keeps its own retention.
 A pass takes k, the newest record captured before now minus the bound, and removes older records oldest first; it removes the pruned records before unlinking any segments or descriptors they list.
 A segment or descriptor listed again by a kept record stays in the archive.
+A busy, fenced or otherwise unsealed table keeps the history carried by its last published position; before pruning old records the newest seal re-lists its segments and descriptors that no remaining record would name.
+Retention of other tables continues at their own seal positions.
 A segment listed only by removed records has its last revision at or below k's seal point of its table, so no state at or after k needs it.
 Files of tables absent from k go with the last record listing them; manifests, users and ledger files are small and stay, since a later record can name one again.
 A backup created after k's capture time rolls forward; an older one cannot, and restore says so.
@@ -63,6 +68,10 @@ A backup created after k's capture time rolls forward; an older one cannot, and 
 ## Point-in-time restore
 
 The restore reads the archive from a local path; with `--archive-command`, fetch the destination first.
+`chunkdb_restore <backup> <target> --archive <path> --seal-ms <capture-ms>` restores each sealed table to its revision in the selected seal.
+Restore reports and omits a busy, fenced or otherwise unsealed table because the selected seal cannot certify its state at that cut; the message gives its last position when known and the fence reason when present.
+Healthy tables still restore normally, and `chunkdb_verify --archive <path>` checks the stored records and referenced file inventory.
+Selection by an arbitrary time or revision is separate from restoring to an exact seal and is described below for future work.
 It checks the backup as today, then chooses the target per table:
 
 - `--until-revision n`: one table (the backup holds one, or `--table` names it); n is at or above the cut and at or below a seal point.

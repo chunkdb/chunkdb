@@ -29,6 +29,7 @@ namespace {
 void PrintUsage() {
     std::cout
         << "Usage: chunkdb_verify --data-dir <path> [--features] [options]\n"
+        << "       chunkdb_verify --archive <path>\n"
         << "  --data-dir <path>          data directory to verify (required)\n"
         << "  --features                 include feature registry and manifest masks\n"
         << "Every table is checked with the geometry recorded in its manifest.\n"
@@ -39,6 +40,7 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     std::filesystem::path data_dir;
+    std::filesystem::path archive;
     bool features = false;
 
     try {
@@ -53,6 +55,8 @@ int main(int argc, char** argv) {
             };
             if (arg == "--data-dir") {
                 data_dir = require_value("--data-dir");
+            } else if (arg == "--archive") {
+                archive = require_value("--archive");
             } else if (arg == "--features") {
                 features = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -62,9 +66,8 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown argument: " + arg);
             }
         }
-        if (data_dir.empty()) {
-            throw std::invalid_argument("--data-dir is required");
-        }
+        if (data_dir.empty() == archive.empty() || (features && !archive.empty()))
+            throw std::invalid_argument("choose --data-dir or --archive; --features requires --data-dir");
     } catch (const std::exception& e) {
         std::cerr << "chunkdb_verify: " << e.what() << "\n";
         PrintUsage();
@@ -74,11 +77,13 @@ int main(int argc, char** argv) {
     chunkdb::VerifyCounters counters;
     try {
         std::error_code exists_ec;
-        if (!std::filesystem::is_directory(data_dir, exists_ec) || exists_ec) {
-            std::cerr << "chunkdb_verify: data directory not found: " << data_dir.string() << "\n";
+        const auto& path = archive.empty() ? data_dir : archive;
+        if (!std::filesystem::is_directory(path, exists_ec) || exists_ec) {
+            std::cerr << "chunkdb_verify: directory not found: " << path.string() << "\n";
             return 2;
         }
-        counters = chunkdb::VerifyDataDirectory(data_dir, std::cout, features);
+        counters = archive.empty() ? chunkdb::VerifyDataDirectory(data_dir, std::cout, features) :
+            chunkdb::VerifyWalArchive(archive, std::cout);
     } catch (const std::exception& e) {
         std::cerr << "chunkdb_verify: fatal: " << e.what() << "\n";
         return 2;

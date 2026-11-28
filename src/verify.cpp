@@ -37,6 +37,7 @@
 #include "txn_intent_format.hpp"
 #include "shared_file_input.hpp"
 #include "commit_group_coordinator.hpp"
+#include "wal_archive.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -1225,6 +1226,85 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
         }
     }
     VerifyDataDirectoryImpl(data_dir, &counters);
+    return counters;
+}
+
+chunkdb::VerifyCounters chunkdb::VerifyWalArchive(const std::filesystem::path& archive, std::ostream& out) {
+    ::VerifyCounters counters;
+    counters.out = &out;
+    for (const auto& directory : backup_detail::DirectoryEntries(archive)) {
+        const auto directory_name = directory.path().filename().string();
+        if (!directory_name.starts_with("directory.")) continue;
+        if (!std::filesystem::is_directory(directory.symlink_status())) {
+            Report(&counters, true, "wal_archive_directory_invalid", directory.path(), "expected a directory");
+            continue;
+        }
+        std::map<std::uint64_t, std::filesystem::path> seals;
+        for (const auto& file : backup_detail::DirectoryEntries(directory.path())) {
+            if (const auto capture = ParseWalArchiveRecordName(file.path().filename().string()))
+                seals.emplace(*capture, file.path());
+        }
+        std::optional<std::uint64_t> previous;
+        std::map<std::filesystem::path, WalArchiveFile> files;
+        std::set<std::filesystem::path> metadata;
+        std::map<std::filesystem::path, std::pair<StoreId, std::uint64_t>> manifests;
+        for (const auto& [capture, path] : seals) {
+            ++counters.checked;
+            try {
+                const auto seal = ReadWalArchiveRecord(path);
+                if (seal.captured_ms != capture || WalArchiveDirectoryDirName(seal.directory) != directory_name ||
+                    (previous && seal.predecessor_ms != 0U && seal.predecessor_ms != *previous))
+                    throw std::runtime_error("seal identity or predecessor does not match the archive inventory");
+                if (!seal.users.empty()) {
+                    const auto users = directory.path() / seal.users;
+                    if (!metadata.contains(users)) {
+                        (void)DecodeUsers(ReadWalArchiveMetadata(users, "users", "", kMaxUsersFileBytes));
+                        metadata.insert(users);
+                        ++counters.checked;
+                    }
+                }
+                if (!seal.ledger.empty()) {
+                    const auto ledger = directory.path() / seal.ledger;
+                    if (!metadata.contains(ledger)) {
+                        (void)DecodeMigrationRecords(ReadWalArchiveMetadata(ledger, "migrations", "", kMaxMigrationRecordsBytes), seal.directory);
+                        metadata.insert(ledger);
+                        ++counters.checked;
+                    }
+                }
+                for (const auto& table : seal.tables) {
+                    if (table.manifest.empty() && table.files.empty()) continue;
+                    const auto parent = archive / WalArchiveTableDirName(table.epoch);
+                    if (!std::filesystem::is_directory(std::filesystem::symlink_status(parent)))
+                        throw std::runtime_error("archive table directory is missing: " + parent.string());
+                    if (!table.manifest.empty()) {
+                        const auto manifest = parent / table.manifest;
+                        auto known = manifests.find(manifest);
+                        if (known == manifests.end()) {
+                            const auto decoded = ParseStoreManifest(ReadWalArchiveMetadata(manifest,
+                                "table." + std::to_string(table.schema_version), ".manifest", kStoreManifestMaxSize));
+                            known = manifests.emplace(manifest, std::pair{decoded.store_id, decoded.schema.version}).first;
+                            ++counters.checked;
+                        }
+                        if (known->second != std::pair{table.epoch, table.schema_version})
+                            throw std::runtime_error("archive table manifest has the wrong identity: " + manifest.string());
+                    }
+                    for (const auto& file : table.files) {
+                        const auto [it, inserted] = files.try_emplace(parent / file.name, file);
+                        if (!inserted && it->second != file)
+                            throw std::runtime_error("conflicting WAL archive inventory for " + file.name);
+                    }
+                }
+            } catch (const std::exception& error) {
+                Report(&counters, true, "wal_archive_seal_invalid", path, error.what());
+            }
+            previous = capture;
+        }
+        for (const auto& [path, entry] : files) {
+            ++counters.checked;
+            try { VerifyWalArchiveFile(path, entry); }
+            catch (const std::exception& error) { Report(&counters, true, "wal_archive_file_invalid", path, error.what()); }
+        }
+    }
     return counters;
 }
 

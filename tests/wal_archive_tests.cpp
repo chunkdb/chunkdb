@@ -3,11 +3,13 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "backup.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -15,14 +17,26 @@
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "feed_test_utils.hpp"
+#include "login_helpers.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
 #include "feed_slot_records.hpp"
 #include "users.hpp"
+#include "verify.hpp"
 #include "wal_archive.hpp"
 
 using namespace chunkdb;
 using namespace chunkdb::feed_test;
+
+namespace chunkdb {
+struct WalArchiveTestAccess {
+    static void AgeSeals(TableCatalog& catalog, std::chrono::milliseconds age) {
+        auto& archiver = *catalog.archiver_;
+        std::lock_guard lock(archiver.pass_mutex_);
+        archiver.last_attempt_ms_ += static_cast<std::uint64_t>(age.count());
+    }
+};
+}  // namespace chunkdb
 
 namespace {
 
@@ -89,10 +103,21 @@ std::uint64_t Completed(Table& table) {
 void RecordFormat() {
     WalArchiveRecord record{{1U, 2U}, 42U, 41U, "users.0000abcd", "", {}};
     record.tables.push_back({"world", {3U}, 9U, 40U, 2U, "table.2.00001234.manifest",
-        {{"C_0_0.5-9.wal", 100U, 7U}, {"C_0_0.5.base", 80U, 8U}, {"table.2.00001234.manifest", 10U, 9U}}});
-    record.tables.push_back({"", {4U}, std::nullopt, 0U, 1U, "", {{"C_1_0.3-4.wal", 10U, 9U}}});
+        {{"C_0_0.5-9.wal", 100U, 7U}, {"C_0_0.5.base", 80U, 8U}, {"table.2.00001234.manifest", 10U, 9U}},
+        WalArchiveTableState::kSealed});
+    record.tables.push_back({"", {4U}, std::nullopt, 0U, 0U, "", {{"C_1_0.3-4.wal", 10U, 9U}},
+        WalArchiveTableState::kDetached});
+    record.tables.push_back({"frozen", {5U}, 5U, 32U, 1U, "table.1.example.manifest", {},
+        WalArchiveTableState::kFenced, "lost durability"});
+    record.tables.push_back({"busy", {6U}, std::nullopt, 0U, 0U, "", {}, WalArchiveTableState::kBusy});
     const auto bytes = SerializeWalArchiveRecord(record);
     assert(ParseWalArchiveRecord(bytes) == record);
+    auto unknown_state = bytes;
+    const auto first_state = 40U + 1U + record.users.size() + 1U + record.ledger.size() + 4U;
+    unknown_state.at(first_state) = 255U;
+    unknown_state.resize(unknown_state.size() - 4U);
+    WriteLe32(unknown_state, Crc32(unknown_state));
+    Throws([&] { (void)ParseWalArchiveRecord(unknown_state); });
     auto damaged = bytes;
     damaged[damaged.size() / 2U] ^= 1U;
     Throws([&] { (void)ParseWalArchiveRecord(damaged); });
@@ -106,10 +131,10 @@ void RecordFormat() {
     auto unordered = record;
     unordered.predecessor_ms = unordered.captured_ms;
     Throws([&] { (void)SerializeWalArchiveRecord(unordered); });
-    // An unsealed entry carries no time bound.
+    // A position must be explicitly present to carry its time bound.
     auto bounded = record;
     bounded.tables[1].time_bound_ms = 5U;
-    assert(ParseWalArchiveRecord(SerializeWalArchiveRecord(bounded)).tables[1].time_bound_ms == 0U);
+    Throws([&] { (void)SerializeWalArchiveRecord(bounded); });
 
     const StoreId directory{7U, 8U};
     const auto chain = SerializeWalArchiveChain(directory, 42U);
@@ -313,37 +338,146 @@ void RetrySyncsExistingArchiveFiles() {
     assert(resynced && catalog.ArchiveStatus()->last_seal_ms > last && !catalog.ArchiveStatus()->error);
 }
 
-void BusyTableDefersCatalogCapture() {
+void CheckRestoredHealthy(const std::filesystem::path& target, std::uint32_t value) {
+    TableCatalog restored(Config(target));
+    assert(!restored.Find("default"));
+    const auto table = restored.Find("healthy");
+    assert(table);
+    const auto lease = table->Acquire();
+    assert(lease && lease->store().GetBlockBits(0, 0) == Bits(value));
+}
+
+void BusyTableLeavesHealthySeals() {
     test::ScopedTempDir temporary("chunkdb-wal-archive-busy-table");
     const auto root = std::filesystem::canonical(temporary.path());
-    TableCatalog catalog(ArchiveConfig(root / "data", root / "archive"));
+    const auto backup = root / "backup", archive = root / "archive", target = root / "restored";
+    const auto data = root / "data";
+    TableCatalog catalog(ArchiveConfig(data, archive));
     AwaitFirstPass(catalog);
     const auto table = CreateDefault(catalog);
-    const auto last = catalog.ArchiveStatus()->last_seal_ms;
+    const auto healthy = catalog.Create("healthy", table->geometry().config(), catalog.default_options());
+    const auto directory = ReadDataDirManifest(data)->data_dir_id;
+    Write(*healthy, 0, 0, 7U);
+    (void)catalog.BackupTo(backup, {});
     struct CaptureWhileBusy : MigrationTestHook {
-        explicit CaptureWhileBusy(TableCatalog& catalog_in) : catalog(catalog_in) {}
+        CaptureWhileBusy(TableCatalog& catalog_in, Table& healthy_in)
+            : catalog(catalog_in), healthy(healthy_in) {}
         void Run(Point point, std::string_view name) override {
             if (point != Point::kBeforeCatalogAdmission) return;
             assert(name == "default");
-            Throws([&] { catalog.RunArchivePass(); });
-            const auto status = catalog.ArchiveStatus();
-            assert(status->error && status->error->find("busy table 'default'") != std::string::npos);
+            for (const auto value : {1U, 2U}) {
+                const auto last = catalog.ArchiveStatus()->last_seal_ms;
+                Write(healthy, 0, 0, value);
+                catalog.RunArchivePass();
+                const auto status = catalog.ArchiveStatus();
+                assert(!status->error && status->last_seal_ms > last);
+                assert(status->tables.size() == 1U && status->tables.front().name == "healthy");
+            }
             ran = true;
         }
         TableCatalog& catalog;
+        Table& healthy;
         bool ran = false;
-    } hook(catalog);
+    } hook(catalog, *healthy);
     catalog.SetMigrationTestHook(&hook);
     TableOptionsUpdate options;
     options.checkpoint_update_interval = 200U;
     catalog.SetOptions("default", options);
     catalog.SetMigrationTestHook(nullptr);
-    assert(hook.ran && catalog.ArchiveStatus()->last_seal_ms == last);
-
+    assert(hook.ran);
+    const auto seal = Records(archive, directory).back();
+    const auto* busy = Entry(seal, table->store_id());
+    assert(busy && busy->name == "default" && busy->state == WalArchiveTableState::kBusy);
+    assert(!busy->revision && busy->manifest.empty());
+    const auto skipped = RestoreArchiveSeal(backup, target, archive, seal.predecessor_ms);
+    assert(skipped == std::vector<std::string>{"skipped table 'default': busy; no previous seal"});
+    CheckRestoredHealthy(target, 1U);
     catalog.RunArchivePass();
-    const auto status = catalog.ArchiveStatus();
-    assert(status->last_seal_ms > last && !status->error);
-    assert(status->tables.size() == 1U && status->tables[0].name == table->name());
+    const auto available = Records(archive, directory).back();
+    const auto* prior = Entry(available, table->store_id());
+    assert(prior && prior->state == WalArchiveTableState::kSealed);
+
+    catalog.SetMigrationTestHook(&hook);
+    options.checkpoint_update_interval = 300U;
+    catalog.SetOptions("default", options);
+    catalog.SetMigrationTestHook(nullptr);
+    const auto again = Records(archive, directory).back();
+    const auto* stale = Entry(again, table->store_id());
+    assert(stale && stale->state == WalArchiveTableState::kBusy && stale->revision == prior->revision &&
+        stale->manifest == prior->manifest && stale->time_bound_ms == prior->time_bound_ms);
+}
+
+void FencedTableLeavesHealthySealsAndRetention() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-fenced-table");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive", backup = root / "backup", target = root / "restored";
+    auto config = ArchiveConfig(data, archive);
+    config.wal_archive.retention = std::chrono::hours(1);
+    TableCatalog catalog(config);
+    AwaitFirstPass(catalog);
+    const auto table = CreateDefault(catalog);
+    const auto healthy = catalog.Create("healthy", table->geometry().config(), catalog.default_options());
+    const auto directory = ReadDataDirManifest(data)->data_dir_id;
+    (void)catalog.BackupTo(backup, {});
+    Write(*table, 0, 0, 9U);
+    Write(*healthy, 0, 0, 1U);
+    catalog.RunArchivePass();
+    const auto good = Records(archive, directory).back();
+    const auto* prior = Entry(good, table->store_id());
+    assert(prior && prior->revision && !prior->manifest.empty());
+    const auto blocked_files = archive / WalArchiveTableDirName(table->store_id());
+    const auto healthy_files = archive / WalArchiveTableDirName(healthy->store_id());
+    const auto old_healthy = Files(healthy_files, ".wal").front();
+    const auto old_blocked = Files(blocked_files, ".wal").front();
+    assert(old_healthy != old_blocked);
+
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE", "1");
+        TableOptionsUpdate options;
+        options.checkpoint_update_interval = 200U;
+        Throws([&] { catalog.SetOptions("default", options); });
+    }
+    assert(!catalog.Find("default") && catalog.Fence("default"));
+    for (const auto value : {2U, 3U}) {
+        const auto last = catalog.ArchiveStatus()->last_seal_ms;
+        Write(*healthy, 0, 0, value);
+        catalog.RunArchivePass();
+        assert(catalog.ArchiveStatus()->last_seal_ms > last && !catalog.ArchiveStatus()->error);
+    }
+    const auto seal = Records(archive, directory).back();
+    const auto* fenced = Entry(seal, table->store_id());
+    assert(fenced && fenced->state == WalArchiveTableState::kFenced && !fenced->reason.empty());
+    assert(fenced->revision == prior->revision && fenced->time_bound_ms == prior->time_bound_ms &&
+        fenced->manifest == prior->manifest);
+    const auto skipped = RestoreArchiveSeal(backup, target, archive, seal.captured_ms);
+    assert(skipped.size() == 1U && skipped.front().starts_with("skipped table 'default': fenced") &&
+        skipped.front().ends_with(std::to_string(*prior->revision)));
+    CheckRestoredHealthy(target, 3U);
+
+    WalArchiveTestAccess::AgeSeals(catalog, std::chrono::hours(2));
+    Write(*healthy, 0, 0, 4U);
+    catalog.RunArchivePass();
+    assert(!std::filesystem::exists(old_healthy) && std::filesystem::exists(old_blocked));
+    const auto kept = Records(archive, directory);
+    assert(kept.size() == 2U && kept.front().captured_ms == seal.captured_ms);
+    const auto* pinned = Entry(kept.back(), table->store_id());
+    assert(pinned && pinned->state == WalArchiveTableState::kFenced && pinned->revision == prior->revision);
+    assert(std::any_of(pinned->files.begin(), pinned->files.end(),
+        [&](const auto& file) { return file.name == old_blocked.filename().string(); }));
+    const auto saved = ReadWalArchiveRecord(data / kWalArchiveStagingName / "last");
+    const auto* remembered = Entry(saved, table->store_id());
+    assert(remembered && remembered->revision == prior->revision && remembered->files.empty());
+    std::ostringstream findings;
+    assert(VerifyWalArchive(archive, findings).errors == 0U);
+
+    catalog.RecoverTable("default");
+    const auto recovered = catalog.Find("default");
+    assert(recovered);
+    Write(*recovered, 0, 0, 10U);
+    catalog.RunArchivePass();
+    const auto next = Records(archive, directory).back();
+    const auto* normal = Entry(next, recovered->store_id());
+    assert(normal && normal->state == WalArchiveTableState::kSealed && normal->revision == Completed(*recovered));
 }
 
 void ArchiveShowStatus() {
@@ -364,6 +498,40 @@ void ArchiveShowStatus() {
         std::to_string(status->last_seal_ms) + "\r\n$5\r\nerror\r\n_\r\n$12\r\nstaged_bytes\r\n:0\r\n" +
         "$6\r\ntables\r\n*1\r\n%2\r\n$4\r\nname\r\n$7\r\ndefault\r\n$8\r\nrevision\r\n:" +
         std::to_string(Completed(*table)) + "\r\n"));
+}
+
+void PendingGrantStopsArchiveAndWrites() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-pending-grant");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data";
+    auto config = ArchiveConfig(data, root / "archive");
+    std::uint64_t before = 0U;
+    {
+        const auto catalog = std::make_shared<TableCatalog>(config);
+        AwaitFirstPass(*catalog);
+        const auto table = CreateDefault(*catalog);
+        (void)catalog->Create("healthy", table->geometry().config(), catalog->default_options());
+        (void)catalog->Create("other", table->geometry().config(), catalog->default_options());
+        const auto users = test::MakeUsers(data, "admin", "admin-password");
+        CommandEngine engine(EngineConfig{.require_auth = false, .users = users}, catalog);
+        SessionState session;
+        assert(engine.Execute(session, "HELLO 3\r\n").starts_with('%'));
+        catalog->RunArchivePass();
+        before = catalog->ArchiveStatus()->last_seal_ms;
+        {
+            txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+            assert(engine.Execute(session, "MIGRATE 'grant' GRANT WRITE ON healthy TO admin\r\n").starts_with("-ERR OUTCOME_UNKNOWN "));
+        }
+        assert(ReadMigrationJournal(data));
+        const auto write = engine.Execute(session, "SET BLOCK 0 0 IN other bits = b'00000000000000000000000000000001'\r\n");
+        assert(write.starts_with("-ERR INTERNAL ") && write.find(kMigrationRecoveryRequiredMessage) != std::string::npos);
+        Throws([&] { catalog->RunArchivePass(); });
+        assert(catalog->ArchiveStatus()->last_seal_ms == before);
+    }
+    TableCatalog recovered(config);
+    AwaitFirstPass(recovered);
+    assert(!ReadMigrationJournal(data) && recovered.ArchiveStatus()->last_seal_ms > before);
+    Write(*recovered.Find("other"), 0, 0, 1U);
 }
 
 // Records of one chain, oldest first: each names the previous one, and only
@@ -492,9 +660,9 @@ void RetentionPreservesRepeatedFiles() {
     // Age the records deterministically. The kept record re-lists the same
     // segment and descriptor, as staging can do after a restart.
     const WalArchiveRecord first{directory, 1U, 0U, "", "",
-        {{"default", epoch, 2U, 1U, 1U, "", {duplicate, descriptor, obsolete}}}};
+        {{"default", epoch, 2U, 1U, 1U, "table.1.fixture.manifest", {duplicate, descriptor, obsolete}, WalArchiveTableState::kSealed}}};
     const WalArchiveRecord kept{directory, 2U, 1U, "", "",
-        {{"default", epoch, 2U, 2U, 1U, "", {duplicate, descriptor}}}};
+        {{"default", epoch, 2U, 2U, 1U, "table.1.fixture.manifest", {duplicate, descriptor}, WalArchiveTableState::kSealed}}};
     for (const auto& record : {first, kept})
         AtomicWrite(records_dir / WalArchiveRecordName(record.captured_ms), SerializeWalArchiveRecord(record), true, true);
     AtomicWrite(data / kWalArchiveStagingName / kWalArchiveChainName, SerializeWalArchiveChain(directory, kept.captured_ms), true, true);
@@ -576,8 +744,10 @@ int main() {
     ChangedMetadata();
     ExistingArchiveFileMustMatch();
     RetrySyncsExistingArchiveFiles();
-    BusyTableDefersCatalogCapture();
+    BusyTableLeavesHealthySeals();
+    FencedTableLeavesHealthySealsAndRetention();
     ArchiveShowStatus();
+    PendingGrantStopsArchiveAndWrites();
     ChainAndTimeBound();
     Retention();
     RetentionPreservesRepeatedFiles();
