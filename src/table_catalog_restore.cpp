@@ -1,5 +1,6 @@
 #include "chunkdb/table_catalog.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <sstream>
@@ -294,8 +295,11 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     // floor rises above both clocks durably before the exchange, and each
     // table opens at it under its new name. A failure here serves both
     // tables as they were.
-    RaiseVersionFloor(std::max(stores[0]->version_clock_ceiling_.load(std::memory_order_acquire),
-        stores[1]->version_clock_ceiling_.load(std::memory_order_acquire)));
+    const auto floor = std::max({version_floor_,
+        stores[0]->version_clock_ceiling_.load(std::memory_order_acquire),
+        stores[1]->version_clock_ceiling_.load(std::memory_order_acquire)});
+    ChunkStore::RequireWritableNameFloor(floor);
+    RaiseVersionFloor(floor);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_VERSION_FLOOR_ONCE");
     // Their existing chunks keep their versions, which may equal versions
     // the other table gave under the name: each records the floor as its
@@ -311,6 +315,15 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         std::make_shared<ChunkStore::UnsyncedArtifacts>(), std::make_shared<ChunkStore::UnsyncedArtifacts>()};
     // Unsynced paths are spelled below each store's own directory.
     const std::array<std::string, 2U> store_dirs{stores[0]->data_dir().string(), stores[1]->data_dir().string()};
+    // Carry the fork across the exchange only when this instance proves it
+    // issued no revision after the fork. The persisted ceiling alone cannot
+    // distinguish a clock jump at open from a reservation used for writes.
+    std::array<std::uint64_t, 2U> fork_starts{};
+    for (std::size_t i = 0; i < stores.size(); ++i) {
+        const auto& store = *stores[i];
+        const auto start = store.FeedStartClock(store.version_clock_.load(std::memory_order_seq_cst));
+        if (store.lineage_ && store.lineage_->fork_revision == start - 1U) fork_starts[i] = start;
+    }
     // A stop accepted until here leaves both tables serving as they were;
     // after it the statement reports its real outcome.
     EnterStatementDecision();
@@ -324,6 +337,7 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         const auto manifest = ReadOpenableManifest(dirs[name]);
         const auto table_options = DecodeTableOptions(manifest.options);
         auto store = OpenStore(names[name], dirs[name], manifest.geometry, 0U, table_options);
+        if (fork_starts[from] != 0U) store->opened_clock_ = fork_starts[from];
         ChunkStore::UnsyncedArtifacts moved;
         moved.overflow = unsynced[from]->overflow;
         const auto& old_dir = store_dirs[from];
@@ -368,6 +382,7 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
             }
             try {
                 auto store = OpenStore(names[i], dirs[i], tables[i]->geometry().config(), 0U, options[i]);
+                if (fork_starts[i] != 0U) store->opened_clock_ = fork_starts[i];
                 store->AdoptUnsynced(*unsynced[i]);
                 tables[i]->EndExclusive(std::move(store), options[i]);
             } catch (const std::exception& error) {
@@ -479,7 +494,9 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     // dropped under the new name. The version floor rises above this clock
     // durably before the rename, and the table opens at it under its new
     // name. A failure here serves the table unchanged.
-    RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
+    const auto floor = std::max(version_floor_, store->version_clock_ceiling_.load(std::memory_order_acquire));
+    ChunkStore::RequireWritableNameFloor(floor);
+    RaiseVersionFloor(floor);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_VERSION_FLOOR_ONCE");
     // Its existing chunks keep their versions, which may equal versions a
     // table dropped under the new name gave: they report the name floor.

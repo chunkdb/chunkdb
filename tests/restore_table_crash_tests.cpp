@@ -199,7 +199,9 @@ void RenameCrashes(const std::string& executable) {
                     // every crash point, so a table created under the old name
                     // starts above it.
                     const auto root = ReadDataDirManifest(source.data);
-                    assert(root && DataDirVersionFloor(*root) > lease->store().GetChunkVersion(0, 0));
+                    const auto page = lease->store().ScanChunkIdentities(false, {}, 1U);
+                    assert(page.entries.size() == 1U && page.entries.front().coord == (ChunkCoord{0, 0}));
+                    assert(root && DataDirVersionFloor(*root) > page.entries.front().version);
                     // From the name floor on, the table's manifest carries it.
                     assert((ReadStoreManifest(source.data / "tables" / (renamed ? "t_old" : "t"))->name_floor ==
                                DataDirVersionFloor(*root)) == name_floor);

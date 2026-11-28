@@ -50,14 +50,20 @@ inline GeometryConfig SourceGeometry() {
 inline void RefusesStaleVersion(TableCatalog& catalog, std::string_view name, std::uint64_t stale) {
     auto lease = catalog.Require(name)->Acquire();
     auto& store = lease->store();
-    for (std::uint64_t i = 0U; i <= stale && store.GetChunkVersion(4, 0) < stale; ++i)
-        store.SetBlockBits(8, 0, i % 2U == 0U ? "00000110" : "00000111");
+    // Force a change even if the first read already reports the name floor.
+    std::string_view bits = store.GetBlockBits(8, 0) == "00000110" ? "00000111" : "00000110";
+    for (std::uint64_t i = 0U; i <= stale; ++i) {
+        store.SetBlockBits(8, 0, bits);
+        if (store.GetChunkVersion(4, 0) >= stale) break;
+        bits = bits == "00000110" ? "00000111" : "00000110";
+    }
     assert(store.GetChunkVersion(4, 0) > stale);
+    assert(store.GetChunkVersion(4, 0) > store.name_floor());
     assert(!store.UnsetBlock(8, 0, stale).ok);
     assert(store.BlockExists(8, 0));
 }
 
-// A table `t` with a slot, a checkpointed image, a WAL-only chunk and
+// A table `t` with an optional slot, a checkpointed image, a WAL-only chunk and
 // tombstones in two large chunks, backed up to `backup`; a later write is
 // not in the backup.
 struct Source {
@@ -69,11 +75,11 @@ struct Source {
     std::uint64_t cut = 0U, live = 0U, wal_only = 0U;
     std::array<std::uint64_t, 2U> deleted{};
 
-    explicit Source(DurabilityMode durability = DurabilityMode::kRelaxed) : mode(durability) {
+    explicit Source(DurabilityMode durability = DurabilityMode::kRelaxed, bool with_slot = true) : mode(durability) {
         TableCatalog catalog(Config());
         const auto table = catalog.Create("t", SourceGeometry(), catalog.default_options());
         epoch = table->store_id();
-        (void)table->CreateFeedSlot("consumer");
+        if (with_slot) (void)table->CreateFeedSlot("consumer");
         {
             auto lease = table->Acquire();
             auto& store = lease->store();

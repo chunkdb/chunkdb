@@ -1340,6 +1340,7 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
 
 void TableCatalog::RecordNameFloor(const std::filesystem::path& dir) {
     auto manifest = ReadOpenableManifest(dir);
+    ChunkStore::RequireWritableNameFloor(std::max(version_floor_, manifest.name_floor));
     if (version_floor_ <= manifest.name_floor) {
         return;
     }

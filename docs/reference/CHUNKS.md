@@ -119,7 +119,8 @@ SHOW TABLE STATS table
 - SET CHUNK: destination chunk version; the input's version and time do not select the committed identity.
 - GET AREA: populated chunks, including metadata-only chunks, in lexicographic coordinate order.
 - SCAN CHUNKS: `chunks`, `more`, `epoch`, `position`, and `retained_deletion_floor`; with WHERE, `after` follows `more`.
-- Each scan row contains the active chunk coordinates and producing version, followed by a form or null when WITH DATA is present.
+- Each scan row contains the active chunk coordinates and the version used by IF VERSION, followed by a form or null when WITH DATA is present.
+- For a written chunk, the returned version is its producing revision or the table's name floor, whichever is higher.
 - Scan rows ascend by cx, then cy, then cz, within a page and across pages continued AFTER.
 - Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; on a server started with `--read-only`, `position` is null.
 - Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
@@ -197,7 +198,7 @@ LIMIT, AFTER and `max_area_chunks` still count requested chunk positions, not sa
 ## Tombstones
 
 GET CHUNK returns an empty form for a retained tombstone; ordinary areas and scans omit it.
-SCAN SINCE returns its coordinates and producing version so consumers can observe deletion.
+SCAN SINCE selects the tombstone by its stored producing revision and returns its coordinates and the version used by IF VERSION.
 A scan reports current identities rather than every intervening change; use WATCH for an ordered change stream.
 COMPACT TOMBSTONES requires table ADMIN and is unavailable inside transactions or on read-only servers.
 BEFORE n forgets eligible retained tombstones through `min(n - 1, completed_revision)`; zero changes nothing.

@@ -1463,7 +1463,8 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     MaskUnusedPayloadBits(geometry_, &canonical_payload);
     auto canonical_presence = presence_bitmap;
     MaskUnusedPresenceBits(geometry_, &canonical_presence);
-    return ApplyChunkState({chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+    const auto revision = ApplyChunkState({chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+    return ReportedVersion(revision);
 }
 
 std::uint64_t ChunkStore::ApplyChunkState(

@@ -528,6 +528,25 @@ void TestNameFloorVersions() {
     assert(written > floor && VersionOf(f.Run("GET BLOCK 28 0 FROM bank WITH VERSION").substr(4)) == written);
 }
 
+void TestNameFloorScanSinceTombstone() {
+    Fixture f;
+    const auto first = VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 1"));
+    const auto deleted = VersionOf(f.Run("DELETE BLOCK 0 0 FROM bank"));
+    {
+        auto lease = f.catalog->Require("bank")->Acquire();
+        lease->store().CheckpointForTests(0, 0);
+        assert(lease->store().RetainedTombstoneCount() == 1U);
+    }
+    ExpectReply(f.Run("ALTER TABLE bank RENAME TO other"), "+OK\r\n");
+    const auto floor = f.catalog->Require("other")->Acquire()->store().name_floor();
+    assert(floor > deleted);
+    const auto prefix = "SCAN CHUNKS FROM other SINCE ";
+    const auto scan = f.Run(prefix + std::to_string(first) + " WITH DATA");
+    assert(Contains(scan, "*4\r\n:0\r\n:0\r\n:" + std::to_string(floor) + "\r\n_\r\n"));
+    const auto caught_up = f.Run(prefix + std::to_string(deleted) + " WITH DATA");
+    assert(caught_up.starts_with("%5\r\n$6\r\nchunks\r\n*0\r\n"));
+}
+
 // Under the chunk's lock the store decodes only the columns the decision
 // reads.
 void TestDecisionDecodesItsColumns() {
@@ -559,6 +578,7 @@ int main() {
     TestVersionParameter();
     TestDecisionDecodesItsColumns();
     TestNameFloorVersions();
+    TestNameFloorScanSinceTombstone();
     std::puts("conditional writes tests passed");
     return 0;
 }

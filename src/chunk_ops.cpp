@@ -453,7 +453,7 @@ ChunkState ChunkStore::ReadChunkState(const ChunkCoord& chunk_coord) {
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return ChunkState{
-        .version = regular_chunk->version,
+        .version = ReportedVersion(regular_chunk->version),
         .payload = regular_chunk->payload,
         .presence_bitmap = regular_chunk->presence_bitmap,
         .vars = regular_chunk->vars,

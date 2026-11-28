@@ -23,7 +23,6 @@
 #include <system_error>
 #include <thread>
 #include <type_traits>
-#include <limits>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -902,9 +901,8 @@ class ChunkStore {
         std::int64_t cx, std::int64_t cy, std::int64_t cz,
         std::int64_t radius_chunks, bool with_vars = false, const TxnAreaRead& txn_read = {});
 
-    // The chunk's state read under one lock. A chunk without blocks has an
-    // empty presence bitmap and still a version, which a conditional write
-    // that creates it compares against.
+    // The chunk's state and conditional-write version read under one lock.
+    // A retained empty chunk has an empty presence bitmap and keeps a version.
     [[nodiscard]] ChunkState ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] ChunkState ReadChunkState(const ChunkCoord& chunk_coord);
     // Replaces the chunk's payload, presence and text and bytes values as
@@ -926,9 +924,8 @@ class ChunkStore {
         const ChunkCoord& chunk_coord, std::optional<std::uint64_t> expected_version,
         bool if_absent, const std::function<void(ChunkState&)>& transform);
 
-    // Committed chunk versions are producing commit revisions, ordered only
-    // within this store_id. Their reservation ceiling survives restart.
-    // GetChunkVersion returns zero for chunks without a producing commit.
+    // Returns the conditional-write version, or zero for a chunk without a
+    // producing commit. ScanChunkIdentities exposes stored revisions.
     [[nodiscard]] std::uint64_t GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y);
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
@@ -1451,11 +1448,10 @@ class ChunkStore {
     // leave the clock unused and issue random epoch tokens instead.
     std::atomic<std::uint64_t> version_clock_{0};
     std::atomic<std::uint64_t> version_clock_ceiling_{0};
-    // The recovered clock when the data directory's version floor raised it
-    // on opening (RaiseVersionClockToFloor), otherwise the largest u64. This
-    // store issued no token from it up to the raised clock, so a change
-    // feed's history is complete from just below it.
-    std::uint64_t opened_clock_ = std::numeric_limits<std::uint64_t>::max();
+    // This store opened with no changes in [opened_clock_, first_version_clock_).
+    // A fresh feed can use that interval while the clock is still untouched.
+    std::uint64_t opened_clock_ = 0U;
+    std::uint64_t first_version_clock_ = 0U;
     // Latest commit time this store instance issued (Unix ms).
     std::atomic<std::uint64_t> last_commit_time_ms_{0};
     std::mutex version_clock_mutex_;
@@ -1778,13 +1774,18 @@ class ChunkStore {
     // proves that this store previously exposed deterministic version tokens.
     void InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error);
     void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
+    // Called during open or with version_clock_mutex_ held.
+    void PersistVersionClockCeiling(std::uint64_t ceiling);
     // Moves the clock past a persisted chunk revision seen at load time, so
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
-    // Raises the clock of a writer to initial_version_floor_ after recovery,
-    // durably before its first token, and records opened_clock_.
+    // Raises the clock of a writer to its floors after recovery, durably
+    // before its first token, and records the opening interval for feeds.
     void RaiseVersionClockToFloor();
+    [[nodiscard]] std::uint64_t FeedStartClock(std::uint64_t clock) const noexcept;
+    // A table taking a name needs room for a reservation above its name floor.
+    static void RequireWritableNameFloor(std::uint64_t name_floor);
     void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.

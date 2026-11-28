@@ -94,7 +94,7 @@ A REQUIRED chunk column without a default must be initialized by a complete chun
 Absent blocks differ from present blocks whose values are zero or NULL.
 A rejected value changes nothing.
 
-A committed chunk version is its producing commit revision, never a timestamp.
+A chunk's version is its producing commit revision or the table's name floor, whichever is higher.
 Compare revisions only within the same table epoch, obtained from DESCRIBE.
 IF VERSION still compares for equality; another chunk's write does not change this chunk's version.
 An absent chunk supplies no token, and zero does not mean create-if-absent.

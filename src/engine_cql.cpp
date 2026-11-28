@@ -2013,11 +2013,11 @@ std::string CommandEngine::ExecuteStatement(
                         private_state = own != txn.writes.end();
                         state = own != txn.writes.end() ? own->second
                                                         : store.ReadChunkStateAt(*txn.snapshot, coord);
+                        state.version = store.ReportedVersion(state.version);
                     } else {
                         state = store.ReadChunkState(coord);
                     }
                     if (!state.written) return NullReply();
-                    state.version = store.ReportedVersion(state.version);
                     ReplyParts reply;
                     AppendChunkState(reply, store.geometry(), state, columns, private_state);
                     return FinishReply(std::move(reply), continuation);
