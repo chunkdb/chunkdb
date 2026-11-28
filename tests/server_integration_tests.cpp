@@ -4566,6 +4566,27 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
+// A delivery hook is refused before the server's transports exist, which it
+// would not reach; clearing one needs none.
+void TestDeliveryHookNeedsTransports() {
+    struct Unused : chunkdb::FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+    } hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.data_dir = TempDataDir("hook-before-start");
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+        auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        chunkdb::ChunkServer server(BaseServerConfig(), engine);
+        bool refused = false;
+        try { chunkdb::FeedDeliveryTestAccess::SetObserverHook(server, &hook); }
+        catch (const std::logic_error& error) { refused = std::string(error.what()).find("transports") != std::string::npos; }
+        assert(refused);
+        chunkdb::FeedDeliveryTestAccess::SetHook(server, nullptr);
+    }
+    RemoveAllWithRetry(store_cfg.data_dir);
+}
+
 // Calls Stop on the Run thread at one point of Run's startup.
 class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
   public:
@@ -4631,7 +4652,8 @@ void TestStopDuringStartup() {
 }
 
 // While ALTER TABLE waits for a lease to drain, SHOW METRICS answers at once
-// without that table, and the server stops without waiting for either.
+// without that table's store samples, and the server stops without waiting
+// for either.
 void TestShowMetricsBusyTable() {
     ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
                           BaseServerConfig());
@@ -4661,7 +4683,10 @@ void TestShowMetricsBusyTable() {
     stop.get();
     assert(scraped && stopped);
     const auto response = scrape.get();
-    assert(response.find("table=\"default\"") == std::string::npos);
+    // Only its chunkdb_table_fenced sample, which needs no lease.
+    const auto labelled = response.find("table=\"default\"");
+    assert(labelled != std::string::npos && response.find("table=\"default\"", labelled + 1U) == std::string::npos);
+    assert(response.find("\nchunkdb_table_fenced{table=\"default\"} 0\n") != std::string::npos);
     assert(response.find("chunkdb_commands_total") != std::string::npos);
 }
 
@@ -5765,6 +5790,79 @@ void TestRemovingCreditHeadAdmitsNextWaiter() {
     controller.SendLine("KILL CONNECTION " + std::to_string(head_id));
     assert(controller.ReadReply().ends_with("#t\r\n"));
     hook.Wait(small_id, true);
+}
+
+class LoginCreditHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kAfterPayloadCreditGranted) return;
+        { std::lock_guard lock(mutex_); ++granted_; }
+        changed_.notify_all();
+    }
+    void WaitGranted(std::size_t count) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return granted_ >= count; }));
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t granted_ = 0U;
+};
+
+// Before login a kept frame is charged the length its header gives, so many
+// logins with an unfinished client_name frame hold only those bytes; charged
+// the most such a HELLO could keep and drain, 15 of them filled the reserve.
+void TestLoginFramesChargedByLength() {
+    LoginCreditHook hook;
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000;
+    ServerHarness harness("login-frame-credit", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    // A completed HELLO shows the transports the hook is installed in have started.
+    RawClient ready("127.0.0.1", harness.port); ready.SetReadDeadline(std::chrono::seconds(10)); ready.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> logins;
+    for (std::size_t i = 0U; i < 24U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(10));
+        client->SendBytes("HELLO 3 WITH client_name=$1\r\n$4\r\n");
+        hook.WaitGranted(i + 1U);
+        logins.push_back(std::move(client));
+    }
+    for (auto& client : logins) {
+        client->SendBytes("name\r\n");
+        (void)ReadHelloReply(*client);
+    }
+}
+
+// Before login a line and a kept frame take at most 8192 bytes, and the
+// login reserves hold more stalled logins than one source may open: 64
+// connections stopped inside a client_name frame at that limit leave a new
+// login and a logged-in connection's reads unaffected; charged the
+// --max-line-bytes of 1 MiB per line, 16 of them filled the line reserve.
+void TestStalledLoginsLeaveLoginsAndReads() {
+    LoginCreditHook hook;
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000; config.max_line_bytes = 1048576U;
+    config.max_handshakes_per_ip = 0U;
+    ServerHarness harness("login-stalled", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient logged("127.0.0.1", harness.port); logged.SetReadDeadline(std::chrono::seconds(10)); logged.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> stalled;
+    for (std::size_t i = 0U; i < 64U; ++i) {
+        stalled.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+        stalled.back()->SendBytes("HELLO 3 WITH client_name=$1\r\n$8192\r\n" + std::string(4000, 'a'));
+        hook.WaitGranted(i + 1U);
+    }
+    RawClient login("127.0.0.1", harness.port); login.SetReadDeadline(std::chrono::seconds(10));
+    login.SendBytes("HELLO 3 WITH client_name=$1\r\n$4\r\nname\r\n");
+    (void)ReadHelloReply(login);
+    logged.SendLine("PING"); assert(logged.ReadLine() == "+PONG\r\n");
+    // Longer values and lines before login are refused.
+    RawClient long_name("127.0.0.1", harness.port); long_name.SetReadDeadline(std::chrono::seconds(10));
+    long_name.SendBytes("HELLO 3 WITH client_name=$1\r\n$8193\r\n" + std::string(8193, 'a') + "\r\n");
+    assert(long_name.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=option_value option=client_name "));
+    RawClient long_line("127.0.0.1", harness.port); long_line.SetReadDeadline(std::chrono::seconds(10));
+    long_line.SendBytes("HELLO 3 WITH client_name='" + std::string(8200, 'a') + "'\r\n");
+    assert(long_line.ReadLine().starts_with("-ERR PROTOCOL "));
+    assert(long_line.WaitForClose(std::chrono::seconds(5)));
 }
 
 // Time spent waiting for the server's input credit is not the client's
@@ -8785,6 +8883,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
+        run("TestDeliveryHookNeedsTransports", TestDeliveryHookNeedsTransports);
         run("TestPortZeroReportsPickedPort", TestPortZeroReportsPickedPort);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -8824,6 +8923,8 @@ int main(int argc, char** argv) {
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
         run("TestListingReplyShare", TestListingReplyShare);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
+        run("TestLoginFramesChargedByLength", TestLoginFramesChargedByLength);
+        run("TestStalledLoginsLeaveLoginsAndReads", TestStalledLoginsLeaveLoginsAndReads);
         run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
         run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
         run("TestKillIdleTransactionReleasesHistory", [] { TestKillIdleTransactionReleasesHistory<RawClient>(false); });
