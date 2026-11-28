@@ -1,0 +1,1 @@
+- CHANGELOG entries of pull requests are files in `changelog.d/`, gathered into `CHANGELOG.md` at a release by `scripts/release/gather-changelog.sh` (#130).
