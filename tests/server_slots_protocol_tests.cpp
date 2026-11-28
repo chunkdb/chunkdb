@@ -132,6 +132,86 @@ struct AckDeadlineIoTestAccess {
         const auto own = feed_test::Next(*reference);
         assert(own->position.revision == next && watch.output.size() == 1U && *watch.output.front().bytes == *own->protocol_frame);
     }
+    static void WatchAreaAfterBufferedChunks(ChunkServer& server, Table& table, bool shrink_share,
+        const std::function<std::uint64_t(unsigned, int)>& write) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>();
+        watch.connection->session.watch = table.SubscribeFeed({.areas = {{{0, 0}, {1, 0}}}, .chunks = true});
+        watch.share = 1024U * 1024U;
+        watch.next_progress = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        auto reference = table.SubscribeFeed({.chunks = true});
+        const auto commit = [&](unsigned value, int x) {
+            const auto revision = write(value, x);
+            auto entry = feed_test::Next(*reference);
+            assert(entry->position.revision == revision && entry->protocol_frame);
+            return entry;
+        };
+        const auto queued = commit(1U, 0);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *queued->protocol_frame);
+
+        (void)commit(2U, 0);
+        const auto merged = commit(3U, 0);
+        const auto held = commit(4U, 4);
+        // Each push fits alone, but there is no room to coalesce both chunks.
+        io.Pull(watch, std::max(merged->protocol_frame->size(), held->protocol_frame->size()));
+        assert(!watch.merge.empty() && watch.held && watch.held->position == held->position);
+        constexpr std::string_view lines = "WATCH AREA 2 0 TO 2 0\r\nUNWATCH\r\n";
+        watch.connection->pending.append(lines.data(), lines.size());
+        io.Read(watch);
+        assert(watch.output.size() == 1U && !watch.unwatch);
+        const auto next = commit(5U, 8);
+        const auto check_reply = [&] {
+            assert(watch.output.front().bytes->starts_with("%2\r\n"));
+            assert(watch.output.front().bytes->ends_with("$8\r\nrevision\r\n:" + std::to_string(held->position.revision) + "\r\n"));
+        };
+
+        io.Advance(watch, watch.bytes);
+        io.Read(watch); // The pipelined UNWATCH still waits behind the replacement.
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *merged->protocol_frame);
+        io.Advance(watch, watch.bytes);
+        if (shrink_share) {
+            // The held old-area push no longer fits after another watch joins.
+            io.Pull(watch, held->protocol_frame->size() - 1U);
+            assert(watch.output.size() == 2U);
+            check_reply();
+            assert(watch.output.back().bytes->starts_with(">5\r\n$6\r\nresync\r\n"));
+            return;
+        }
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *held->protocol_frame);
+        io.Advance(watch, watch.bytes);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U);
+        check_reply();
+        io.Advance(watch, watch.bytes);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *next->protocol_frame);
+        io.Read(watch);
+        assert(watch.unwatch && watch.output.size() == 2U && *watch.output.back().bytes == "+OK\r\n");
+    }
+    static void WatchAreaReplySurvivesResync(ChunkServer& server, Table& table, const std::function<std::uint64_t()>& write) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>();
+        watch.connection->session.watch = table.SubscribeFeed();
+        watch.share = 128U; // Accept one control, then pause reads until its reply drains.
+        auto reference = table.SubscribeFeed();
+        constexpr std::string_view line = "WATCH AREA 0 0 TO 0 0\r\n";
+        watch.connection->pending.append(line.data(), line.size());
+        io.Read(watch);
+        assert(watch.output.size() == 1U && watch.output.front().bytes->starts_with("%2\r\n"));
+        const auto reply = watch.output.front().bytes;
+
+        const auto revision = write();
+        const auto entry = feed_test::Next(*reference);
+        assert(entry->position.revision == revision && EncodeFeedEntry(*entry).size() > watch.share);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 2U && watch.output.front().bytes == reply);
+        assert(watch.output.back().bytes->starts_with(">5\r\n$6\r\nresync\r\n"));
+    }
 #ifdef CHUNKDB_WITH_OPENSSL
     // A server TLS session whose peer is a memory pipe smaller than one record,
     // so SSL_write blocks without any socket or reader scheduling.
@@ -2418,6 +2498,23 @@ void LaggingChunksWatch(bool tls) {
         [&](unsigned value, int x) { return Set(*writer, value, x); });
 }
 
+void WatchAreaAfterBufferedChunks(bool tls) {
+    for (const bool shrink_share : {false, true}) {
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        AckDeadlineIoTestAccess::WatchAreaAfterBufferedChunks(harness.server(), *harness.catalog->Find("t"), shrink_share,
+            [&](unsigned value, int x) { return Set(*writer, value, x); });
+    }
+}
+
+void WatchAreaReplySurvivesResync(bool tls) {
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    AckDeadlineIoTestAccess::WatchAreaReplySurvivesResync(harness.server(), *harness.catalog->Find("t"), [&] {
+        return Number(writer->Command("SET BLOCK 0 0 IN t n = 1, label = '" + std::string(120U, 'x') + "'"));
+    });
+}
+
 // A CHUNKS slot whose output is unsent merges its next pushes into one push at
 // the newest revision; acknowledging that revision covers every merged change.
 void LaggingChunksSlot(bool tls) {
@@ -2907,6 +3004,8 @@ int main(int argc, char** argv) {
         run("CHUNKS-ACK-deadline-ledger", ChunksDeadlineLedger);
         run("CHUNKS-slot-live-reader", ChunkSlotLiveReader);
         run("CHUNKS-lagging-watch", LaggingChunksWatch); run("CHUNKS-lagging-slot", LaggingChunksSlot);
+        run("WATCH-AREA-buffered-CHUNKS", WatchAreaAfterBufferedChunks);
+        run("WATCH-AREA-reply-resync", WatchAreaReplySurvivesResync);
         run("ACK-deadline-wire", AckDeadlineWire);
         run("CHUNKS-ACK-deadline-wire", ChunksDeadlineWire);
         run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);

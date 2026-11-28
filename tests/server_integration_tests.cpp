@@ -7005,6 +7005,8 @@ template <typename Client> void TestWatchAreaReplace(bool tls) {
     assert(watch.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
     (void)set(0, 0);
     changed(set(9, 9), "9");
+    // Chunk 5 5 is in the second replacement area and survives the refusal too.
+    changed(set(20, 20), "20");
     watch.SendLine("WATCH default");
     assert(watch.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
     assert(watch.WaitForClose(std::chrono::seconds(10)));
@@ -7153,6 +7155,8 @@ void TestWatchCatalog() {
     const auto* table = CatalogEvent(whole, "table", "default");
     assert(table != nullptr && FeedMap(*table, "action").value == "create" && FeedMap(*table, "table").type == '_');
     assert(CatalogEvent(whole, "user", kAdminUser) != nullptr && CatalogEvent(whole, "user", "mon") != nullptr);
+    full.SendLine("WATCH AREA 0 0 TO 0 0");
+    assert(full.ReadLine().starts_with("-ERR INVALID_ARGUMENT"));
     // MONITOR without MANAGES USERS: no user records and no slot owners.
     mon.SendLine("WATCH CATALOG");
     assert(FeedStart(ReadFeedReply(mon)).substr(0, 32U) == epoch);

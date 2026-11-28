@@ -5,6 +5,7 @@
 #include <cmath>
 #include <future>
 #include <limits>
+#include <new>
 #include <string_view>
 #include <thread>
 
@@ -618,6 +619,29 @@ void SeveralAreasShareOneProjection() {
     assert(txn_test::ThrowsAs<std::invalid_argument>([&] { (void)table->SubscribeFeed({.areas = {low, FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}}}); }));
 }
 
+void FailedChunkProjectionJoinKeepsCaptureMode() {
+    class FailJoin final : public FeedTestHook {
+      public:
+        void Run(Point point, std::uint64_t) override {
+            if (point == Point::kBeforeProjectionJoin) throw std::bad_alloc();
+        }
+    } fail_join;
+    ScopedTempDir dir("chunkdb-feed-failed-projection-join");
+    TableCatalog catalog(Config(dir.path()));
+    auto table = CreateDefault(catalog);
+    auto ordinary = table->SubscribeFeed();
+    FeedTestAccess::SetHook(*table, &fail_join);
+    const bool failed = txn_test::ThrowsAs<std::bad_alloc>([&] { (void)table->SubscribeFeed({.chunks = true}); });
+    FeedTestAccess::SetHook(*table, nullptr);
+    assert(failed);
+
+    auto lease = table->Acquire();
+    auto& store = lease->store();
+    store.SetBlock(0, 0, {{"bits", BitsValue{Bits(1U)}}});
+    const auto entry = Next(*ordinary);
+    assert(entry->kind == FeedEntry::Kind::kChange && !entry->chunk_forms_complete);
+}
+
 // WATCH AREA on a watching session replaces the areas of its watch after the
 // position it answers, and the watch then shares the projection of its new
 // filters; a refused replacement keeps the areas, and a full WATCH stays refused.
@@ -913,6 +937,7 @@ int main(int argc, char** argv) {
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
     SeveralAreasShareOneProjection();
+    FailedChunkProjectionJoinKeepsCaptureMode();
     ReplaceWatchAreas();
     ReplaceWatchAreasWhileWriting();
     ProjectionGroupBounds();

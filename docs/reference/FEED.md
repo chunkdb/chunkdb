@@ -104,7 +104,7 @@ UNWATCH
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
 - `AREA`: inclusive chunk-coordinate rectangle or cuboid with exactly the table's active axes; transactions are clipped to it.
 - `AREA ..., AREA ...`: WATCH without SLOT takes up to 64 areas with the same axes and keeps a chunk inside any of them; a slot keeps one AREA, and WATCH SLOT accepts several only when each repeats it.
-- `WATCH AREA`: sent while a WATCH without SLOT streams, replaces that watch's areas; it takes the same areas as WATCH.
+- `WATCH AREA`: replaces the areas of a streaming table watch without SLOT and takes the same areas as WATCH.
 - `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
 - `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes; while the watch lags, repeated changes of a chunk merge (see [Notes](#notes)).
@@ -125,7 +125,10 @@ UNWATCH
 - SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, `peer`, `last_ack_ms`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
-- WATCH AREA: `{epoch, revision}`, after the pushes sent with the old areas; changes after that revision are sent for chunks in the new areas. Read a newly watched area after this reply, and apply a pushed change only above the version you read.
+- WATCH AREA: `{epoch, revision}`, after the pushes sent with the old areas, including buffered CHUNKS pushes.
+  Later pushes carry changes after that revision in the new areas.
+  If the watch needs to resync while draining the old areas, the reply precedes the resync.
+  Read a newly watched area after this reply, and apply a pushed change only above the version you read.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
 
@@ -210,7 +213,8 @@ Catalog watches count against `--max-watches`, and a connection that already wat
 The catalog revision is not stored: after a server restart the epoch changes and the revision starts over, so watch the catalog again and rebuild your catalog from the first push.
 `CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.
 The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.
-Only UNWATCH is accepted while streaming.
+UNWATCH ends the catalog stream.
+WATCH AREA receives INVALID_ARGUMENT and leaves the catalog stream open.
 
 ## Limits
 

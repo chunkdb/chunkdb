@@ -861,34 +861,38 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);
     }
-    result->chunks_ = options.chunks;
     result->slot_ = slot;
-    JoinGroup(*result, released);
+    JoinGroup(*result, options.chunks, released);
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
+    result->chunks_ = options.chunks;
     result->table_ = std::move(table);
     return result;
 }
-void ChangeFeed::JoinGroup(FeedSubscription& sub, FeedProjectionGroup::Released& released) {
-    FeedProjectionGroup::Key key{sub.areas_, sub.column_ids_, sub.no_before_, sub.chunks_};
-    if (sub.slot_ || (key.areas.empty() && !key.column_ids && !key.no_before && !key.chunks)) return;
+void ChangeFeed::JoinGroup(FeedSubscription& sub, bool chunks, FeedProjectionGroup::Released& released) {
+    if (sub.slot_ || (sub.areas_.empty() && !sub.column_ids_ && !sub.no_before_ && !chunks)) return;
+    FeedProjectionGroup::Key key{sub.areas_, sub.column_ids_, sub.no_before_, chunks};
     std::erase_if(groups_, [](const auto& group) { return group.expired(); });
+    std::shared_ptr<FeedProjectionGroup> group;
     for (const auto& weak : groups_) {
-        if (auto group = weak.lock(); group && group->key() == key) { sub.group_ = std::move(group); break; }
+        if (auto candidate = weak.lock(); candidate && candidate->key() == key) { group = std::move(candidate); break; }
     }
-    if (!sub.group_) {
-        auto group = std::make_shared<FeedProjectionGroup>(std::move(key));
+    const bool created = !group;
+    if (created) group = std::make_shared<FeedProjectionGroup>(std::move(key));
+    // Cleanup can leave a group only after this revision has joined it.
+    RunHook(FeedTestHook::Point::kBeforeProjectionJoin, sub.position_.revision);
+    group->Join(sub.position_.revision);
+    if (created) {
         groups_.push_back(group);
-        sub.group_ = std::move(group);
         group_count_.store(groups_.size(), std::memory_order_relaxed);
         // Every share shrinks, so existing groups give up what exceeds theirs
         // and what the ring floor passed; together they keep at most the budget.
         for (const auto& weak : groups_) {
-            if (auto other = weak.lock(); other && other != sub.group_)
+            if (auto other = weak.lock(); other && other != group)
                 other->Trim(budget() / groups_.size(), floor_, released);
         }
     }
     group_count_.store(groups_.size(), std::memory_order_relaxed);
-    sub.group_->Join(sub.position_.revision);
+    sub.group_ = std::move(group);
     sub.group_position_ = sub.position_.revision;
 }
 FeedPosition FeedSubscription::SetAreas(std::vector<FeedArea> areas) {
@@ -919,7 +923,7 @@ FeedPosition FeedSubscription::SetAreas(std::vector<FeedArea> areas) {
         std::lock_guard lock(feed_->mutex_);
         std::erase_if(feed_->groups_, [](const auto& group) { return group.expired(); });
         feed_->group_count_.store(feed_->groups_.size(), std::memory_order_relaxed);
-        feed_->JoinGroup(*this, released);
+        feed_->JoinGroup(*this, chunks_, released);
     }
     return position_;
 }

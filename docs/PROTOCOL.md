@@ -268,7 +268,9 @@ Revisions have gaps and define order; timestamps do not.
 AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.
 
 Only UNWATCH, WATCH AREA, and ACK on a slot watch are accepted while streaming; another statement receives PROTOCOL and closes.
-WATCH AREA replaces the areas of a watch without SLOT and replies `{epoch, revision}` after the pushes already sent; later pushes carry changes after that revision in the new areas, see [feed statements](reference/FEED.md#returns).
+WATCH AREA replaces the areas of a table watch without SLOT and replies `{epoch, revision}` after the pushes sent with the old areas, including buffered CHUNKS pushes.
+Later pushes carry changes after that revision in the new areas, as described in [feed statements](reference/FEED.md#returns).
+If the watch needs to resync while draining the old areas, the reply precedes the resync.
 Lines sent after WATCH before its reply are read by the stream the same way.
 UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
 ACK has no success reply and cannot exceed the last fully sent change, progress push or accepted start position.
