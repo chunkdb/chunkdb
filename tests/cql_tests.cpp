@@ -138,6 +138,11 @@ void TestChunkModelScan() {
     assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").where);
     assert(Get<cql::ScanChunks>("SCAN CHUNKS FROM t AFTER 1 2 WHERE pos_x < 4").after_z == 0);
     ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1", "WHERE with SINCE requires WITH DATA");
+    ExpectError("SCAN CHUNKS FROM t BLOCKS 0 0 TO 1 1 SINCE 0", "BLOCKS with SINCE requires WITH DATA");
+    const auto area = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA 0 0 TO 1 1 SINCE 0");
+    assert(area.has_area && !area.area.around && area.since == 0U && !area.with_data);
+    const auto around = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1 SINCE 0");
+    assert(around.has_area && around.area.around && around.since == 0U && !around.with_data);
     ExpectError("SCAN CHUNKS FROM t WHERE n = 1 WHERE n = 2", "column 32: WHERE is given twice");
     // AREA and AREA AROUND follow the table, in chunk coordinates.
     const auto box = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA -1 2 TO 3 4 SINCE 5 LIMIT 2");
@@ -800,16 +805,47 @@ void TestAggregate() {
     ExpectError(long_where, "the expression is too long: at most 256 nodes");
     ExpectError("AGGREGATE AREA 0 0 TO 1 1 0 FROM t COUNT(*)", "AREA endpoints have different dimensions");
     ExpectError("AGGREGATE AREA AROUND 0 0 RADIUS -1 FROM t COUNT(*)", "a radius must be between 0");
-    ExpectError("AGGREGATE BLOCK 0 0 FROM t COUNT(*)", "expected CHUNK or AREA, got 'BLOCK'");
+    ExpectError("AGGREGATE BLOCK 0 0 FROM t COUNT(*)", "expected CHUNK, AREA or BLOCKS, got 'BLOCK'");
     ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) LIMIT 1", "expected the end of the statement, got 'LIMIT'");
     ExpectError("AGGREGAT CHUNK 0 0 FROM t COUNT(*)", "did you mean AGGREGATE?");
+}
+
+// BLOCKS in GET, AGGREGATE and SCAN CHUNKS; WHERE in GET AREA and GET
+// BLOCKS; AREA, AROUND and BLOCKS in SCAN CHUNKS.
+void TestSelections() {
+    const auto blocks = Get<cql::GetArea>("GET BLOCKS -5 -6 TO 7 8 FROM t COLUMNS a WHERE a > $1 LIMIT 2", 1);
+    assert(blocks.blocks && !blocks.around && blocks.dims == 2U && blocks.x0 == -5 && blocks.y0 == -6);
+    assert(blocks.x1 == 7 && blocks.y1 == 8 && blocks.where && blocks.limit == 2U);
+    assert((blocks.columns == std::vector<std::string>{"a"}));
+    const auto cube = Get<cql::GetArea>("get blocks 1 2 3 to 4 5 6 from t");
+    assert(cube.blocks && cube.dims == 3U && cube.z0 == 3 && cube.z1 == 6 && !cube.where);
+    const auto area = Get<cql::GetArea>("GET AREA AROUND 0 0 RADIUS 2 FROM t WHERE EXISTS AND a = 1 WITH SCHEMA");
+    assert(!area.blocks && area.around && area.where && area.with_schema);
+    ExpectError("GET BLOCKS AROUND 0 0 RADIUS 1 FROM t", "expected x, got 'AROUND'");
+    ExpectError("GET BLOCKS 0 0 TO 1 1 1 FROM t", "BLOCKS endpoints have different dimensions");
+    ExpectError("GET AREA 0 0 TO 1 1 FROM t WHERE a = 1 WHERE a = 2", "WHERE is given twice");
+
+    const auto aggregate = Get<cql::Aggregate>("AGGREGATE BLOCKS 0 0 TO 9 9 FROM t COUNT(*) WHERE a > 0 BY CHUNK");
+    assert(aggregate.blocks && !aggregate.around && aggregate.x1 == 9 && aggregate.where && aggregate.by_chunk);
+    assert(!Get<cql::Aggregate>("AGGREGATE AREA 0 0 TO 9 9 FROM t COUNT(*)").blocks);
+
+    const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM t BLOCKS 0 0 TO 31 31 WITH DATA AFTER 0 0 LIMIT 5");
+    assert(!scan.has_area && scan.blocks && scan.blocks->last.x == 31);
+    assert(scan.blocks->dims == 2U && scan.after && scan.with_data);
+    const auto around = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA AROUND 1 2 3 RADIUS 4 LIMIT 3 WHERE a = $1", 1);
+    assert(around.has_area && around.area.around && around.area.dims == 3U);
+    assert(around.area.first.z == 3 && around.area.radius == 4 && around.where);
+    assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").blocks);
+    ExpectError("SCAN CHUNKS FROM t AREA 0 0 TO 1 1 BLOCKS 0 0 TO 1 1", "AREA or BLOCKS is given twice");
+    ExpectError("SCAN CHUNKS FROM t AREA 0 0 0 TO 1 1 1 AFTER 0 0",
+        "the AFTER cursor and the selection have different dimensions");
 }
 
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
     ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'; read with GET BLOCK, GET AREA or GET CHUNK");
     ExpectError("BOGUS", "column 1: unknown statement 'BOGUS'; the CQL reference lists every statement");
-    ExpectError("GET ROW 1 2 FROM t", "column 5: expected BLOCK, CHUNK or AREA, got 'ROW'");
+    ExpectError("GET ROW 1 2 FROM t", "column 5: expected BLOCK, BLOCKS, CHUNK or AREA, got 'ROW'");
     ExpectError("GET BLOCK 1 FROM t", "column 13: expected y, got 'FROM'");
     ExpectError("GET BLOCK 1 2 FROM t extra", "column 22: expected the end of the statement, got 'extra'");
     ExpectError("GET BLOCK 1 2 FROM t COLUMNS", "expected a column name, got the end of the statement");
@@ -956,6 +992,7 @@ int main() {
     TestBlockReturning();
     TestChunkAndAreaStatements();
     TestAggregate();
+    TestSelections();
     TestLiterals();
     TestFloatLocale();
     TestParameters();

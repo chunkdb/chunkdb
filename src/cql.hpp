@@ -150,7 +150,8 @@ struct SetChunk {
     std::vector<std::string> columns;
     bool if_absent = false;
 };
-// A chunk range or ball; dims selects whether z0 and z1 participate.
+// A chunk range or ball, or with `blocks` a range of block coordinates
+// (BLOCKS); dims selects whether z0 and z1 participate.
 struct GetArea {
     bool around = false;
     std::int64_t x0 = 0;
@@ -168,6 +169,10 @@ struct GetArea {
     std::optional<ChunkCoord> after;
     // SCALE k USING reduction: one cell per k blocks on every active axis.
     std::optional<ChunkFormScale> scale;
+    // BLOCKS x0 y0 TO x1 y1: x0 to z1 are block coordinates.
+    bool blocks = false;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 // One function of AGGREGATE; `column` is empty for COUNT(*).
@@ -193,6 +198,8 @@ struct Aggregate {
     std::uint8_t dims = 2;
     // WHERE (expr.hpp): only the present blocks for which it is TRUE.
     std::shared_ptr<const expr::Expression> where;
+    // BLOCKS x0 y0 TO x1 y1: x0 to z1 are block coordinates.
+    bool blocks = false;
 };
 
 // CHECK [name] (expr): the condition's text as written, trimmed.
@@ -412,6 +419,12 @@ struct Begin {
 };
 struct Commit {};
 struct Rollback {};
+// Inclusive BLOCKS endpoints in block coordinates.
+struct ScanBlockRange {
+    ChunkCoord first{};
+    ChunkCoord last{};
+    std::uint8_t dims = 2;
+};
 // The populated chunks of table, ordered by every active coordinate axis.
 struct ScanChunks {
     std::string table;
@@ -427,6 +440,8 @@ struct ScanChunks {
     // AREA a TO b or AREA AROUND c RADIUS r: only the chunks inside it.
     bool has_area = false;
     ChunkAreaSelector area{};
+    // BLOCKS a TO b: clip the blocks in each intersecting chunk.
+    std::optional<ScanBlockRange> blocks{};
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;

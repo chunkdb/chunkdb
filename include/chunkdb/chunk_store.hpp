@@ -459,9 +459,15 @@ struct ChunkIdentityScanPage {
 // Which identities a scan keeps (SCAN CHUNKS WHERE). `keep` may change the
 // state it is given and returns false to leave the identity out of the page.
 struct ChunkScanFilter {
+    // When set, decides each identity from its state, which it may change.
     std::function<bool(const ChunkCoord&, ChunkRangeEntry&)> keep;
     // Whether `keep` reads text and bytes values.
     bool needs_vars = false;
+    // When set, only identities with an x from `x_range.first` to
+    // `x_range.second` are visited, and of them only those `covers` accepts
+    // reach `keep`; both are checked before the state is read.
+    std::optional<std::pair<std::int64_t, std::int64_t>> x_range{};
+    std::function<bool(const ChunkCoord&)> covers{};
 };
 
 class TombstoneHistoryLostError : public std::invalid_argument {
@@ -833,9 +839,9 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
-    // With `filter`, the page reads each identity's state, and every identity it
-    // visits counts toward `limit`, whether the filter keeps it or not. With
-    // `area`, only identities inside it, still in ascending x, y, z order.
+    // With `filter`, every candidate visited counts toward `limit`, including
+    // those it rejects before reading their state. With `area`, only identities
+    // inside it are visited, still in ascending x, y, z order.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}, bool with_data = false,

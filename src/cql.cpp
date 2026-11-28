@@ -727,8 +727,26 @@ class Parser {
         return std::make_shared<const expr::Expression>(expr::ParseConditionAt(line_, &at_, &parameters_));
     }
 
-    // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, then
-    // FROM t, the functions, WHERE and BY CHUNK.
+    // After AREA, or BLOCKS with `blocks`: a TO b, or for AREA also AROUND c
+    // RADIUS r, into `out` (GetArea or Aggregate).
+    template <typename Out>
+    void SelectionBody(Out& out, bool blocks) {
+        out.blocks = blocks;
+        if (!blocks && Accept("around")) {
+            out.around = true;
+            out.dims = Point(out.x0, out.y0, out.z0);
+            Expect("radius");
+            out.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+            return;
+        }
+        out.dims = Point(out.x0, out.y0, out.z0);
+        Expect("to");
+        if (Point(out.x1, out.y1, out.z1) != out.dims)
+            Fail(1, blocks ? "BLOCKS endpoints have different dimensions" : "AREA endpoints have different dimensions");
+    }
+
+    // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r |
+    // BLOCKS a TO b, then FROM t, the functions, WHERE and BY CHUNK.
     [[nodiscard]] Aggregate AggregateStatement() {
         Aggregate aggregate;
         if (Accept("chunk")) {
@@ -737,19 +755,11 @@ class Parser {
             aggregate.y1 = aggregate.y0;
             aggregate.z1 = aggregate.z0;
         } else if (Accept("area")) {
-            if (Accept("around")) {
-                aggregate.around = true;
-                aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0);
-                Expect("radius");
-                aggregate.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
-            } else {
-                aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0);
-                Expect("to");
-                if (Point(aggregate.x1, aggregate.y1, aggregate.z1) != aggregate.dims)
-                    Fail(1, "AREA endpoints have different dimensions");
-            }
+            SelectionBody(aggregate, false);
+        } else if (Accept("blocks")) {
+            SelectionBody(aggregate, true);
         } else {
-            Fail(Peek().column, "expected CHUNK or AREA, got " + Quote(Peek()));
+            Fail(Peek().column, "expected CHUNK, AREA or BLOCKS, got " + Quote(Peek()));
         }
         Expect("from");
         aggregate.table = Name("a table name");
@@ -1049,18 +1059,10 @@ class Parser {
                 get.columns = Columns();
                 return get;
             }
-            if (Accept("area")) {
+            const bool area = Accept("area");
+            if (area || Accept("blocks")) {
                 GetArea get;
-                if (Accept("around")) {
-                    get.around = true;
-                    get.dims = Point(get.x0, get.y0, get.z0);
-                    Expect("radius");
-                    get.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
-                } else {
-                    get.dims = Point(get.x0, get.y0, get.z0);
-                    Expect("to");
-                    if (Point(get.x1, get.y1, get.z1) != get.dims) Fail(1, "AREA endpoints have different dimensions");
-                }
+                SelectionBody(get, !area);
                 Expect("from");
                 get.table = Name("a table name");
                 bool columns = false;
@@ -1098,11 +1100,14 @@ class Parser {
                         else if (Accept("any")) scale.reduction = ChunkFormReduction::kAny;
                         else Fail(reduction, "expected MAX, MIN, MODE, FIRST or ANY, got " + Quote(Peek()));
                         get.scale = scale;
+                    } else if (Accept("where")) {
+                        if (get.where) Fail(column, "WHERE is given twice");
+                        get.where = Where();
                     } else break;
                 }
                 return get;
             }
-            Fail(Peek().column, "expected BLOCK, CHUNK or AREA, got " + Quote(Peek()));
+            Fail(Peek().column, "expected BLOCK, BLOCKS, CHUNK or AREA, got " + Quote(Peek()));
         }
         if (Accept("aggregate")) return AggregateStatement();
         if (Accept("set")) {
@@ -1587,10 +1592,22 @@ class Parser {
                 } else if (Accept("where")) {
                     if (scan.where) Fail(column, "WHERE is given twice");
                     scan.where = Where();
+                } else if (Accept("blocks")) {
+                    if (scan.has_area || scan.blocks) Fail(column, "AREA or BLOCKS is given twice");
+                    auto& blocks = scan.blocks.emplace();
+                    blocks.dims = Point(blocks.first.x, blocks.first.y, blocks.first.z);
+                    Expect("to");
+                    if (Point(blocks.last.x, blocks.last.y, blocks.last.z) != blocks.dims)
+                        Fail(1, "BLOCKS endpoints have different dimensions");
                 } else break;
             }
+            if (scan.after && ((scan.has_area && scan.area.dims != scan.dims) ||
+                                  (scan.blocks && scan.blocks->dims != scan.dims)))
+                Fail(1, "the AFTER cursor and the selection have different dimensions");
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
             if (scan.where && scan.since && !scan.with_data) Fail(1, "WHERE with SINCE requires WITH DATA");
+            if (scan.blocks && scan.since && !scan.with_data)
+                Fail(1, "BLOCKS with SINCE requires WITH DATA");
             return scan;
         }
         throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +

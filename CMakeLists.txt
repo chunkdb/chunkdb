@@ -61,6 +61,7 @@ add_library(chunkdb_core STATIC
     src/bit_codec.cpp
     src/block_checks.cpp
     src/block_filter.cpp
+    src/block_selection.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
     src/chunk_cache.cpp
@@ -780,6 +781,11 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME version_clock_crash COMMAND chunkdb_version_clock_test --crash-boundaries)
     set_tests_properties(version_clock_crash PROPERTIES TIMEOUT 300)
 
+    add_executable(chunkdb_block_selection_test tests/block_selection_tests.cpp)
+    target_link_libraries(chunkdb_block_selection_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_block_selection_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME block_selection COMMAND chunkdb_block_selection_test)
+
     add_executable(
         chunkdb_read_only_intent_replay_test
         tests/read_only_intent_replay_tests.cpp
@@ -1326,6 +1332,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_world_ops_test
         chunkdb_world_ops_regression_test
         chunkdb_version_clock_test
+        chunkdb_block_selection_test
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
@@ -1492,6 +1499,7 @@ if(CHUNKDB_BUILD_TESTS)
         world_ops
         world_ops_regression
         version_clock
+        block_selection
         read_only_intent_replay
         security_regression
         server_integration
