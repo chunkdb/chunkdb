@@ -38,6 +38,10 @@ struct DeleteBlock;
 // The wire protocol this engine speaks: CQL statements with typed replies
 // (docs/PROTOCOL.md).
 inline constexpr int kProtocolVersion = 3;
+// Before login a request line and a kept parameter frame each take at most
+// this many bytes (or --max-line-bytes when smaller): login messages are
+// short, and the server reserves line and frame credit for logins by it.
+inline constexpr std::size_t kMaxLoginLineBytes = 8192U;
 
 // docs/design/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
