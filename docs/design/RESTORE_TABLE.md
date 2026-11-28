@@ -55,11 +55,11 @@ SWAP takes the feature and backup metadata gates shared, as RECOVER TABLE does, 
 It then takes the tables' DDL locks and exclusive access in name order, so two swaps of overlapping tables cannot deadlock, then the catalog's table operations.
 It waits for running statements on both tables, makes their acknowledged writes durable with a WAL barrier and closes both stores; files a closing store leaves unsynced are carried to the reopened store under the new path.
 CANCEL, KILL CONNECTION or a statement timeout stops the swap only before the exchange, and both tables then keep serving under their names.
-One atomic directory exchange then swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS).
-A file system without an atomic exchange refuses the swap and reopens both tables unchanged; Windows refuses it before closing either table; there is no non-atomic fallback.
-The [swap guard design](SWAP_GUARD.md) replaces this refusal with three renames under one guard record.
+On Linux and macOS an atomic directory exchange swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` or `renamex_np(RENAME_SWAP)`).
+On Linux and macOS, a file system without an atomic exchange refuses the swap and both tables reopen under their original names.
+Windows uses three renames under one [swap guard](SWAP_GUARD.md).
 After the exchange the parent directory is synced and each store is reopened under its new name as a new table object.
-A crash at any point leaves both directories under their old names or both exchanged; each directory is a complete table.
+After writer recovery, both directories are under their old names or both are exchanged. Each directory is a complete table.
 A failure after the exchange that leaves a name unserved fences that name until RECOVER TABLE or a restart.
 Open transactions on either table end with CONFLICT at their next statement, because their snapshot belongs to the closed store.
 
@@ -100,4 +100,4 @@ Subprocess crash tests stop at every restore step and every swap step; the resta
 Rename tests check epoch, data, tombstones and slots under the new name, the ended watch, the refusals and each injected failure, the grants after a failed copy or open, and a REVOKE that waits for the rename; crash tests stop before the rename, after it and after its sync.
 Feed tests watch a swapped name from the old epoch and receive resync, or continue from the exact fork revision.
 Slot tests watch restored and swapped slots without AFTER and receive resync until an acknowledgement, and check the marks after each swap crash point and a refused swap.
-`chunkdb_verify` needs no new checks: restore and swap create no new file kinds.
+`chunkdb_verify` reports pending Windows swaps and checks their guards and table identities.

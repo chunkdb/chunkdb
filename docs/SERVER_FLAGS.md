@@ -153,11 +153,12 @@ To find a table's chunks after the writer changed it, they read only the chunks 
 Each change the writer makes to a table makes the next read of every chunk of that table load it again.
 That load waits for a moment when the writer is not updating the table's files, for at most about 250 ms, and returns an error if there is none; a writer that changes a table without pause can make its reads fail.
 The tables, columns and users are the ones that exist at startup.
-Restart the read-only server after the writer creates, alters or drops a table or changes users.
+Restart the read-only server after the writer creates, alters, drops or swaps a table or changes users.
 Until then, a table the writer dropped returns an error, and in a table it altered, chunks written after the change return an error while the others are returned with the columns the read-only server started with.
 
 A directory whose last writer stopped without closing it needs recovery, which only a writer runs.
 `--read-only` refuses such a directory with a message saying so; start the server once without `--read-only` to recover it.
+It also refuses a directory with a pending Windows swap until a writer finishes it.
 The same refusal appears while a writer is recovering a table or finishing a migration; try again once it has.
 With `--auth scram` the directory must already have users, because `--read-only` does not create the first administrator.
 

@@ -172,7 +172,9 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | CHECK_FAILED | A write leaves a block for which a check is false, or ADD CHECK finds a stored one: `block (x, y) fails CHECK name (condition)`, with `check=name`. | Change the values, or drop the check. |
 | INVALID_ARGUMENT | A check names an unknown column, is not a condition, or uses parameters, chunk columns, NOW() or EXISTS; DROP COLUMN or ALTER COLUMN TYPE ... USING names a column a check reads. | Correct the condition, or drop the check first. |
 | TABLE_EXISTS | RENAME TO names a table that exists, or a directory under `tables/` that no table of this server uses. | Use another name, or DROP TABLE that table first. |
-| INTERNAL | SWAP TABLES on Windows or a file system without an atomic directory exchange; both tables keep their names. | Swap on Linux or macOS, or restore under the live name after DROP TABLE. |
+| INVALID_ARGUMENT | SWAP TABLES on Windows without the exclusive writer lock. | Open the catalog as a single writer. |
+| INTERNAL | The file system on Linux or macOS refuses an atomic directory exchange. | Run the swap on a file system that supports directory exchange. |
+| INTERNAL | A Windows swap could not finish and both names are fenced. | Run RECOVER TABLE for both names, or restart the writer. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
 ## Notes
@@ -197,13 +199,14 @@ DROP TABLE deletes its data, durable slots, and table-specific grants.
 It waits for a running backup to pin its tables and save their grants, so a backup holds the table with its grants or neither.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
 
-SWAP TABLES exchanges two tables' names in one atomic step; data, epochs, lineage and durable slots stay with their tables, and grants stay with the names.
+SWAP TABLES exchanges two tables' names. Data, epochs, lineage and durable slots stay with their tables, and grants stay with the names.
 It waits for running statements and backups on both tables and makes their acknowledged writes durable first.
-CANCEL, KILL CONNECTION or a statement timeout stops it only before the exchange, and both tables then keep their names.
+CANCEL, KILL CONNECTION or a statement timeout can stop it before it commits to the exchange, and both tables then keep their names.
 Open transactions on either table answer CONFLICT, and watches of either table end with INTERNAL `watched table was swapped; watch it again`.
 A consumer that watches the name again sees another epoch, so it resumes by [lineage](../CHANGE_FEED.md) or rebuilds.
 Each slot of either table is then reached by another name, so its next watch without AFTER starts with resync.
-A failure after the exchange fences the names it leaves unserved until RECOVER TABLE.
+On Windows, a writer restart finishes an interrupted swap recorded on disk before serving either name.
+If a swap fails and fences both names, RECOVER TABLE on either name finishes any pending swap and opens that name. Recover the other name separately or restart the writer.
 
 RENAME TO gives a table a new name in one atomic step; data, epoch, lineage and durable slots stay with the table, and the grants on its name move to the new name; prefix and `*` grants stay as they are.
 A user with grants on both names keeps the higher right; the old name keeps no grants and is free for a new table.

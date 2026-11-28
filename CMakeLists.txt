@@ -145,6 +145,7 @@ add_library(chunkdb_core STATIC
     src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
     src/table_catalog_restore.cpp
+    src/table_swap_guard.cpp
     src/migrations_records.cpp
     src/migrations_apply.cpp
     src/uri.cpp
@@ -394,7 +395,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_restore_table_crash_test tests/restore_table_crash_tests.cpp)
     target_link_libraries(chunkdb_restore_table_crash_test PRIVATE chunkdb_tools)
     add_test(NAME restore_table_crash COMMAND chunkdb_restore_table_crash_test)
-    set_tests_properties(restore_table_crash PROPERTIES TIMEOUT 300 LABELS "crash")
+    set_tests_properties(restore_table_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
@@ -1520,6 +1521,7 @@ if(CHUNKDB_BUILD_TESTS)
     set(CHUNKDB_CRASH_TESTS
         backup_crash
         restore_crash
+        restore_table_crash
         migrations_crash
         feed_slots_crash
         durability_crash_hardening

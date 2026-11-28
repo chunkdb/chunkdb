@@ -5,6 +5,7 @@
 #include "feed_slots.hpp"
 #include "restore_table_test_utils.hpp"
 #include "statement_control.hpp"
+#include "table_swap_guard.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -275,16 +276,18 @@ struct Swapped {
 void SwapsNames() {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
         Swapped swapped{Source(mode)};
-        const auto old_t = swapped.catalog.Require("t");
-        auto watch = old_t->SubscribeFeed();
+        const std::array old_tables{swapped.catalog.Require("t"), swapped.catalog.Require("t_restored")};
+        std::array watches{old_tables[0]->SubscribeFeed(), old_tables[1]->SubscribeFeed()};
         swapped.catalog.SwapTables("t", "t_restored");
         swapped.Check(true);
         // The old table objects are gone; their watches end.
-        assert(!old_t->Acquire().has_value());
-        const auto ended = watch->Next(std::chrono::seconds(5));
-        assert(ended && ended->kind == FeedEntry::Kind::kEnd && ended->protocol_frame &&
-               ended->protocol_frame->find("swapped") != std::string::npos);
-        watch.reset();
+        for (std::size_t i = 0U; i < old_tables.size(); ++i) {
+            assert(!old_tables[i]->Acquire().has_value());
+            const auto ended = watches[i]->Next(std::chrono::seconds(5));
+            assert(ended && ended->kind == FeedEntry::Kind::kEnd && ended->protocol_frame &&
+                   ended->protocol_frame->find("swapped") != std::string::npos);
+            watches[i].reset();
+        }
         // Writes under the new names are acknowledged and stay there.
         swapped.catalog.Require("t")->Acquire()->store().SetBlockBits(0, 1, "00010000");
         swapped.catalog.Require("t_restored")->Acquire()->store().SetBlockBits(0, 1, "00100000");
@@ -343,6 +346,7 @@ void SwapRefusals() {
     Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "t"); });
     Throws<TableNotFoundError>([&] { catalog.SwapTables("t", "absent"); });
     Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "Bad.Name"); });
+#ifndef _WIN32
     {
         // Without an atomic exchange nothing moves and both tables serve.
         txn_test::ScopedEnv refuse("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", "1");
@@ -350,6 +354,7 @@ void SwapRefusals() {
     }
     assert(catalog.Fences().empty());
     swapped.Check(false);
+#endif
     {
         // An exchange that cannot be synced leaves both names fenced; a
         // recovery opens what each directory holds.
@@ -371,12 +376,6 @@ void SwapRefusals() {
     Verified(swapped.source.data);
 }
 
-#ifdef _WIN32
-constexpr bool kAtomicExchange = false;
-#else
-constexpr bool kAtomicExchange = true;
-#endif
-
 // Whether the one slot of `table` starts its next watch without AFTER with resync.
 bool Resyncs(TableCatalog& catalog, std::string_view table) {
     const auto slots = catalog.Require(table)->ListFeedSlots();
@@ -390,11 +389,18 @@ void SwapMarksSlots() {
     Swapped swapped{Source()};
     auto& catalog = swapped.catalog;
     assert(!Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
-    for (const auto* point : {"CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", "CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"}) {
+    for (const auto* point : {
+#ifdef _WIN32
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_PUBLISH_FAIL_ONCE", "CHUNKDB_FAILPOINT_SWAP_TABLES_PARK_FIRST_FAIL_ONCE",
+#else
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE",
+#endif
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"}) {
         txn_test::ScopedEnv refuse(point, "1");
         Throws([&] { catalog.SwapTables("t", "t_restored"); });
         assert(catalog.Fences().empty());
         swapped.Check(false);
+        assert(!TableSwapPending(swapped.source.data));
         assert(!Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
     }
     catalog.SwapTables("t", "t_restored");
@@ -443,15 +449,102 @@ void MarkedSlotBecomesLost() {
     Verified(source.data);
 }
 
-// Windows has no atomic directory exchange: SWAP TABLES is refused before
-// anything closes, and both tables keep serving.
-void SwapRefusedOnWindows() {
-    Swapped swapped{Source()};
-    assert(Throws([&] { swapped.catalog.SwapTables("t", "t_restored"); }).find("Windows") != std::string::npos);
-    assert(swapped.catalog.Fences().empty());
-    swapped.Check(false);
-    assert(!Resyncs(swapped.catalog, "t"));
+#ifdef _WIN32
+void GuardedSwapRequiresWriterLock() {
+    test::ScopedTempDir directory("chunkdb-swap-shared-writer");
+    CatalogConfig config;
+    config.data_dir = directory.path();
+    config.background_maintenance = false;
+    config.allow_multiple_processes = true;
+    TableCatalog catalog(config);
+    const auto first = catalog.Create("a", GeometryConfig{}, catalog.default_options());
+    const auto second = catalog.Create("b", GeometryConfig{}, catalog.default_options());
+    assert(Throws<std::invalid_argument>([&] { catalog.SwapTables("a", "b"); })
+               .find("exclusive writer lock") != std::string::npos);
+    assert(!TableSwapPending(config.data_dir) && catalog.Find("a") == first && catalog.Find("b") == second);
 }
+
+void GuardedSwapPublicationLeavesDecision() {
+    Swapped swapped{Source()};
+    auto& catalog = swapped.catalog;
+    {
+        struct ResetObserver { ~ResetObserver() { SetDirectorySyncObserverForTests({}); } } reset;
+        // Report a publication error once the guard is visible, before the
+        // caller has started moving directories.
+        SetDirectorySyncObserverForTests([&](const auto& directory) {
+            if (directory == swapped.source.data && TableSwapPending(directory))
+                throw std::runtime_error("injected error returning from guard publication");
+        });
+        Throws<TableFencedError>([&] { catalog.SwapTables("t", "t_restored"); });
+    }
+    assert(catalog.Fences().size() == 2U && ValidatePendingTableSwap(swapped.source.data));
+    assert(ReadStoreManifest(swapped.source.data / "tables/t")->store_id == swapped.source.epoch);
+    assert(ReadStoreManifest(swapped.source.data / "tables/t_restored")->store_id == swapped.restored);
+    catalog.RecoverTable("t");
+    assert(!TableSwapPending(swapped.source.data) && catalog.Fence("t_restored"));
+    catalog.RecoverTable("t_restored");
+    swapped.Check(true);
+}
+
+void GuardedSwapRecoversAfterFailures() {
+    for (const auto* point : {"CHUNKDB_FAILPOINT_SWAP_TABLES_MOVE_SECOND_FAIL_ONCE",
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_MOVE_PARKED_FAIL_ONCE",
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_REMOVE_GUARD_FAIL_ONCE",
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_REMOVE_SYNC_FAIL_ONCE"}) {
+        Swapped swapped{Source()};
+        auto& catalog = swapped.catalog;
+        {
+            txn_test::ScopedEnv fail(point, "1");
+            assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find(kFenceSwapPending) != std::string::npos);
+        }
+        const bool guard_remains = std::string_view(point).find("REMOVE_SYNC") == std::string_view::npos;
+        assert(TableSwapPending(swapped.source.data) == guard_remains);
+        assert(catalog.Fences().size() == 2U && catalog.TableCount() == 0U);
+        Throws<TableFencedError>([&] { (void)catalog.Create("t", GeometryConfig{}, catalog.default_options()); });
+        Throws<TableFencedError>([&] { (void)catalog.RestoreTable(swapped.source.Request()); });
+        Throws<TableFencedError>([&] { (void)catalog.EnableFeature("feature_activation"); });
+        Throws<TableFencedError>([&] { (void)catalog.BackupTo(swapped.source.root / "fenced-copy", {}); });
+        if (guard_remains) {
+            (void)catalog.Create("a", GeometryConfig{}, catalog.default_options());
+            (void)catalog.Create("b", GeometryConfig{}, catalog.default_options());
+            Throws<TableFencedError>([&] { catalog.RenameTable("a", "t", nullptr); });
+            const auto before = LoadFile(swapped.source.data / kTableSwapPendingFileName);
+            assert(Throws([&] { catalog.SwapTables("a", "b"); }).find("pending swap") != std::string::npos);
+            assert(LoadFile(swapped.source.data / kTableSwapPendingFileName) == before);
+            catalog.Drop("a");
+            catalog.Drop("b");
+        }
+        // Either name can finish the swap. Its partner stays fenced.
+        catalog.RecoverTable("t_restored");
+        assert(catalog.Require("t_restored")->store_id() == swapped.source.epoch && catalog.Fence("t"));
+        assert(!TableSwapPending(swapped.source.data));
+        catalog.RecoverTable("t");
+        swapped.Check(true);
+        assert(catalog.Fences().empty() && Entries(swapped.source.data / "tables") == 2U);
+        assert(Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
+    }
+}
+
+void GuardedSwapCannotUndo() {
+    for (const auto* point : {"CHUNKDB_FAILPOINT_SWAP_TABLES_REMOVE_GUARD_FAIL_ONCE",
+             "CHUNKDB_FAILPOINT_SWAP_TABLES_REMOVE_SYNC_FAIL_ONCE"}) {
+        Swapped swapped{Source()};
+        auto& catalog = swapped.catalog;
+        {
+            txn_test::ScopedEnv fail_first("CHUNKDB_FAILPOINT_SWAP_TABLES_PARK_FIRST_FAIL_ONCE", "1");
+            txn_test::ScopedEnv fail_undo(point, "1");
+            assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find(kFenceSwapPending) != std::string::npos);
+        }
+        const bool committed = TableSwapPending(swapped.source.data);
+        assert(committed == (std::string_view(point).find("REMOVE_SYNC") == std::string_view::npos));
+        assert(catalog.Fences().size() == 2U && catalog.TableCount() == 0U);
+        catalog.RecoverTable("t");
+        assert(!TableSwapPending(swapped.source.data) && catalog.Fence("t_restored"));
+        catalog.RecoverTable("t_restored");
+        swapped.Check(committed);
+    }
+}
+#endif
 
 // CANCEL, KILL or a statement timeout accepted before the decision leaves
 // nothing restored or swapped; after it, a stop is refused and the statement
@@ -478,7 +571,6 @@ void StatementStops() {
         assert(control.decision_entered() && !control.RequestStop(StatementStopReason::kCancelled));
         assert(catalog.Find("t_restored") != nullptr);
     }
-    if (!kAtomicExchange) return;
     Swapped swapped{Source()};
     {
         StatementControl control(StatementControl::Clock::now(), 0U);
@@ -653,15 +745,17 @@ int main() {
     RenamesTable();
     RenameRefusals();
     RenameStatementStops();
-    if (kAtomicExchange) {
-        SwapsNames();
-        SwapSurvivesRestart();
-        FeedAfterSwap();
-        SwapRefusals();
-        SwapMarksSlots();
-        SwapMarksSurviveRestart();
-    } else {
-        SwapRefusedOnWindows();
-    }
+    SwapsNames();
+    SwapSurvivesRestart();
+    FeedAfterSwap();
+    SwapRefusals();
+    SwapMarksSlots();
+    SwapMarksSurviveRestart();
+#ifdef _WIN32
+    GuardedSwapRequiresWriterLock();
+    GuardedSwapPublicationLeavesDecision();
+    GuardedSwapRecoversAfterFailures();
+    GuardedSwapCannotUndo();
+#endif
     std::cout << "restore table tests passed\n";
 }
