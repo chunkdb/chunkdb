@@ -587,7 +587,8 @@ Required participants depend on the operation:
 - GRANT/REVOKE: users.
 - CREATE SLOT: table manifest and slots.
 - DROP SLOT: slots.
-- Several steps: the files of their one table that the steps change, the table manifest beside changed slots, users when a step is GRANT or REVOKE, and the manifest and index when the first step creates the table; a journal with only the ledger needs every step to be conditional DDL whose condition holds.
+- Several steps: a manifest for ALTER TABLE, slot records and the table manifest for slot changes, users for GRANT or REVOKE, and a manifest and index for table creation.
+- A manifest or slot records file can be omitted when every conditional step that could change it is a no-op; recovery checks those conditions against the unchanged state on disk.
 
 Every operation includes the ledger and rejects unrelated participants.
 CREATE prepares its exact manifest under `.chunkdb.staging/<table>.<16 lowercase hex digits>/`; DROP uses the corresponding `.chunkdb.dropped/` operation name.

@@ -1,7 +1,7 @@
 # MIGRATE, SHOW MIGRATIONS
 
 You record a named schema or rights change and safely retry it at application startup.
-A migration is a statement, or several steps on one table, recorded under one permanent name.
+A migration is a statement, or several steps on one table or grant target, recorded under one permanent name.
 
 ## Examples
 
@@ -38,7 +38,7 @@ SHOW MIGRATIONS
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, from 1 through 63 bytes.
 - `statement`: one CREATE TABLE, ALTER TABLE, DROP TABLE, GRANT, REVOKE, CREATE SLOT, or DROP SLOT statement; ALTER TABLE ... RENAME TO is refused.
-- Several statements separated by `;`, at most 64, are the steps of one migration on one table; see [Steps](#steps).
+- Several statements separated by `;`, at most 64, are the steps of one migration on one table or grant target; see [Steps](#steps).
 - Conditional IF NOT EXISTS and IF EXISTS forms are supported inside a migration.
 
 ## Returns
@@ -55,9 +55,9 @@ SHOW MIGRATIONS
 | PERMISSION_DENIED | You lack the inner statement's rights, or the name is recorded for a change outside your rights. | Request access, or use another name. |
 | INVALID_ARGUMENT | You run MIGRATE inside a transaction or submit an unsupported statement. | Run the allowed statement outside a transaction. |
 | INVALID_ARGUMENT | You run MIGRATE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
-| INVALID_ARGUMENT | The steps name more than one table, include DROP TABLE, put CREATE TABLE, ADD CHECK, DROP NULL or a narrowing ALTER COLUMN ... TYPE after the first step, or change slots of a table the same migration creates. | Give those steps migrations of their own. |
+| INVALID_ARGUMENT | The steps name different tables or grant targets, include DROP TABLE, put CREATE TABLE, ADD CHECK, DROP NULL or a narrowing ALTER COLUMN ... TYPE without USING after the first step, or change slots of a table the same migration creates. | Give those steps migrations of their own. |
 | OUT_OF_RANGE | The ledger exceeds 16384 records or 16777216 bytes. | Stop adding new migration names. |
-| INTERNAL | A durable decision has an unknown outcome. | Restart the writer, then retry the same name and text; RECOVER TABLE does not recover it. |
+| OUTCOME_UNKNOWN | Publishing or completing the migration decision failed, so the outcome is unknown. | Restart the writer to recover, then retry the same name and text. |
 | INTERNAL | The inner statement names a fenced table. | Run [RECOVER TABLE](TABLES.md#notes), then retry the same name and text. |
 
 ## Notes
@@ -84,13 +84,16 @@ See [Users and rights](../USERS.md#rights) and [Backup and restore](../BACKUP.md
 
 ## Steps
 
-The steps of a migration are applied in order as one unit: after a failure or a crash either every step is applied or none is, and a migration that fails records nothing.
+The steps of a migration apply in order as one unit, with one record for the whole migration.
+A failure before the decision is published leaves every step unapplied and records nothing.
+If a published decision survives a failure or crash, restarting the writer finishes the unit and records it.
 Each step sees the table as the steps before it left it, so a later step can name a column an earlier step added, and IF NOT EXISTS and IF EXISTS test that state.
 SHOW MIGRATIONS lists the migration once, with every step in its statement; each step needs its own rights, and a record is within your rights only when every step is.
-Every step names the same table: CREATE TABLE, ALTER TABLE, CREATE SLOT and DROP SLOT on it, and GRANT and REVOKE on it; DROP TABLE runs as a migration of its own.
+When a migration includes a table or slot change, every step names the same table; DROP TABLE runs as a migration of its own.
+A migration of only GRANT and REVOKE steps uses the same grant target in every step, either a table name, a prefix followed by `*`, or `*`.
 CREATE TABLE can be only the first step; with IF NOT EXISTS and an existing table, the other steps change that table.
-ADD CHECK, DROP NULL and a narrowing ALTER COLUMN ... TYPE check stored values, so they can be only the first step; CREATE SLOT and DROP SLOT on a table the same migration creates go in a later migration.
-The migration waits for running statements on the table, as ALTER TABLE does, also when every step's condition already holds.
+ADD CHECK, DROP NULL and a narrowing ALTER COLUMN ... TYPE without USING check stored values, so they can be only the first step; CREATE SLOT and DROP SLOT on a table the same migration creates go in a later migration.
+A migration with table or slot steps waits for running statements on its table, as ALTER TABLE does, also when every step's condition already holds.
 
 ## Limits
 

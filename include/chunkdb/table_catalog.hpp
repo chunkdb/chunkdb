@@ -726,9 +726,9 @@ class TableCatalog {
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.
     std::uint64_t version_floor_ = 0;
-    // Staging directory names of running RESTORE TABLE statements, which
+    // Staging directory names of running restores and migration creates, which
     // RECOVER TABLE leaves alone; changed under operations_mutex_.
-    std::set<std::string, std::less<>> restore_staging_;
+    std::set<std::string, std::less<>> active_staging_;
     mutable std::shared_mutex tables_mutex_;
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
     // Out of service until RecoverTable; disjoint from tables_, which

@@ -16,6 +16,7 @@
 #include "user_registry.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "cql.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 namespace {
@@ -600,7 +601,6 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
         return false;
     };
     if (already_applied()) return false;
-    operations.unlock();
     std::shared_ptr<Table> table;
     std::shared_ptr<ChunkStore> store;
     TableOptions previous;
@@ -619,6 +619,29 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
     // before catalog admission, and a step that is not decided drops it again.
     bool narrowing_recorded = false;
     TableSchema scanned_schema;
+    MigrationJournal prepared_create;
+    StoreManifest staged_manifest;
+    std::optional<decltype(active_staging_)::iterator> staging_registration;
+    const auto forget_staging = [&] {
+        if (!staging_registration) return;
+        std::unique_lock cleanup(operations_mutex_, std::defer_lock);
+        if (!operations.owns_lock()) {
+            ScopedStatementControl detached(nullptr);
+            cleanup.lock();
+        }
+        active_staging_.erase(*staging_registration);
+        staging_registration.reset();
+    };
+    const auto discard_staging = [&] {
+        if (!staging_registration) return;
+        if (user_lock.owns_lock()) user_lock.unlock();
+        if (operations.owns_lock()) operations.unlock();
+        std::error_code error;
+        if (staging_owned) std::filesystem::remove_all(staging, error);
+        forget_staging();
+        staging_owned = false;
+        if (error) throw std::runtime_error("cannot remove unpublished migration staging: " + error.message());
+    };
     const auto drop_recorded_narrowing = [&] {
         if (!narrowing_recorded) return;
         narrowing_recorded = false;
@@ -632,20 +655,130 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
             // Logged by EndNarrowing, which fenced the table if needed.
         }
     };
+    const auto apply_alter = [&](const MigrationRequest& step, std::size_t i, StoreManifest& manifest) {
+        if (step.columns_if_needed && !step.columns_if_needed(step.chunk_column ? *manifest.chunk_schema : manifest.schema))
+            return false;
+        const auto previous_schema = manifest.schema;
+        const auto previous_chunk_schema = *manifest.chunk_schema;
+        if (step.narrowing) {
+            const auto& [column_name, type] = *step.narrowing;
+            if (i == 0U && narrowing_recorded) {
+                // The scan checked the values of this schema only.
+                if (manifest.schema != scanned_schema)
+                    throw std::runtime_error("table '" + request.table + "' changed during the narrowing check");
+                manifest.schema = NarrowColumnType(manifest.schema, column_name, type);
+            } else {
+                const auto at = std::find_if(manifest.schema.columns.begin(), manifest.schema.columns.end(),
+                    [&](const auto& column) { return column.name == column_name; });
+                if (at == manifest.schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
+                if (!HoldsEveryValue(at->type, type)) {
+                    if (i == 0U) throw std::runtime_error("table '" + request.table + "' changed before the narrowing check");
+                    throw std::invalid_argument("step " + std::to_string(i + 1U) + " of the migration narrows column " + column_name +
+                        ", which checks stored values; a narrowing can only be the first step");
+                }
+                manifest.schema = ChangeColumnType(manifest.schema, column_name, type, Conversion::kExact);
+            }
+        } else if (step.drop_null) {
+            if (!narrowing_recorded || manifest.schema != scanned_schema)
+                throw std::runtime_error("table '" + request.table + "' changed during the DROP NULL check");
+            manifest.schema = chunkdb::DropColumnNull(manifest.schema, *step.drop_null);
+        } else if (step.add_check) {
+            if (!narrowing_recorded || manifest.schema != scanned_schema)
+                throw std::runtime_error("table '" + request.table + "' changed during the ADD CHECK scan");
+            manifest.schema = AddPendingCheck(manifest.schema);
+        } else step.alter(manifest);
+        AlignManifestSchemaDomains(&manifest, previous_schema, previous_chunk_schema);
+        if (store) {
+            RequireCompatibleColumnAdditions(previous_schema, manifest.schema, *store);
+            for (const auto& column : manifest.chunk_schema->columns) {
+                if (!column.required || column.has_default ||
+                    std::any_of(previous_chunk_schema.columns.begin(), previous_chunk_schema.columns.end(),
+                        [&](const auto& old) { return old.id == column.id; })) continue;
+                if (store->HasWrittenChunkIdentities())
+                    throw std::invalid_argument("chunk column " + column.name +
+                        ": a REQUIRED column added to a table needs a DEFAULT for its written chunk identities");
+                break;
+            }
+        }
+        if (const auto reason = UnsupportedSchemaReason(manifest.schema); !reason.empty()) throw std::invalid_argument(reason);
+        manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
+        (void)Geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+        next_options = DecodeTableOptions(manifest.options);
+        RequireValidTableOptions(next_options);
+        return true;
+    };
     try {
         if (!grants_only) {
             table = Find(request.table);
-            if (!table && !creates) {
-                operations.lock();
-                if (already_applied()) return false;
-                table = Find(request.table);
-                if (!table) throw TableNotFoundError("table '" + request.table + "' does not exist");
+            if (!table && !creates) throw TableNotFoundError("table '" + request.table + "' does not exist");
+            if (!table) {
+                if (request.cancelled.stop_requested()) throw std::runtime_error("migration cancelled");
+                RequireNewTableName(request.table);
+                prepared_create.directory_action = MigrationDirectoryAction::kCreate;
+                prepared_create.operation_name = OperationName(request.table);
+                staging = StagingDir() / prepared_create.operation_name;
+                const auto [registration, inserted] = active_staging_.insert(prepared_create.operation_name);
+                if (!inserted)
+                    throw std::runtime_error("migration stage already registered");
+                staging_registration = registration;
                 operations.unlock();
+                // Prepare only private table files here. Grants and the ledger
+                // are planned against current metadata at publication.
+                std::exception_ptr preparation_failure;
+                try {
+                    TableDefinition definition{request.geometry, request.options, request.schema};
+                    if (request.definition) definition = request.definition();
+                    RequireValidTableOptions(definition.options);
+                    const auto block_schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits));
+                    if (const auto reason = UnsupportedSchemaReason(block_schema); !reason.empty()) throw std::invalid_argument(reason);
+                    const auto geometry = definition.chunk_schema ? Geometry(definition.geometry, block_schema, *definition.chunk_schema)
+                                                                 : Geometry(definition.geometry, block_schema);
+                    prepared_create.table_id = NewStoreId();
+                    staged_manifest = StoreManifest{.features = TableScopedFeatures(initial_root->features), .geometry = definition.geometry,
+                        .store_id = prepared_create.table_id, .options = EncodeTableOptions(definition.options),
+                        .schema = block_schema, .chunk_schema = geometry.chunk_schema()};
+                    next_options = definition.options;
+                    for (std::size_t i = 1U; i < steps.size(); ++i) {
+                        const auto& step = *steps[i];
+                        if (step.kind == Kind::kAlter) apply_alter(step, i, staged_manifest);
+                        if (step.kind == Kind::kCreateSlot || step.kind == Kind::kDropSlot)
+                            throw std::invalid_argument("CREATE SLOT and DROP SLOT on a table that the same migration creates run in a later migration");
+                    }
+                    EnsureDirectoryPathExists(StagingDir(), true);
+                    if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("migration stage already exists");
+                    staging_owned = true;
+                    const Geometry final_geometry(staged_manifest.geometry, staged_manifest.schema, *staged_manifest.chunk_schema);
+                    if (!ChunkCoordinateIndex::InitializeEmpty(staging, final_geometry, prepared_create.table_id))
+                        throw std::runtime_error("coordinate inventory appeared in migration staging");
+                    auto bytes = SerializeStoreManifest(staged_manifest);
+                    if (!PublishNewFile(StoreManifestPath(staging), bytes)) throw std::runtime_error("migration stage manifest already exists");
+                    SyncDirectoryPath(StagingDir());
+                    // A concurrent creator may have made the staging parent without syncing its entry yet.
+                    SyncDirectoryPath(config_.data_dir);
+                    prepared_create.files.push_back({"tables/" + request.table + "/" + std::string(kStoreManifestFileName),
+                        std::nullopt, std::move(bytes)});
+                    prepared_create.files.push_back({"tables/" + request.table + "/" + std::string(kChunkIndexFileName),
+                        std::nullopt, LoadFile(staging / kChunkIndexFileName)});
+                } catch (const std::exception&) {
+                    preparation_failure = std::current_exception();
+                }
+                if (!preparation_failure) {
+                    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+                        hook->Run(MigrationTestHook::Point::kMigrationCreateStaged, request.record.name);
+                }
+                operations.lock();
+                if (already_applied()) {
+                    discard_staging();
+                    return false;
+                }
+                table = Find(request.table);
+                if (table) discard_staging();
+                else if (preparation_failure) std::rethrow_exception(preparation_failure);
             }
-            // CREATE TABLE without IF NOT EXISTS of a table that exists is
-            // refused under catalog admission, after the name is compared.
-            if (table && creates && !request.if_not_exists) table.reset();
+            if (table && creates && !request.if_not_exists)
+                throw TableExistsError("table '" + request.table + "' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE " + request.table + " first");
             if (table) {
+                if (operations.owns_lock()) operations.unlock();
                 ddl = std::unique_lock(table->ddl_mutex_);
                 previous = table->Info().options;
                 next_options = previous;
@@ -710,37 +843,26 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
                 table_admitted = true;
             }
         }
-        if (!operations.owns_lock()) operations.lock();
-        if (already_applied()) {
-            if (store) {
-                try { table->EndExclusive(std::move(store), previous); }
-                catch (const std::exception& error) {
-                    migration_health_->failed.store(true, std::memory_order_release);
-                    RetireTable(*table, previous);
-                    throw MigrationRecoveryRequiredError("cannot resume table '" + request.table + "' after migration retry: " + error.what());
-                }
+        if (table_admitted) operations.lock();
+        if (table_admitted && already_applied()) {
+            try { table->EndExclusive(std::move(store), previous); }
+            catch (const std::exception& error) {
+                migration_health_->failed.store(true, std::memory_order_release);
+                RetireTable(*table, previous);
+                throw MigrationRecoveryRequiredError("cannot resume table '" + request.table + "' after migration retry: " + error.what());
             }
             drop_recorded_narrowing();
             return false;
         }
         if (request.cancelled.stop_requested()) throw std::runtime_error("migration cancelled");
-        const bool created = creates && !table_admitted;
-        if (!grants_only) {
-            const auto current = Find(request.table);
-            if (table_admitted && current != table)
-                throw TableNotFoundError("table '" + request.table + "' was replaced during migration admission");
-            if (created && current) {
-                if (!request.if_not_exists)
-                    throw TableExistsError("table '" + request.table + "' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE " + request.table + " first");
-                throw TableExistsError("table '" + request.table + "' was created while this migration waited; run the migration again");
-            }
-            if (created) RequireNewTableName(request.table);
-        }
+        const bool created = creates && !table;
+        if (table_admitted && Find(request.table) != table)
+            throw TableNotFoundError("table '" + request.table + "' was replaced during migration admission");
         auto records = ReadMigrationRecords(config_.data_dir);
         auto root = ReadDataDirManifest(config_.data_dir);
         if (!root) throw std::runtime_error("data directory manifest disappeared");
         RequireFeature(root->features, *FindFeature("migrations"));
-        MigrationJournal journal;
+        MigrationJournal journal = created ? std::move(prepared_create) : MigrationJournal{};
         journal.data_dir_id = root->data_dir_id;
         journal.record = request.record;
         journal.record.applied_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -750,7 +872,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
             journal.files.push_back({relative.generic_string(), FileImage(config_.data_dir / relative), std::move(after)});
         };
         // The table's manifest as the steps change it, step by step.
-        StoreManifest manifest;
+        StoreManifest manifest = std::move(staged_manifest);
         if (table_admitted) {
             store->ThrowIfDurabilityPoisoned();
             store->StopMaintenanceThread();
@@ -760,21 +882,8 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
             const auto current = ReadStoreManifest(table->dir_);
             if (!current || current->store_id != journal.table_id) throw std::runtime_error("migration table identity changed");
             manifest = *current;
-        } else if (created) {
-            TableDefinition definition{request.geometry, request.options, request.schema};
-            if (request.definition) definition = request.definition();
-            RequireValidTableOptions(definition.options);
-            const auto block_schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits));
-            if (const auto reason = UnsupportedSchemaReason(block_schema); !reason.empty()) throw std::invalid_argument(reason);
-            const auto geometry = definition.chunk_schema ? Geometry(definition.geometry, block_schema, *definition.chunk_schema)
-                                                         : Geometry(definition.geometry, block_schema);
-            journal.table_id = NewStoreId();
-            manifest = StoreManifest{.features = TableScopedFeatures(root->features), .geometry = definition.geometry, .store_id = journal.table_id,
-                                     .options = EncodeTableOptions(definition.options), .schema = block_schema,
-                                     .chunk_schema = geometry.chunk_schema()};
-            next_options = definition.options;
         }
-        bool manifest_changed = created;
+        bool manifest_changed = false;
         bool slots_changed = false;
         bool grants_changed = false;
         std::optional<FeedSlotRecords> slots;
@@ -840,59 +949,9 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
                 case Kind::kCreate:
                     // Prepared above, or a CREATE TABLE IF NOT EXISTS of the table that exists.
                     break;
-                case Kind::kAlter: {
-                    if (step.columns_if_needed && !step.columns_if_needed(step.chunk_column ? *manifest.chunk_schema : manifest.schema))
-                        break;
-                    const auto previous_schema = manifest.schema;
-                    const auto previous_chunk_schema = *manifest.chunk_schema;
-                    if (step.narrowing) {
-                        const auto& [column_name, type] = *step.narrowing;
-                        if (i == 0U && narrowing_recorded) {
-                            // The scan checked the values of this schema only.
-                            if (manifest.schema != scanned_schema)
-                                throw std::runtime_error("table '" + request.table + "' changed during the narrowing check");
-                            manifest.schema = NarrowColumnType(manifest.schema, column_name, type);
-                        } else {
-                            const auto at = std::find_if(manifest.schema.columns.begin(), manifest.schema.columns.end(),
-                                [&](const auto& column) { return column.name == column_name; });
-                            if (at == manifest.schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
-                            if (!HoldsEveryValue(at->type, type)) {
-                                if (i == 0U) throw std::runtime_error("table '" + request.table + "' changed before the narrowing check");
-                                throw std::invalid_argument("step " + number + " of the migration narrows column " + column_name +
-                                    ", which checks stored values; a narrowing can only be the first step");
-                            }
-                            manifest.schema = ChangeColumnType(manifest.schema, column_name, type, Conversion::kExact);
-                        }
-                    } else if (step.drop_null) {
-                        if (!narrowing_recorded || manifest.schema != scanned_schema)
-                            throw std::runtime_error("table '" + request.table + "' changed during the DROP NULL check");
-                        manifest.schema = chunkdb::DropColumnNull(manifest.schema, *step.drop_null);
-                    } else if (step.add_check) {
-                        if (!narrowing_recorded || manifest.schema != scanned_schema)
-                            throw std::runtime_error("table '" + request.table + "' changed during the ADD CHECK scan");
-                        manifest.schema = AddPendingCheck(manifest.schema);
-                    } else step.alter(manifest);
-                    AlignManifestSchemaDomains(&manifest, previous_schema, previous_chunk_schema);
-                    if (!created) {
-                        RequireCompatibleColumnAdditions(previous_schema, manifest.schema, *store);
-                        for (const auto& column : manifest.chunk_schema->columns) {
-                            if (!column.required || column.has_default ||
-                                std::any_of(previous_chunk_schema.columns.begin(), previous_chunk_schema.columns.end(),
-                                    [&](const auto& old) { return old.id == column.id; })) continue;
-                            if (store->HasWrittenChunkIdentities())
-                                throw std::invalid_argument("chunk column " + column.name +
-                                    ": a REQUIRED column added to a table needs a DEFAULT for its written chunk identities");
-                            break;
-                        }
-                    }
-                    if (const auto reason = UnsupportedSchemaReason(manifest.schema); !reason.empty()) throw std::invalid_argument(reason);
-                    manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
-                    (void)Geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
-                    next_options = DecodeTableOptions(manifest.options);
-                    RequireValidTableOptions(next_options);
-                    manifest_changed = true;
+                case Kind::kAlter:
+                    if (!created && apply_alter(step, i, manifest)) manifest_changed = true;
                     break;
-                }
                 case Kind::kCreateSlot: {
                     RequireValidFeedSlotName(step.slot);
                     load_slots();
@@ -944,23 +1003,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
             }
             CrashAtFailpoint(("CHUNKDB_FAILPOINT_CRASH_MIGRATION_UNIT_STEP_" + number + "_ONCE").c_str());
         }
-        if (created) {
-            journal.directory_action = MigrationDirectoryAction::kCreate;
-            journal.operation_name = OperationName(request.table);
-            staging = StagingDir() / journal.operation_name;
-            EnsureDirectoryPathExists(StagingDir(), true);
-            if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("migration stage already exists");
-            staging_owned = true;
-            const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
-            if (!ChunkCoordinateIndex::InitializeEmpty(staging, geometry, journal.table_id))
-                throw std::runtime_error("coordinate inventory appeared in migration staging");
-            const auto bytes = SerializeStoreManifest(manifest);
-            if (!PublishNewFile(StoreManifestPath(staging), bytes)) throw std::runtime_error("migration stage manifest already exists");
-            SyncDirectoryPath(StagingDir());
-            journal.files.push_back({"tables/" + request.table + "/" + std::string(kStoreManifestFileName), std::nullopt, bytes});
-            journal.files.push_back({"tables/" + request.table + "/" + std::string(kChunkIndexFileName),
-                std::nullopt, LoadFile(staging / kChunkIndexFileName)});
-        } else if (manifest_changed || slots_changed) {
+        if (!created && (manifest_changed || slots_changed)) {
             // A slot change carries the manifest too, which binds redo to the
             // table identity, as a single CREATE SLOT does.
             add_file("tables/" + request.table + "/" + std::string(kStoreManifestFileName), SerializeStoreManifest(manifest));
@@ -993,6 +1036,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
             store.reset();
         }
         CompleteMigrationJournal(config_.data_dir, journal);
+        forget_staging();
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
         if (user_lock.owns_lock()) user_lock.unlock();
         if (created) {
@@ -1021,6 +1065,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
         const auto failure = std::current_exception();
         if (decided) {
             migration_health_->failed.store(true, std::memory_order_release);
+            forget_staging();
             store.reset();
             if (table && table_admitted && !serving_finished) RetireTable(*table, previous);
         } else {
@@ -1045,11 +1090,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
                                              "; cannot resume table: " + restore_error.what());
                 }
             }
-            if (staging_owned) {
-                std::error_code ec;
-                std::filesystem::remove_all(staging, ec);
-                if (ec) throw std::runtime_error("migration preparation failed and staging cleanup failed: " + ec.message());
-            }
+            discard_staging();
             drop_recorded_narrowing();
         }
         if (decided) {

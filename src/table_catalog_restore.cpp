@@ -83,12 +83,13 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
     {
         std::lock_guard operations(operations_mutex_);
         require_name();
-        restore_staging_.insert(operation);
+        if (!active_staging_.insert(operation).second)
+            throw std::runtime_error("restore stage already registered");
     }
     // Runs last, after the operations lock taken below is released.
     ScopeExit registration([&] {
         std::lock_guard operations(operations_mutex_);
-        restore_staging_.erase(operation);
+        active_staging_.erase(operation);
     });
     LogMessage(LogLevel::kInfo, LogComponent::kStore, "table restore started",
         {{"table", request.name}, {"backup", request.backup.string()}, {"backed_up_table", request.table}});

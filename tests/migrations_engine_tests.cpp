@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <future>
@@ -908,6 +910,130 @@ void UsersProgressDuringDropLeaseDrain() {
     assert(e.catalog->Migrations().size() == 1U);
 }
 
+void UnitRejectsMissingJournalParticipants() {
+    test::ScopedTempDir dir("chunkdb-migrations-unit-participants");
+    const std::string grant = "GRANT WRITE ON realm TO limited";
+    const std::string unit = "MIGRATE 'unit' ALTER TABLE realm ADD COLUMN a u8 NULL; " + grant;
+    {
+        Engine e(dir.path(), true);
+        Reply(e.Run(kCreate), "+OK\r\n");
+        Reply(e.Run("CREATE SLOT 'first' ON realm"), "+OK\r\n");
+        e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+        const auto manifest = LoadFile(dir.path() / "tables/realm/table.manifest");
+        const auto users = LoadFile(dir.path() / "chunkdb.users");
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+        Error(e.Run(unit), "OUTCOME_UNKNOWN stage=migration_completion");
+        const auto pending = LoadFile(dir.path() / kMigrationPendingFileName);
+        const auto journal = ReadMigrationJournal(dir.path());
+        assert(journal && journal->files.size() == 3U);
+        ValidateMigrationJournal(dir.path(), *journal);
+        const auto reject = [&](const MigrationJournal& incomplete, std::string_view expected = {}) {
+            bool refused = false;
+            try { CompleteMigrationJournal(dir.path(), incomplete); }
+            catch (const std::runtime_error& error) {
+                assert(expected.empty() || std::string_view(error.what()).find(expected) != std::string_view::npos);
+                refused = true;
+            }
+            assert(refused);
+            assert(LoadFile(dir.path() / kMigrationPendingFileName) == pending);
+            assert(LoadFile(dir.path() / "tables/realm/table.manifest") == manifest);
+            assert(LoadFile(dir.path() / "chunkdb.users") == users);
+            assert(ReadMigrationRecords(dir.path()).empty());
+        };
+        for (const auto* path : {"tables/realm/table.manifest", "chunkdb.users"}) {
+            auto incomplete = *journal;
+            assert(std::erase_if(incomplete.files, [&](const auto& file) { return file.path == path; }) == 1U);
+            reject(incomplete);
+        }
+        auto users_only = *journal;
+        users_only.files.erase(users_only.files.begin());
+        const auto with_first_step = [&](std::string_view first) {
+            auto modified = users_only;
+            modified.record.statement = std::string(first) + "; " + grant;
+            modified.files.back().after = EncodeMigrationRecords(modified.data_dir_id, {modified.record});
+            return modified;
+        };
+        ValidateMigrationJournal(dir.path(), with_first_step("ALTER TABLE realm ADD COLUMN IF NOT EXISTS v u8"));
+        ValidateMigrationJournal(dir.path(), with_first_step("CREATE SLOT IF NOT EXISTS 'first' ON realm"));
+        for (const auto* first : {"ALTER TABLE realm ADD COLUMN IF NOT EXISTS v u8",
+                                  "CREATE SLOT IF NOT EXISTS 'first' ON realm"}) {
+            auto missing_table = with_first_step(first);
+            missing_table.table.clear();
+            missing_table.table_id = {};
+            reject(missing_table, "migration steps table differs from participants");
+        }
+        reject(with_first_step("ALTER TABLE realm ADD COLUMN IF NOT EXISTS a u8"));
+        reject(with_first_step("DROP SLOT IF EXISTS 'first' ON realm"));
+        reject(with_first_step("DROP SLOT 'first' ON realm"));
+        reject(with_first_step(kCreate));
+    }
+    Engine recovered(dir.path(), true);
+    assert(!ReadMigrationJournal(dir.path()) && recovered.catalog->Migrations().size() == 1U);
+    assert(recovered.catalog->Find("realm")->Info().schema.columns.back().name == "a");
+    assert(recovered.users->Find("limited")->grants.at("realm") == Right::kWrite);
+    Reply(recovered.Run(unit), "+skipped\r\n");
+}
+
+void ConditionalUnitUsesConcurrentCreate() {
+    test::ScopedTempDir dir("chunkdb-migrations-unit-concurrent-create");
+    Engine e(dir.path());
+    Reply(e.Run("CREATE TABLE other (v u8) CHUNK 2 x 2"), "+OK\r\n");
+    Pause pause;
+    pause.pause_at = MigrationTestHook::Point::kMigrationCreateStaged;
+    e.catalog->SetMigrationTestHook(&pause);
+    SessionState second;
+    assert(e.engine->Execute(second, "HELLO 3").front() == '%');
+    auto unit = std::async(std::launch::async, [&] {
+        return e.Run("MIGRATE 'unit' CREATE TABLE IF NOT EXISTS realm (ignored u8) CHUNK 2 x 2; "
+                     "ALTER TABLE realm ADD COLUMN a u8 NULL");
+    });
+    pause.WaitPrepared();
+    const auto staging = dir.path() / ".chunkdb.staging";
+    assert(!std::filesystem::is_empty(staging));
+    auto create = std::async(std::launch::async, [&] {
+        assert(e.engine->Execute(second, "SET BLOCK 0 0 IN other v = 7").front() == ':');
+        assert(e.engine->Execute(second, "GET BLOCK 0 0 FROM other COLUMNS v").find(":7\r\n") != std::string::npos);
+        return e.engine->Execute(second, kCreate);
+    });
+    assert(create.wait_for(10s) == std::future_status::ready);
+    Reply(create.get(), "+OK\r\n");
+    const auto winner = e.catalog->Find("realm");
+    assert(winner);
+    pause.Release();
+    Reply(unit.get(), "+applied\r\n");
+    e.catalog->SetMigrationTestHook(nullptr);
+    assert(e.catalog->Find("realm") == winner && std::filesystem::is_empty(staging));
+    const auto schema = winner->Info().schema;
+    assert(schema.columns.size() == 2U && schema.columns[0].name == "v" && schema.columns[1].name == "a");
+    assert(e.catalog->Migrations().size() == 1U);
+}
+
+void UnitSlotBaselineOnlyForNewSlot() {
+    struct SyncCount : FeedSlotTestHook {
+        std::atomic<unsigned> syncs{0U};
+        void Run(Point point, std::uint64_t) override {
+            if (point == Point::kBeforeSync) ++syncs;
+        }
+    } count;
+    test::ScopedTempDir dir("chunkdb-migrations-unit-slot-baseline");
+    Engine e(dir.path());
+    Reply(e.Run(kCreate), "+OK\r\n");
+    Reply(e.Run("CREATE SLOT 'first' ON realm"), "+OK\r\n");
+    const auto table = e.catalog->Find("realm");
+    const auto path = dir.path() / "tables/realm/chunkdb.slots";
+    const auto before = LoadFile(path);
+    FeedSlotTestAccess::SetHook(*table, &count);
+    Reply(e.Run("MIGRATE 'keep_slot' CREATE SLOT IF NOT EXISTS 'first' ON realm; "
+                "ALTER TABLE realm ADD COLUMN IF NOT EXISTS v u8"), "+applied\r\n");
+    assert(count.syncs.load() == 0U && LoadFile(path) == before);
+
+    // The unit reopens the store, so install the hook on its replacement.
+    FeedSlotTestAccess::SetHook(*table, &count);
+    Reply(e.Run("MIGRATE 'add_slots' CREATE SLOT 'second' ON realm; CREATE SLOT 'third' ON realm"), "+applied\r\n");
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+    assert(count.syncs.load() == 1U && table->ListFeedSlots().size() == 3U);
+}
+
 // A migration of several steps on one table applies every step or none, and
 // records one ledger entry for the whole text.
 void UnitsAllOrNothing() {
@@ -1016,11 +1142,25 @@ void UnitRecordsFollowRights() {
     assert(as(keeper, "SHOW MIGRATIONS").find("$4\r\nboth\r\n") != std::string::npos);
 }
 
+void GrantOnlyUnitsUseOneTarget() {
+    test::ScopedTempDir dir("chunkdb-migrations-unit-grant-target");
+    Engine e(dir.path(), true);
+    e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    Error(e.Run("MIGRATE 'grants' GRANT READ ON * TO limited; GRANT WRITE ON realm* TO limited"), "INVALID_ARGUMENT");
+    assert(e.catalog->Migrations().empty());
+    Reply(e.Run("MIGRATE 'all_tables' GRANT READ ON * TO limited; GRANT WRITE ON * TO limited"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'prefix' GRANT ADMIN ON realm* TO limited; REVOKE ADMIN ON realm* FROM limited"), "+applied\r\n");
+    const auto user = e.users->Find("limited");
+    assert(user->grants.at("*") == Right::kWrite && user->prefix_grants.at("realm") == Right::kWrite);
+    assert(e.catalog->Migrations().size() == 2U);
+}
+
 }  // namespace
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
     UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); SlotOwnersInMigrations(); NarrowingScanOutsideCatalogAdmission(); NarrowingRefusalLeavesNoTrace(); NarrowingEndFailureFences(); RightsAndDrop(); RecordedNamesFollowRights(); UnparseableRecordNeedsEveryTable(); ListingWithoutAdminSkipsLedger(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); PingDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery(); UnitsAllOrNothing(); UnitRecordsFollowRights();
+    UnitRejectsMissingJournalParticipants(); ConditionalUnitUsesConcurrentCreate(); UnitSlotBaselineOnlyForNewSlot(); GrantOnlyUnitsUseOneTarget();
     LedgerLimit(false); LedgerLimit(true);
 }

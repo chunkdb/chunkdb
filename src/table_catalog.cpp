@@ -1349,8 +1349,7 @@ void TableCatalog::RemoveInterruptedOperations(std::string_view table) {
         std::vector<std::filesystem::path> leftovers;
         for (; !ec && it != end; it.increment(ec)) {
             const auto name = it->path().filename().string();
-            // A RESTORE TABLE still copying into this name keeps its staging.
-            if (dir == StagingDir() && restore_staging_.contains(name)) continue;
+            if (dir == StagingDir() && active_staging_.contains(name)) continue;
             if (name.starts_with(prefix)) leftovers.push_back(it->path());
         }
         if (ec) {
