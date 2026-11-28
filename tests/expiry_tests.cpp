@@ -50,6 +50,13 @@ void Expect(const std::string& reply, const std::string& part) {
     }
 }
 
+void ExpectReply(const std::string& reply, const std::string& expected) {
+    if (reply != expected) {
+        std::fprintf(stderr, "expected reply '%s', got '%s'\n", expected.c_str(), reply.c_str());
+        std::abort();
+    }
+}
+
 CatalogConfig Config(const std::filesystem::path& dir, std::chrono::milliseconds expiry_interval) {
     auto config = feed_test::Config(dir);
     config.expiry_interval = expiry_interval;
@@ -63,7 +70,7 @@ struct Server {
         Expect(Run("HELLO 3"), "%");
     }
     std::string Run(const std::string& statement) { return engine.Execute(session, statement); }
-    void Ok(const std::string& statement) { Expect(Run(statement), "+OK"); }
+    void Ok(const std::string& statement) { ExpectReply(Run(statement), "+OK\r\n"); }
     void Write(const std::string& statement) {
         const auto reply = Run(statement);
         if (reply.empty() || reply.front() != ':') {
@@ -163,8 +170,8 @@ void TestCommitTimeWrites() {
         // A transaction stamps the blocks it changes, and only those.
         g_now = 8'000U;
         server.Ok("BEGIN");
-        Expect(server.Run("SET BLOCK 1 0 IN t v = 1"), "_");
-        Expect(server.Run("COMMIT"), ":");
+        ExpectReply(server.Run("SET BLOCK 1 0 IN t v = 1"), "_\r\n");
+        server.Write("COMMIT");
         assert(server.Get("1 0", "t", "at") == Int(8'000U));
         assert(server.Get("0 0", "t", "at") == Int(7'500U));
         // Whole-chunk writes, unconditional and conditional.
@@ -231,9 +238,9 @@ void TestCommitTimePeerColumns() {
     assert(server.Get("0 0", "t", "a") == Int(10U));
     assert(server.Get("0 0", "t", "b") == Int(5'000U));
     server.Ok("BEGIN");
-    assert(server.Run("SET BLOCK 0 0 IN t a = 11") == "_\r\n");
+    ExpectReply(server.Run("SET BLOCK 0 0 IN t a = 11"), "_\r\n");
     g_now = 6'000U;
-    Expect(server.Run("COMMIT"), ":");
+    server.Write("COMMIT");
     assert(server.Get("0 0", "t", "a") == Int(11U));
     assert(server.Get("0 0", "t", "b") == Int(6'000U));
 }
@@ -254,9 +261,9 @@ void TestExpireColumnOption() {
         server.Ok("ALTER TABLE e SET expire_column = NULL");
         assert(!Contains(server.Run("DESCRIBE e"), "expire_column"));
         server.Ok("ALTER TABLE e SET expire_column = 'deadline'");
-        Expect(server.Run("MIGRATE 'drop_expiry' ALTER TABLE e SET expire_column = NULL"), "+applied");
+        ExpectReply(server.Run("MIGRATE 'drop_expiry' ALTER TABLE e SET expire_column = NULL"), "+applied\r\n");
         assert(!Contains(server.Run("DESCRIBE e"), "expire_column"));
-        Expect(server.Run("MIGRATE 'add_expiry' ALTER TABLE e SET expire_column = deadline"), "+applied");
+        ExpectReply(server.Run("MIGRATE 'add_expiry' ALTER TABLE e SET expire_column = deadline"), "+applied\r\n");
     }
     // Option type 13 survives a restart.
     Server server(dir.path());
@@ -424,7 +431,9 @@ void TestFencedExpiryMetrics() {
     ExpiryTestAccess::RunSweep(*server.catalog, "e");
     {
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE", "1");
-        Expect(server.Run("ALTER TABLE e SET checkpoint_updates = 9000"), "injected failure reopening a table");
+        // The engine logs the reopen failure and sends a generic INTERNAL reply.
+        ExpectReply(server.Run("ALTER TABLE e SET checkpoint_updates = 9000"),
+            "-ERR INTERNAL reason=internal internal error\r\n");
     }
     assert(server.catalog->Find("e") == nullptr);
     g_now = 1'250U;
@@ -495,11 +504,11 @@ void TestChecksReadCommitTime() {
     assert(server.Get("1 0", "c", "updated") == Int(4'000U) && server.Get("2 0", "c", "v") == "_\r\n");
     // A statement defers the checks that read the time; COMMIT decides.
     server.Ok("BEGIN");
-    Expect(server.Run("SET BLOCK 3 0 IN c v = 1, expires = 5000"), "_");
-    Expect(server.Run("COMMIT"), ":");
+    ExpectReply(server.Run("SET BLOCK 3 0 IN c v = 1, expires = 5000"), "_\r\n");
+    server.Write("COMMIT");
     assert(server.Get("3 0", "c", "updated") == Int(4'000U));
     server.Ok("BEGIN");
-    Expect(server.Run("SET BLOCK 3 1 IN c v = 1, expires = 4500"), "_");
+    ExpectReply(server.Run("SET BLOCK 3 1 IN c v = 1, expires = 4500"), "_\r\n");
     g_now = 5'000U;
     Expect(server.Run("COMMIT"), "check=fresh");
     assert(server.Get("3 1", "c", "v") == "_\r\n");
