@@ -47,12 +47,15 @@ Later 2.x servers still open valid 2.0 data.
 | `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled for a binary without `slot_filters`, or before any multi-area slots were created for a binary that lacks multi-area slot support. |
 | `feature_activation` | Directory: checked activation decisions. | Before bit `0x10` was enabled. |
 | `chunk_model` | Directory and tables: dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions. | No conversion to an earlier development layout. |
+| `commit_groups` | Directory and tables: the commit owner scope and its canonical owner root, created INACTIVE. | Before bit `0x40` was enabled. |
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
 A binary with `slot_filters` also needs multi-area slot support to open tables whose [`chunkdb.slots`](STORAGE_FORMAT.md#feed-slots-and-archives) header carries flag `0x2`.
 To use a binary lacking a feature, restore the whole consistent backup identified above.
 Use a restore tool that supports that backup's recorded features; restore refuses backed-up tables without `table_lineage`, which every table a 2.0 build creates has.
 Dropping records or manually clearing masks does not establish a supported rollback.
+In a directory with `commit_groups`, an entry of `tables/` with a table name that is a symlink or junction refuses opening; a directory without the feature still skips it with a warning.
+A directory or standalone store that has no manifest and holds `chunkdb.manifest.tmp.*`, `table.manifest.tmp.*` or `chunkdb.index.tmp.*` files without a creation decision, such as those left by a crash of an earlier build, refuses opening and keeps them; remove them, or the whole directory, to create it again.
 New directories already enable these initial features; an older binary must support their masks to open them.
 
 Restore records the immediate parent epoch and completed backup cut, preserving committed revision values within a new epoch.

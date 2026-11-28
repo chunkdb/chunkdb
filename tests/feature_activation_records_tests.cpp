@@ -14,6 +14,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "feature_activation_records.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
@@ -81,11 +82,14 @@ FeatureActivationJournal Seed(const std::filesystem::path& root) {
     }
     auto directory = *ReadDataDirManifest(root);
     directory.features = {.incompat = kFeatureActivation | kFeatureChunkModel, .compat = 1U << 30U};
+    directory.commit_owner.reset();
     Save(DataDirManifestPath(root), SerializeDataDirManifest(directory));
+    assert(std::filesystem::remove(root / "chunkdb.groups.owner"));
     FeatureActivationJournal journal{directory.data_dir_id, kFeatureSlotFilters, {}};
     for (const char* name : {"alpha", "beta"}) {
         auto manifest = *ReadStoreManifest(root / "tables" / name);
         manifest.features = {.incompat = kFeatureFeedSlots | kFeatureChunkModel, .compat = 1U << 29U};
+        manifest.commit_owner.reset();
         manifest.options.insert(manifest.options.end(), {99, 0, 1, 0, 0xAC});
         Save(StoreManifestPath(root / "tables" / name), SerializeStoreManifest(manifest));
         journal.tables.push_back({name, manifest.store_id});
@@ -144,42 +148,37 @@ void RuntimeActivation() {
     }
 }
 
-// Groups are not active: new directories and tables do not carry
-// commit_groups, it cannot be enabled or listed, and a directory or table
-// whose manifest carries the bit is refused as an unknown feature.
-void CommitGroupsDormant() {
+// ENABLE FEATURE 'commit_groups' binds the directory and every table to one
+// owner scope and preserves every other manifest field; new tables carry it.
+void CommitGroupOwnership() {
     test::ScopedTempDir dir("chunkdb-commit-group-feature");
+    (void)Seed(dir.path());
+    const auto before_directory = *ReadDataDirManifest(dir.path());
+    const auto before_alpha = *ReadStoreManifest(dir.path() / "tables/alpha");
+    const auto before_beta = *ReadStoreManifest(dir.path() / "tables/beta");
     CatalogConfig config; config.data_dir = dir.path();
     {
-        auto catalog = std::make_shared<TableCatalog>(config);
-        const auto created = catalog->Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
-        assert((created->Acquire()->store().features().incompat & kFeatureCommitGroups) == 0U);
-        assert((ReadDataDirManifest(dir.path())->features.incompat & kFeatureCommitGroups) == 0U);
-        assert((ReadStoreManifest(dir.path() / "tables/alpha")->features.incompat & kFeatureCommitGroups) == 0U);
-        const auto before = Tree(dir.path());
-        Reject([&] { (void)catalog->EnableFeature("commit_groups"); }, "unknown feature");
-        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
-        SessionState session; (void)engine.Execute(session, "HELLO 3\r\n");
-        const auto enable = engine.Execute(session, "ENABLE FEATURE 'commit_groups'\r\n");
-        assert(enable.find("reason=unknown_feature") != std::string::npos);
-        const auto status = engine.Execute(session, "SHOW STATUS\r\n");
-        assert(status.starts_with("%7\r\n") && status.find("commit_groups") == std::string::npos);
-        assert(Tree(dir.path()) == before);
-    }
-    const auto table_path = StoreManifestPath(dir.path() / "tables/alpha");
-    const auto table_bytes = LoadFile(table_path);
-    auto table = ParseStoreManifest(table_bytes);
-    table.features.incompat |= kFeatureCommitGroups;
-    Save(table_path, SerializeStoreManifest(table));
-    Reject([&] {
         TableCatalog catalog(config);
-        (void)catalog.Find("alpha")->Acquire();
-    }, "does not support (unknown incompat=0x40 ");
-    Save(table_path, table_bytes);
-    auto directory = *ReadDataDirManifest(dir.path());
-    directory.features.incompat |= kFeatureCommitGroups;
-    Save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(directory));
-    Reject([&] { TableCatalog catalog(config); }, "does not support (unknown incompat=0x40 ");
+        assert(catalog.EnableFeature("commit_groups"));
+        assert(!catalog.EnableFeature("commit_groups"));
+        for (const auto& name : {"alpha", "beta"}) {
+            const auto lease = catalog.Find(name)->Acquire();
+            assert((lease->store().features().incompat & kFeatureCommitGroups) != 0U);
+        }
+        const auto created = catalog.Create("gamma", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        assert((created->Acquire()->store().features().incompat & kFeatureCommitGroups) != 0U);
+    }
+    const auto directory = *ReadDataDirManifest(dir.path());
+    assert(directory.data_dir_id == before_directory.data_dir_id);
+    assert(directory.features.incompat == (before_directory.features.incompat | kFeatureCommitGroups));
+    assert(directory.features.compat == before_directory.features.compat);
+    for (const auto& [name, before] : {std::pair{"alpha", before_alpha}, std::pair{"beta", before_beta}}) {
+        const auto after = *ReadStoreManifest(dir.path() / "tables" / name);
+        assert(after.store_id == before.store_id && after.options == before.options);
+        assert(after.features.incompat == (before.features.incompat | kFeatureCommitGroups));
+        assert(after.features.compat == before.features.compat);
+    }
+    assert(!ReadFeatureActivationJournal(dir.path()));
 }
 
 void RuntimeAdmissionAndRecovery() {
@@ -285,7 +284,7 @@ void Codec() {
     const auto good = EncodeFeatureActivationJournal(journal);
     assert(DecodeFeatureActivationJournal(good) == journal);
     auto bad = good; bad[0] ^= 1U; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "magic");
-    bad = good; bad[4] = 2; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "version");
+    bad = good; bad[4] = 3; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "version");
     bad = good; bad[6] = 1; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "reserved");
     bad = good; bad[10] ^= 1U; Reject([&] { (void)DecodeFeatureActivationJournal(bad); }, "checksum");
     bad = good; bad.insert(bad.end() - 4, 0); Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "trailing");
@@ -453,13 +452,66 @@ void CrashRecovery(const std::string& executable) {
     assert(!ReadFeatureActivationJournal(dir.path()));
     assert(ReadDataDirManifest(dir.path())->features.incompat == (kFeatureActivation | kFeatureSlotFilters | kFeatureChunkModel));
 }
+// ENABLE FEATURE 'commit_groups' interrupted at each publication boundary:
+// a pending decision refuses read-only opening, and writer startup finishes
+// with the recorded owner on the directory, its root and every table.
+void CommitGroupCrashRecovery(const std::string& executable) {
+    const char* points[]{
+        "CHUNKDB_FAILPOINT_CRASH_FEATURE_BEFORE_DECISION_ONCE", "CHUNKDB_FAILPOINT_CRASH_FEATURE_AFTER_DECISION_ONCE",
+        "CHUNKDB_FAILPOINT_CRASH_OWNER_FEATURE_AFTER_OWNER_ONCE",
+        "CHUNKDB_FAILPOINT_CRASH_FEATURE_ROOT_BEFORE_PUBLISH_ONCE", "CHUNKDB_FAILPOINT_CRASH_FEATURE_ROOT_AFTER_PUBLISH_ONCE",
+        "CHUNKDB_FAILPOINT_FEATURE_TABLE_0_BEFORE_PUBLISH_ONCE", "CHUNKDB_FAILPOINT_FEATURE_TABLE_0_AFTER_PUBLISH_ONCE",
+        "CHUNKDB_FAILPOINT_FEATURE_TABLE_1_BEFORE_PUBLISH_ONCE", "CHUNKDB_FAILPOINT_FEATURE_TABLE_1_AFTER_PUBLISH_ONCE",
+        "CHUNKDB_FAILPOINT_CRASH_FEATURE_BEFORE_PENDING_REMOVE_ONCE", "CHUNKDB_FAILPOINT_CRASH_FEATURE_AFTER_PENDING_REMOVE_ONCE"};
+    for (const char* point : points) {
+        test::ScopedTempDir dir("chunkdb-commit-group-crash");
+        const auto journal = Seed(dir.path());
+        std::string command = "\"" + executable + "\" --groups \"" + dir.path().string() + "\" \"" + point + "\"";
+#ifdef _WIN32
+        assert(std::system(("\"" + command + "\"").c_str()) == 86);
+#else
+        const auto status = std::system(command.c_str()); assert(WIFEXITED(status) && WEXITSTATUS(status) == 86);
+#endif
+        const bool applied = std::string_view(point) != points[0];
+        const auto pending = ReadFeatureActivationJournal(dir.path());
+        if (pending) {
+            assert(pending->feature == kFeatureCommitGroups && pending->commit_owner);
+            assert(pending->commit_owner->directory_id == journal.data_dir_id && pending->commit_owner->role == CommitOwnerRole::kCatalog);
+            CatalogConfig read_only; read_only.data_dir = dir.path(); read_only.access_mode = AccessMode::kReadOnly;
+            Reject([&] { TableCatalog catalog(read_only); }, "");
+            assert(ReadFeatureActivationJournal(dir.path()) == pending);
+        }
+        {
+            CatalogConfig config; config.data_dir = dir.path(); TableCatalog catalog(config);
+            for (const char* name : {"alpha", "beta"}) (void)catalog.Find(name)->Acquire();
+        }
+        assert(!ReadFeatureActivationJournal(dir.path()));
+        const auto directory = *ReadDataDirManifest(dir.path());
+        assert(((directory.features.incompat & kFeatureCommitGroups) != 0U) == applied);
+        assert(directory.commit_owner.has_value() == applied);
+        if (!applied) {
+            assert(!std::filesystem::exists(dir.path() / "chunkdb.groups.owner"));
+            continue;
+        }
+        if (pending) assert(directory.commit_owner == pending->commit_owner);
+        (void)CommitOwnerBootstrap::ReadInactiveRoot(dir.path(), *directory.commit_owner);
+        for (const auto& target : journal.tables) {
+            const auto table = *ReadStoreManifest(dir.path() / "tables" / target.name);
+            assert(table.store_id == target.table_id && table.commit_owner == directory.commit_owner);
+            assert((table.features.incompat & kFeatureCommitGroups) != 0U);
+        }
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 4) {
         txn_test::ScopedEnv armed(argv[3], "1");
         try {
-            if (std::string_view(argv[1]) == "--bootstrap") {
+            if (std::string_view(argv[1]) == "--groups") {
+                CatalogConfig config; config.data_dir = argv[2]; TableCatalog catalog(config);
+                (void)catalog.EnableFeature("commit_groups");
+            } else if (std::string_view(argv[1]) == "--bootstrap") {
                 CatalogConfig config; config.data_dir = argv[2]; TableCatalog catalog(config);
                 try { (void)catalog.EnableFeature("feature_activation"); }
                 catch (const WriteOutcomeUnknownError& error) {
@@ -485,5 +537,5 @@ int main(int argc, char** argv) {
         return 3;
     }
     assert(argc == 1);
-    RuntimeActivation(); CommitGroupsDormant(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
+    RuntimeActivation(); CommitGroupOwnership(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]); CommitGroupCrashRecovery(argv[0]);
 }

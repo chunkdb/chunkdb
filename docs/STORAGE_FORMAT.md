@@ -30,13 +30,14 @@ data_dir/
   chunkdb.users                       user verifiers and grants, when authentication is configured
   chunkdb.migrations                  completed named migration records, when present
   chunkdb.migration.pending           decided migration awaiting completion, when present
+  chunkdb.groups.owner                commit owner root, initially INACTIVE
+  chunkdb.bootstrap.pending           creation decision, until creation completes
   .chunkdb.lock/                      writer-process lock
   .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
-  chunkdb.groups.owner                commit group owner root (inactive; no path creates it)
-  chunkdb.groups.objects/             commit group owner objects (inactive)
-  chunkdb.groups.journal/             commit group journal generations (inactive)
+  chunkdb.groups.objects/             commit group owner objects, not created by this build
+  chunkdb.groups.journal/             commit group journal generations, not created by this build
   tables/<name>/
     table.manifest                    identity, geometry, options, schema history
     chunkdb.version                   reserved revision ceiling
@@ -83,7 +84,8 @@ Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only rea
 The server opens read-write and therefore refuses either of the first two unknown sets; with `--read-only` it refuses only unknown `incompat` bits.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
-Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
+Directory and table incompat bit 6 (`0x40`), named `commit_groups`, owns checked group decisions, grouped WAL metadata, durability receipts and retained result identities.
+It also requires an immutable manifest owner scope and the checked canonical `chunkdb.groups.owner`; a missing claimed owner is damage.
 Envelopes of 1.x and of development builds of 2.0 are refused before any artifact changes; such a data directory must be recreated.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
@@ -112,8 +114,11 @@ Options are consecutive `type:u16, length:u16, value:length` entries filling the
 Type 1 is `version_floor:u64`, the lower bound for a newly initialized table clock.
 DROP raises it to at least the dropped table’s reserved ceiling, preventing token reuse after recreation.
 Missing floor is zero; new clocks start at least at 1, and duplicate floor entries or a wrong length are invalid.
+Type 2 is the 40-byte commit-owner scope and is present exactly when `commit_groups` is set.
+It contains nonzero directory and owner identities (16 bytes each), role `u8` and seven zero bytes; catalog role is 2 and its directory identity equals `data_dir_id`.
 
-A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files.
+A writer starts fresh catalog creation only when its lock is the sole chunkdb-owned entry.
+A checked creation decision permits recovery of its matching manifest temporary files.
 Foreign entries such as `lost+found` are preserved.
 Read-only opening never initializes the directory.
 
@@ -155,6 +160,11 @@ Options use the same TLV layout as the root manifest:
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
+| 16 | immutable 40-byte commit-owner scope | required exactly with `commit_groups` |
+
+Catalog tables repeat their directory's exact scope and require its admitted directory context when opened.
+A standalone table uses role 1 with its own `store_id` as the scope's directory identity; opening an isolated catalog table does not infer standalone ownership.
+Scope is separate from mutable options and survives schema, option and lineage replacements.
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is not a known option.
 
@@ -168,26 +178,35 @@ Committed image and WAL revisions retain their numeric values; reserved tokens b
 ### Feature activation decision
 
 `chunkdb.feature.pending` belongs to directory incompatibility feature `feature_activation` (`0x10`).
-Its checked version-1 representation is:
+New decisions use checked version 2:
 
 | Order | Bytes |
 |---|---|
-| 1 | `CKFA`, version `u16` = 1, reserved zero `u16` |
+| 1 | `CKFA`, version `u16` = 2, reserved zero `u16` |
 | 2 | directory identity, 16 bytes |
 | 3 | one registered incompatibility bit `u32`, target count `u32` |
-| 4 | per target: name length `u8`, name bytes, table identity, 16 bytes |
-| 5 | CRC32 `u32` over every preceding byte |
+| 4 | owner scope, 40 bytes: required for `commit_groups`, otherwise all zero |
+| 5 | per target: name length `u8`, name bytes, table identity, 16 bytes |
+| 6 | CRC32 `u32` over every preceding byte |
 
 Targets appear in strictly increasing name order and cover the complete table inventory.
 `feature_activation` itself uses one atomic root-manifest replacement and cannot appear as the journal's activation bit.
 Names follow table-name rules; identities are nonzero.
 The maximum target count is 65536; the file cannot exceed 16 MiB.
+Historical tag-1 decisions omit the scope field and remain readable for known nongroup features; tag 1 cannot activate `commit_groups`.
 Malformed bounds, reserved fields, ownership, identities, inventory, or checksums prevent publication.
 
 Recovery validates every target before changing a manifest, then unions the recorded bit into its registered owners.
 Directory-only migrations do not copy their bit into table manifests.
 It preserves current schema, options, lineage, and other feature masks.
 Every replacement and affected directory is synced before the journal is removed and its parent directory is synced.
+
+Initial owner creation uses the bounded `chunkdb.bootstrap.pending` CKGB decision, whose complete target manifest fixes both identities before publication.
+The checked empty inventory and generation-one INACTIVE owner are durable before the manifest claims them; only then is the decision removed and its directory synced.
+The owner is a 512-byte CKGO root with no selected references or counter in this initial state.
+Read-only startup refuses pending bootstrap, and recovery never recreates an owner lost after its manifest was committed.
+A manifest or inventory temporary in a directory without a manifest or a decision refuses opening and is left in place.
+The exact owner and creation envelopes are specified in [owner format](design/COMMIT_GROUP_OWNER_FORMAT.md) and [bootstrap format](design/COMMIT_OWNER_BOOTSTRAP.md).
 An interrupted replay repeats these unions without restoring stale manifest images.
 
 ### Schema area and history
@@ -331,7 +350,7 @@ TLVs fill their declared area exactly; each known type appears at most once:
 | 1 TAG | nonempty opaque bytes |
 | 2 SCHEMA | schema version `u64`; absent means version 1 |
 | 3 USER | nonempty writer-identity bytes, requiring the feed-slots feature; absent for anonymous writes |
-| 4 GROUP | reserved for commit groups: nonzero 16-byte group identity, `u64` member count, `u64` member ordinal; this build refuses a frame that carries it |
+| 4 GROUP | reserved for commit groups: nonzero 16-byte group identity, `u64` member count, `u64` member ordinal; this build refuses a frame that carries it, also in a table with `commit_groups` |
 
 All TLVs including their four-byte headers must fit the 65535-byte area; TAG's usable size therefore depends on other metadata in the frame.
 GROUP is exactly 32 bytes, its count is positive and its ordinal is below that count.
@@ -484,10 +503,10 @@ Rollback truncates/removes each WAL to its recorded boundary; a missing or short
 Committed intents preserve WAL effects, including WALs subsequently checkpointed away; removal and directory sync finish recovery idempotently.
 Failure repairing an uncommitted operation fences the affected store until recovery; post-commit cleanup does not turn a committed operation into a rejected one.
 
-## Commit group owner (inactive)
+## Commit group owner
 
-No server or tool path creates these files; `commit_groups` stays refused, and only internal code and tests write them in this build.
-The owner root is the data directory, or the root of a standalone store.
+The owner root is the data directory, or the root of a standalone store; creation, `ENABLE FEATURE 'commit_groups'` and restore write its canonical root, and every owner stays INACTIVE in this build.
+The object and journal directories are written only by internal code and tests: no server or tool path publishes an ACTIVE root or appends a journal.
 `chunkdb.groups.owner` is the 512-byte [CKGO root](design/COMMIT_GROUP_OWNER_FORMAT.md); the only canonical form this build writes is the generation-one INACTIVE root, published from an exclusive `.owner-root-<32 hex>` temporary without replacement.
 An existing root, or one that arrives during that publication, is admitted only by comparing its exact bytes with that root, and is then synced with the root directory.
 `chunkdb.groups.objects/` holds a `.scope` marker and digest-named immutable objects: roots, pages, 128-byte `CKGC` journal inventories and `CKID` ID inventories of at least 164 bytes, in their [native encodings](design/COMMIT_GROUP_FORMAT.md#journal-header-and-certified-inventory).
@@ -658,7 +677,8 @@ Empty-chunk collection records the empty state when needed, removes the image be
 
 Explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
-`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them, and reports commit group owner files that no enabled feature claims as `group_owner_unclaimed` warnings.
+`chunkdb_verify --data-dir <path>` checks a catalog or standalone store without repairing it, including its manifest, claimed INACTIVE owner root, bookkeeping and chunk artifacts.
+It checks the owner scopes of a `commit_groups` catalog and its tables before replaying chunks.
 Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target.
 
 Findings carry stable codes and relative paths.

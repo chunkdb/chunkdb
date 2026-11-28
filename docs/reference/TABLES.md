@@ -278,7 +278,7 @@ A `frozen` table is fenced and has a slot that is not lost: its store failed clo
 Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
-New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
+New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, `chunk_model`, and `commit_groups`.
 A directory keeps its recorded bits; only ENABLE FEATURE adds one, and it refuses any other feature while the directory lacks `feature_activation`.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.
