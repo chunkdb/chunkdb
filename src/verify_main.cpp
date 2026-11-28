@@ -1,5 +1,5 @@
 // chunkdb_verify: offline, read-only integrity verification for a chunkdb
-// data directory.
+// data directory or standalone store.
 //
 // Output is machine-usable: one finding per line in the form
 //   VERIFY <level> <code> <path> [detail...]
@@ -29,7 +29,7 @@ namespace {
 void PrintUsage() {
     std::cout
         << "Usage: chunkdb_verify --data-dir <path> [--features] [options]\n"
-        << "  --data-dir <path>          data directory to verify (required)\n"
+        << "  --data-dir <path>          catalog or standalone store to verify (required)\n"
         << "  --features                 include feature registry and manifest masks\n"
         << "Every table is checked with the geometry recorded in its manifest.\n"
         << "Verification is read-only; it never modifies the data directory.\n";

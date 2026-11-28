@@ -681,6 +681,16 @@ void TestUndecidedCreationTemporaryRefused() {
     (void)ExpectRefused([&] { chunkdb::ChunkStore store(ReadOnly(Config(dir.path(), geometry))); });
     assert(owned() == before);
     assert(!chunkdb::ReadStoreManifest(dir.path()));
+
+    ScopedTempDir catalog_dir("chunkdb-catalog-manifest-interrupted");
+    const auto catalog_temp = catalog_dir.path() / "chunkdb.manifest.tmp.2147483000.1.2.3";
+    WriteBytes(catalog_temp, {1U, 2U, 3U});
+    chunkdb::CatalogConfig catalog_config;
+    catalog_config.data_dir = catalog_dir.path();
+    const auto catalog_error = ExpectRefused([&] { chunkdb::TableCatalog catalog(catalog_config); });
+    assert(Contains(catalog_error, "creation temporary has no checked decision"));
+    assert(ReadBytes(catalog_temp) == (std::vector<std::uint8_t>{1U, 2U, 3U}));
+    assert(!chunkdb::ReadDataDirManifest(catalog_dir.path()));
 }
 
 // A store at a volume root shares it with `lost+found`, which ext4 creates
@@ -903,6 +913,42 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
     assert(Contains(output, " errors=0"));
 }
 
+void TestVerifyStandaloneOwner(const std::string& verify) {
+    ScopedTempDir dir("chunkdb-manifest-verify-standalone");
+    const auto data_dir = dir.path() / "store";
+    auto config = Config(data_dir);
+    config.background_maintenance = false;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "1010101010101010");
+        store.CheckpointForTests(0, 0);
+    }
+    const auto log = dir.path() / "verify.log";
+    const auto args = "--data-dir \"" + data_dir.string() + "\" --features";
+    std::string output;
+    assert(Run(verify, args, log, &output) == 0);
+    assert(Contains(output, "commit_groups") && Contains(output, " errors=0"));
+
+    const auto index_path = data_dir / "chunkdb.index";
+    auto index = ReadBytes(index_path);
+    index.front() ^= 1U;
+    WriteBytes(index_path, index);
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "coordinate_index_invalid"));
+
+    const auto owner_path = data_dir / "chunkdb.groups.owner";
+    assert(std::filesystem::remove(owner_path));
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "VERIFY error group_owner_missing") && !Contains(output, "coordinate_index_invalid"));
+    chunkdb::CommitOwnerRoot owner;
+    owner.scope = *chunkdb::ReadStoreManifest(data_dir)->commit_owner;
+    owner.generation = 2U;
+    const auto bytes = chunkdb::SerializeCommitOwnerRoot(owner);
+    WriteBytes(owner_path, {bytes.begin(), bytes.end()});
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "VERIFY error group_owner_invalid") && !Contains(output, "coordinate_index_invalid"));
+}
+
 }  // namespace
 
 // A table with columns: verify sizes its chunks from the recorded schema.
@@ -1099,6 +1145,7 @@ int main(int argc, char** argv) {
     TestServerUsesStoredTableGeometry(argv[1]);
     TestUnknownFeatureFlags(argv[1], argv[2]);
     TestVerifyUsesManifestGeometry(argv[2]);
+    TestVerifyStandaloneOwner(argv[2]);
     TestVerifyTypedTable(argv[2]);
     return 0;
 }

@@ -146,7 +146,8 @@ struct BackupTableCopy {
 using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::uint64_t copied_bytes,
     std::uint64_t total_files, std::uint64_t total_bytes)>;
 // Copies table `table` of the completed backup `backup` into the existing
-// empty `directory`. The backup's table directory must hold exactly its
+// empty `directory`. The source manifest and any claimed INACTIVE owner
+// must match the inventory. The table directory must hold exactly its
 // inventory files, all regular; every copied length and CRC must match the
 // inventory, and the copy must pass the inventory check of its cut. Calls
 // `progress` before the first file and after each copied file. Throws

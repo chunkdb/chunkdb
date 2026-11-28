@@ -183,6 +183,11 @@ void PendingCreationKeepsIdentity() {
     const auto raw = SerializeStoreManifest(manifest);
     Save(temporary.path() / kCommitOwnerBootstrapName,
         SerializeCommitOwnerBootstrapDecision({CommitOwnerBootstrapKind::kStandalone, raw}));
+    std::ostringstream findings;
+    const auto verified = VerifyDataDirectory(temporary.path(), findings);
+    assert(verified.errors == 0U && verified.warnings == 1U);
+    assert(findings.str().find("owner_bootstrap_pending") != std::string::npos);
+    assert(!std::filesystem::exists(StoreManifestPath(temporary.path())));
     StoreConfig config; config.data_dir = temporary.path(); config.background_maintenance = false;
     config.geometry_fields = 0U;
     config.access_mode = AccessMode::kReadOnly;
@@ -225,8 +230,14 @@ void HistoricalActivationRecoversWithoutOwner() {
     assert(LoadFile(StoreManifestPath(temporary.path() / "tables/alpha")) == before);
     std::ostringstream output;
     assert(VerifyDataDirectory(temporary.path(), output).errors == 0U);
+#ifndef _WIN32
+    std::filesystem::create_directory_symlink("alpha", temporary.path() / "tables/alias");
+#endif
     config.access_mode = AccessMode::kReadWrite;
-    { TableCatalog recovered(config); }
+    {
+        TableCatalog recovered(config);
+        assert(recovered.TableCount() == 1U && recovered.Find("alpha") && !recovered.Find("alias"));
+    }
     assert(!ReadFeatureActivationJournal(temporary.path()));
     assert(!ReadDataDirManifest(temporary.path())->commit_owner);
     assert(!ReadStoreManifest(temporary.path() / "tables/alpha")->commit_owner);
@@ -320,6 +331,7 @@ void OwnerAdmissionPrecedesChunkReads() {
     {
         TableCatalog catalog(config);
         auto table = catalog.Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        (void)catalog.Create("beta", {1U, 1U, 2U, 2U, 8U}, config.default_options);
         auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "10000000");
         lease->store().CheckpointForTests(0, 0);
     }
@@ -359,6 +371,64 @@ void OwnerAdmissionPrecedesChunkReads() {
         assert(reads.images == 0U);
         Save(temporary.path() / "chunkdb.groups.owner", source);
     }
+    const auto check_table_damage = [&](std::string_view code) {
+        reads.images = 0U; findings.str(""); findings.clear();
+        assert(VerifyDataDirectory(temporary.path(), findings).errors > 0U);
+        assert(findings.str().find(code) != std::string::npos && reads.images == 0U);
+    };
+    const auto beta = temporary.path() / "tables/beta";
+    const auto manifest_path = StoreManifestPath(beta);
+    const auto table_manifest = LoadFile(manifest_path);
+    assert(std::filesystem::remove(manifest_path));
+    check_table_damage("manifest_missing");
+    auto damaged = table_manifest;
+    damaged.back() ^= 1U;
+    Save(manifest_path, damaged);
+    check_table_damage("manifest_invalid");
+    Save(manifest_path, table_manifest);
+#ifndef _WIN32
+    std::filesystem::rename(beta, temporary.path() / "moved-beta");
+    std::filesystem::create_directory_symlink("../moved-beta", beta);
+    check_table_damage("redirected managed table directory");
+#endif
+}
+
+void BackupOwnerAdmissionPrecedesChunkReads() {
+    test::ScopedTempDir temporary("chunkdb-owner-verify-backup-reads");
+    const auto backup = temporary.path() / "backup";
+    CatalogConfig config; config.data_dir = temporary.path() / "source"; config.background_maintenance = false;
+    {
+        TableCatalog catalog(config);
+        auto alpha = catalog.Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        (void)catalog.Create("beta", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        {
+            auto lease = alpha->Acquire();
+            lease->store().SetBlockBits(0, 0, "10000000");
+            lease->store().CheckpointForTests(0, 0);
+        }
+        (void)catalog.BackupTo(backup, {});
+    }
+    const auto record = ReadBackupRecord(backup);
+    const auto image = std::find_if(record.files.begin(), record.files.end(),
+        [](const auto& file) { return file.relative_path.extension() == ".chk"; });
+    assert(image != record.files.end());
+    auto bytes = LoadFile(backup / image->relative_path);
+    bytes.front() ^= 1U;
+    Save(backup / image->relative_path, bytes);
+    const auto beta = backup / "tables/beta";
+    auto manifest = *ReadStoreManifest(beta);
+    const auto original = SerializeStoreManifest(manifest);
+    auto& id = manifest.commit_owner->owner_id;
+    id = id == StoreId{1U} ? StoreId{2U} : StoreId{1U};
+    Save(StoreManifestPath(beta), SerializeStoreManifest(manifest));
+
+    std::ostringstream findings;
+    assert(VerifyDataDirectory(backup, findings).errors == 1U);
+    assert(findings.str().find("backup table owner scope mismatch: beta") != std::string::npos);
+    Save(StoreManifestPath(beta), original);
+    findings.str(""); findings.clear();
+    assert(VerifyDataDirectory(backup, findings).errors == 1U);
+    assert(findings.str().find("backup inventory checksum or length mismatch") != std::string::npos);
 }
 
 // A new table directory under a catalog's tables/ never bootstraps a
@@ -797,7 +867,8 @@ int main(int argc, char** argv) {
     HistoricalActivationRecoversWithoutOwner(); SparseDecisionAdmission();
     ReusedOwnerMustBeDurableBeforeManifest();
     WrongPendingRootRefusesBeforeInventory();
-    OwnerAdmissionPrecedesChunkReads(); DirectOpenUnderCatalogRefuses(); UnclaimedOwnersRefuseEverySurface();
+    OwnerAdmissionPrecedesChunkReads(); BackupOwnerAdmissionPrecedesChunkReads();
+    DirectOpenUnderCatalogRefuses(); UnclaimedOwnersRefuseEverySurface();
     CreationCrashBoundaries(argv[0]);
     TemporaryCreationRecovery(argv[0]);
     InactiveBackupRestore(argv[0]); BackupRefusesChangedOwner();

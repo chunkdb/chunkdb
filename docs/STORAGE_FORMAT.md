@@ -117,7 +117,8 @@ Missing floor is zero; new clocks start at least at 1, and duplicate floor entri
 Type 2 is the 40-byte commit-owner scope and is present exactly when `commit_groups` is set.
 It contains nonzero directory and owner identities (16 bytes each), role `u8` and seven zero bytes; catalog role is 2 and its directory identity equals `data_dir_id`.
 
-A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files.
+A writer starts fresh catalog creation only when its lock is the sole chunkdb-owned entry.
+A checked creation decision permits recovery of its matching manifest temporary files.
 Foreign entries such as `lost+found` are preserved.
 Read-only opening never initializes the directory.
 
@@ -671,7 +672,8 @@ Empty-chunk collection records the empty state when needed, removes the image be
 
 Explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
-`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them, and reports commit group owner files that no enabled feature claims as `group_owner_unclaimed` warnings.
+`chunkdb_verify --data-dir <path>` checks a catalog or standalone store without repairing it, including its manifest, claimed INACTIVE owner root, bookkeeping and chunk artifacts.
+It checks the owner scopes of a `commit_groups` catalog and its tables before replaying chunks.
 Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target.
 
 Findings carry stable codes and relative paths.

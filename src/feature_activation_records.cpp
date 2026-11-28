@@ -98,10 +98,11 @@ struct Participants {
 
 Participants ValidateParticipants(const std::filesystem::path& root, const FeatureActivationJournal& journal, bool require_activation = true) {
     ValidateStructure(journal);
-    CommitOwnerBootstrap::ValidateManagedDirectories(root);
     const auto directory = ReadDataDirManifest(root);
     if (!directory || directory->data_dir_id != journal.data_dir_id) Bad("data-directory identity changed");
     RequireOpenableFeatures(directory->features, AccessMode::kReadWrite);
+    if (directory->commit_owner || journal.feature == kFeatureCommitGroups)
+        CommitOwnerBootstrap::ValidateManagedDirectories(root);
     if (journal.feature == kFeatureCommitGroups && directory->commit_owner && directory->commit_owner != journal.commit_owner)
         Bad("directory owner differs from activation decision");
     const auto owner_scope = directory->commit_owner ? directory->commit_owner : journal.commit_owner;

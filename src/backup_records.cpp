@@ -578,16 +578,22 @@ class SharedInput {
     std::ifstream input_;
 #endif
 };
-// Checks one table directory of a backup, or a copy of one, against its cut.
-// `files` are the table's inventory files, relative to `dir`.
-StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cut,
-    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled,
+StoreManifest ReadBackupTableManifest(const std::filesystem::path& dir, const BackupTableCut& cut,
     const std::optional<CommitOwnerScope>& owner) {
-    const auto manifest = ReadStoreManifest(dir);
+    auto manifest = ReadStoreManifest(dir);
     if (!manifest || manifest->store_id != cut.epoch) throw std::runtime_error("backup table epoch mismatch: " + cut.name);
     if (manifest->commit_owner != owner) throw std::runtime_error("backup table owner scope mismatch: " + cut.name);
     RequireOpenableFeatures(manifest->features, AccessMode::kReadOnly);
-    Geometry geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
+    return std::move(*manifest);
+}
+
+// Checks one table directory of a backup, or a copy of one, against its cut.
+// `files` are the table's inventory files, relative to `dir`.
+void ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled,
+    const std::optional<CommitOwnerScope>& owner) {
+    const auto manifest = ReadBackupTableManifest(dir, cut, owner);
+    Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
     std::uint64_t ceiling = 0U, generation = 0U;
     if (!TryParseVersionClockRecord(LoadFile(dir / "chunkdb.version"), &ceiling) || ceiling <= cut.revision)
         throw std::runtime_error("backup clock is not above its cut");
@@ -595,9 +601,9 @@ StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut&
         throw std::runtime_error("backup snapshot generation is not stable");
     if (!IsValidInitializedStoreMarker(LoadFile(dir / ".chunkdb.initialized"))) throw std::runtime_error("invalid backup initialized marker");
     if (auto slots = ReadFeedSlotRecords(dir, cut.epoch, geometry.dims())) {
-        if ((manifest->features.incompat & kFeatureFeedSlots) == 0U || slots->durable_watermark > cut.revision)
+        if ((manifest.features.incompat & kFeatureFeedSlots) == 0U || slots->durable_watermark > cut.revision)
             throw std::runtime_error("backup slot frontier exceeds cut or has no feature");
-        if (slots->filter_format && (manifest->features.incompat & kFeatureSlotFilters) == 0U)
+        if (slots->filter_format && (manifest.features.incompat & kFeatureSlotFilters) == 0U)
             throw std::runtime_error("backup slot filters have no storage feature");
         for (const auto& slot : slots->slots) if (slot.written > cut.revision) throw std::runtime_error("backup slot exceeds cut");
     }
@@ -626,8 +632,8 @@ StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut&
         if (!ParseChunkFilePath(local, geometry, &coord)) throw std::runtime_error("noncanonical backup chunk path");
         const auto full = dir / local;
         if (local.extension() == ".chk") {
-            auto image = ParseChunkImage(LoadChunkImageFile(full, geometry, coord, cut.epoch, manifest->features),
-                geometry, coord, cut.epoch, manifest->features);
+            auto image = ParseChunkImage(LoadChunkImageFile(full, geometry, coord, cut.epoch, manifest.features),
+                geometry, coord, cut.epoch, manifest.features);
             if (image.revision > cut.revision) throw std::runtime_error("backup image exceeds cut");
             const auto boundary = retained.EmptyBoundary(coord);
             if (boundary)
@@ -639,8 +645,8 @@ StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut&
             std::shared_ptr<const ChunkColumnState> chunk_columns;
             const auto image_path = full.parent_path() / (stem + ".chk");
             if (Present(image_path)) {
-                auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, cut.epoch, manifest->features),
-                    geometry, coord, cut.epoch, manifest->features);
+                auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, cut.epoch, manifest.features),
+                    geometry, coord, cut.epoch, manifest.features);
                 base = image.revision; schema = image.schema_version; time = image.commit_time_ms;
                 payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
                 chunk_columns = std::move(image.chunk_columns);
@@ -650,7 +656,7 @@ StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut&
                 (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
                     payload, presence, vars, chunk_columns);
             std::vector<WalFrameBoundary> boundaries;
-            auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema,
+            auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest.features, base, schema,
                 &payload, &presence, &vars, &boundaries, &chunk_columns, time,
                 boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
             if ((!replay.replayable && !replay.torn_creation) ||
@@ -658,7 +664,6 @@ StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut&
                 (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");
         } else throw std::runtime_error("unknown backup chunk artifact: " + relative);
     }
-    return manifest->store_id;
 }
 void ValidateInventory(const std::filesystem::path& root, const BackupRecord& record, bool completing, const BackupCancel& cancelled = {}) {
     ValidateRecord(record);
@@ -673,9 +678,6 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         expected_files.insert(relative);
         auto parent = file.relative_path.parent_path();
         while (!parent.empty()) { expected_dirs.insert(parent.generic_string()); parent = parent.parent_path(); }
-        const auto actual = InspectBackupFile(root, file.relative_path, cancelled);
-        if (actual.size != file.size || actual.crc32 != file.crc32)
-            throw std::runtime_error("backup inventory checksum or length mismatch: " + relative);
     }
     backup_detail::WalkDirectory(root, [&](const auto& entry) {
 #ifdef _WIN32
@@ -695,17 +697,28 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         } else throw std::runtime_error("unsafe backup entry: " + relative);
     });
     if (!expected_files.empty() || !expected_dirs.empty()) throw std::runtime_error("backup inventory entry is missing");
-    if (!ReadDataDirManifest(root)) throw std::runtime_error("backup data-directory manifest is missing");
-    const auto directory_manifest = *ReadDataDirManifest(root);
-    RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadOnly);
-    if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
-    (void)ReadMigrationRecords(root);
+    const auto directory_manifest = ReadDataDirManifest(root);
+    if (!directory_manifest) throw std::runtime_error("backup data-directory manifest is missing");
+    RequireOpenableFeatures(directory_manifest->features, AccessMode::kReadOnly);
     std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
-    if (directory_manifest.commit_owner) {
-        (void)CommitOwnerBootstrap::ReadInactiveRoot(root, *directory_manifest.commit_owner);
+    if (directory_manifest->commit_owner) {
+        (void)CommitOwnerBootstrap::ReadInactiveRoot(root, *directory_manifest->commit_owner);
         allowed.insert("chunkdb.groups.owner");
     } else if (Present(root / "chunkdb.groups.owner")) throw std::runtime_error("unclaimed canonical commit owner exists");
     std::set<StoreId> epochs;
+    // Admit all table scopes before reading any chunk, including for checksums.
+    for (const auto& cut : record.tables) {
+        Cancelled(cancelled);
+        const auto manifest = ReadBackupTableManifest(root / "tables" / cut.name, cut, directory_manifest->commit_owner);
+        if (!epochs.insert(manifest.store_id).second) throw std::runtime_error("backup contains duplicate table epochs");
+    }
+    for (const auto& file : record.files) {
+        const auto actual = InspectBackupFile(root, file.relative_path, cancelled);
+        if (actual.size != file.size || actual.crc32 != file.crc32)
+            throw std::runtime_error("backup inventory checksum or length mismatch: " + file.relative_path.generic_string());
+    }
+    if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
+    (void)ReadMigrationRecords(root);
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);
         const auto prefix = std::filesystem::path("tables") / cut.name;
@@ -717,8 +730,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
             files.push_back(file.relative_path.lexically_relative(prefix));
             allowed.insert(relative);
         }
-        const auto epoch = ValidateTableCut(root / prefix, cut, files, cancelled, directory_manifest.commit_owner);
-        if (!epochs.insert(epoch).second) throw std::runtime_error("backup contains duplicate table epochs");
+        ValidateTableCut(root / prefix, cut, files, cancelled, directory_manifest->commit_owner);
     }
     for (const auto& file : record.files)
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
@@ -1128,6 +1140,30 @@ BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string
     const auto found = std::find_if(record.tables.begin(), record.tables.end(),
         [&](const BackupTableCut& cut) { return cut.name == table; });
     if (found == record.tables.end()) throw std::invalid_argument("the backup has no table '" + std::string(table) + "'");
+    const auto inventory_file = [&](std::string_view name) {
+        return std::find_if(record.files.begin(), record.files.end(),
+            [&](const BackupFileRecord& file) { return file.relative_path == name; });
+    };
+    const auto manifest_file = inventory_file(kDataDirManifestFileName);
+    if (manifest_file == record.files.end()) throw std::runtime_error("backup inventory is missing the data-directory manifest");
+    SafeDescendants(backup, manifest_file->relative_path);
+    const auto manifest_path = backup / manifest_file->relative_path;
+    if (manifest_file->size > kDataDirManifestMaxSize || std::filesystem::file_size(manifest_path) != manifest_file->size)
+        throw std::runtime_error("backup inventory length mismatch: chunkdb.manifest");
+    const auto manifest_bytes = ReadBackupFile(manifest_path, manifest_file->size, cancelled);
+    if (Crc32(manifest_bytes) != manifest_file->crc32)
+        throw std::runtime_error("backup inventory checksum mismatch: chunkdb.manifest");
+    const auto source = ParseDataDirManifest(manifest_bytes);
+    RequireOpenableFeatures(source.features, AccessMode::kReadOnly);
+    const auto owner_file = inventory_file("chunkdb.groups.owner");
+    if (source.commit_owner) {
+        if (owner_file == record.files.end()) throw std::runtime_error("backup inventory is missing the canonical commit owner");
+        const auto owner = CommitOwnerBootstrap::ReadInactiveRoot(backup, *source.commit_owner);
+        if (owner.size() != owner_file->size || Crc32(owner) != owner_file->crc32)
+            throw std::runtime_error("backup inventory checksum or length mismatch: chunkdb.groups.owner");
+    } else if (owner_file != record.files.end() || Present(backup / "chunkdb.groups.owner")) {
+        throw std::runtime_error("unclaimed canonical commit owner exists");
+    }
     BackupTableCopy copy;
     copy.cut = *found;
     const auto prefix = std::filesystem::path("tables") / copy.cut.name;
@@ -1186,9 +1222,7 @@ BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string
         if (progress) progress(copied_files, copy.bytes, expected.size(), total);
     }
     // The copied manifest still names the backed-up directory's owner scope.
-    const auto source = ReadDataDirManifest(backup);
-    if (!source) throw std::runtime_error("backup data-directory manifest is missing");
-    (void)ValidateTableCut(directory, copy.cut, copy.files, cancelled, source->commit_owner);
+    ValidateTableCut(directory, copy.cut, copy.files, cancelled, source.commit_owner);
     return copy;
 }
 void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, true); }

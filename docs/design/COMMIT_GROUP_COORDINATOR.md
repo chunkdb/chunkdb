@@ -43,10 +43,11 @@ Journal records are admitted only as records: member frames, rollback bases and 
 
 ## Verification
 
-`chunkdb_verify` checks the canonical INACTIVE root of a data directory or standalone store whose manifest claims `commit_groups` through the bootstrap admission.
+`chunkdb_verify --data-dir <path>` checks the canonical INACTIVE root of a catalog or standalone store whose manifest claims `commit_groups` before checking chunk artifacts.
 It reports `chunkdb.groups.objects` and `chunkdb.groups.journal`, and any owner name in a catalog table, as the warning `group_owner_unclaimed`, because no INACTIVE owner selects them.
 The internal `VerifyCommitGroupOwner` checks an owner for a supplied scope without changing files; nothing reaches it from the command line until an ACTIVE owner can exist.
-A missing root is the error `group_owner_missing`, and an unreadable, foreign or non-generation-one INACTIVE root is the error `group_owner_invalid`.
+A missing or invalid catalog root is the error `data_dir_manifest_invalid`.
+A standalone store reports `group_owner_missing` for a missing root and `group_owner_invalid` for an unreadable, foreign or non-generation-one INACTIVE root.
 An INACTIVE root gets no further checks, because staged objects and journal generations under it are not admitted.
 A PENDING root is the warning `group_owner_pending`.
 For an ACTIVE root, any refusal of the selection is the error `group_journal_invalid` at the journal leaf once the inventory names it, else at the object directory.

@@ -15,9 +15,8 @@ struct VerifyCounters {
     std::uint64_t errors = 0;
 };
 
-// Checks a data directory offline without changing it: its manifest, the
-// leftovers of interrupted table operations, and every table with the
-// geometry its manifest records. Writes one finding per line to `out`:
+// Checks a catalog or standalone store offline without changing it, using
+// the geometry each table manifest records. Writes one finding per line to `out`:
 //   VERIFY <level> <code> <path> [detail]
 // Paths and details are C-style quoted, escaped tokens. Throws when the
 // directory cannot be inspected at all.
@@ -34,8 +33,7 @@ struct VerifyCounters {
     std::ostream& out);
 
 // Checks the commit group owner of a directory for an admitted scope without
-// changing it. Not called by VerifyDataDirectory: no manifest can claim commit
-// groups in this build, so the CLI reports owner files as group_owner_unclaimed.
+// changing it. VerifyDataDirectory only admits the initial INACTIVE root.
 // Journal records are checked as records only; member frames are not checked.
 // Throws when the directory itself cannot be opened.
 [[nodiscard]] VerifyCounters VerifyCommitGroupOwner(
