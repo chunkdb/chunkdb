@@ -674,6 +674,7 @@ ChunkStore::~ChunkStore() {
             unsynced_handover_->dirs = std::move(unsynced_dirs_);
             unsynced_handover_->swept_dirs = std::move(unsynced_swept_dirs_);
             unsynced_handover_->overflow = unsynced_overflow_;
+            unsynced_handover_->durability_failed_on_close = durability_poisoned_.load(std::memory_order_acquire);
         }
     }
     CloseSnapshotGeneration();

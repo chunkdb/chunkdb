@@ -224,7 +224,9 @@ std::shared_ptr<const Users> UserRegistry::Published() const {
 
 void UserRegistry::ConfirmPublication() {
     if (!publication_unknown_) return;
-    try { SyncDirectoryPath(data_dir_); }
+    // Republish the visible bytes from memory so the directory sync
+    // covers a fresh replacement.
+    try { WriteUsersFile(data_dir_, users_); }
     catch (const std::exception&) { std::rethrow_exception(publication_unknown_); }
     publication_unknown_ = nullptr;
 }

@@ -344,17 +344,20 @@ void TestCrashPointAfterRenameBeforeDirSync() {
         assert(store.GetBlockBits(0, 0) == "01010101");
         ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
         // Post-replace directory-sync failure is post-commit: the command
-        // succeeds and the retained WAL covers the image until retry.
+        // succeeds because the WAL already holds the write.
         store.SetBlockBits(0, 0, "10101010");
         assert(store.GetBlockBits(0, 0) == "10101010");
+        try {
+            store.WalBarrier();
+            assert(false);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()).find("fail-closed") != std::string::npos);
+        }
     }
 
     {
         chunkdb::ChunkStore recovered(config);
-        const std::string bits = recovered.GetBlockBits(0, 0);
-        // Replace boundary fault must never leave a torn final state.
-        // The persisted value must be old-or-new only.
-        assert(bits == "01010101" || bits == "10101010");
+        assert(recovered.GetBlockBits(0, 0) == "10101010");
     }
 
     RemoveAllWithRetry(data_dir);
@@ -678,8 +681,8 @@ void TestWalAfterFailedDirectoryPreparationSyncsParent() {
 
 // A WAL flush failure is a pre-commit failure: the command must error, the
 // in-memory value must roll back, the appended bytes must be neutralized so
-// the rejected value can never resurrect after restart, and the store must
-// keep serving.
+// the rejected value cannot resurrect after restart. The store keeps serving
+// reads and refuses writes until reopened.
 void TestRejectedWriteAfterWalSyncFailureDoesNotResurrect() {
     const auto data_dir = TempDataDir("wal-sync-fail-rollback");
     const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
@@ -698,19 +701,52 @@ void TestRejectedWriteAfterWalSyncFailureDoesNotResurrect() {
             }
         }
         assert(threw);
-        // Memory rolled back and the store still serves reads and writes.
         assert(store.GetBlockBits(0, 0) == "11110000");
-        store.SetBlockBits(1, 0, "10101010");
-        assert(store.GetBlockBits(1, 0) == "10101010");
+        try {
+            store.SetBlockBits(1, 0, "10101010");
+            assert(false);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()).find("fail-closed") != std::string::npos);
+        }
     }
 
     {
         chunkdb::ChunkStore recovered(config);
-        // The rejected value must not resurrect from the WAL.
         assert(recovered.GetBlockBits(0, 0) == "11110000");
-        assert(recovered.GetBlockBits(1, 0) == "10101010");
+        assert(!recovered.BlockExists(1, 0));
+        recovered.SetBlockBits(1, 0, "10101010");
     }
 
+    RemoveAllWithRetry(data_dir);
+}
+
+void TestVersionClockDirectorySyncFailureFencesStore() {
+    const auto data_dir = TempDataDir("clock-dir-sync-failure");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    {
+        chunkdb::ChunkStore store(config);
+        {
+            ScopedEnv fault("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
+            try {
+                store.SetBlockBits(0, 0, "11110000");
+                assert(false);
+            } catch (const std::runtime_error& error) {
+                assert(std::string(error.what()).find("injected directory sync failure") != std::string::npos);
+            }
+        }
+        assert(store.GetChunkVersion(0, 0) == 0U);
+        try {
+            store.SetBlockBits(0, 0, "11110000");
+            assert(false);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()).find("fail-closed") != std::string::npos);
+        }
+    }
+    {
+        chunkdb::ChunkStore recovered(config);
+        recovered.SetBlockBits(0, 0, "11110000");
+        assert(recovered.GetChunkVersion(0, 0) > 0U);
+    }
     RemoveAllWithRetry(data_dir);
 }
 
@@ -1199,6 +1235,7 @@ int main(int argc, char** argv) {
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
     TestRejectedWriteAfterWalSyncFailureDoesNotResurrect();
+    TestVersionClockDirectorySyncFailureFencesStore();
     TestRelaxedGroupCommitFlushFailureRollsBackOnlyRejectedWrite();
     TestOrdinaryWriteCheckpointFailureAfterImageReplaceIsCommitted();
     TestOrdinaryWriteGenerationPublishFailureIsCommitted();

@@ -502,6 +502,24 @@ void FrozenSlotFrontier() {
     Reply(Metric(e, "chunkdb_table_fenced{table=\"realm\"}"), "0");
 }
 
+void RetriedFlushWalRequiresRecovery() {
+    test::ScopedTempDir dir("chunkdb-recover-flush-wal");
+    Engine e(dir.path(), true);
+    Reply(e.Run("CREATE TABLE other (v u16) CHUNK 2 x 2 WITH durability_mode = 'relaxed'"), "+OK\r\n");
+    assert(e.Run("SET BLOCK 0 0 IN other v=5").front() == ':');
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE", "1");
+        Error(e.Run("FLUSH WAL"), "INTERNAL");
+    }
+    Error(e.Run("FLUSH WAL"), "INTERNAL");
+    assert(e.catalog->Fence("other"));
+    assert(e.Run("GET BLOCK 0 0 FROM other").find(":5\r\n") != std::string::npos);
+    Error(e.Run("SET BLOCK 0 0 IN other v=9"), "INTERNAL");
+    Reply(e.Run("RECOVER TABLE other"), "+OK\r\n");
+    assert(e.Run("SET BLOCK 0 0 IN other v=9").front() == ':');
+    Reply(e.Run("FLUSH WAL"), "+OK\r\n");
+}
+
 void FailedRecoveryStaysFenced() {
     test::ScopedTempDir dir("chunkdb-recover-table-failure");
     Engine e(dir.path(), true);
@@ -603,6 +621,7 @@ int main(int argc, char** argv) {
     for (const auto& [name, run] : std::initializer_list<std::pair<const char*, void (*)()>>{
              {"excludes commands", ExcludesCommands}, {"concurrent recovery", ConcurrentRecovery},
              {"option mismatch", OptionMismatchKeepsStore}, {"backup during recovery", BackupDuringRecovery},
+             {"retried FLUSH WAL", RetriedFlushWalRequiresRecovery},
              {"watches end", WatchesEnd}, {"leftover filter", LeftoverFilter},
              {"applied migration", AppliedMigrationWhileFenced}, {"frozen slot frontier", FrozenSlotFrontier},
              {"failed recovery", FailedRecoveryStaysFenced},

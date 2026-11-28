@@ -20,6 +20,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
+#include "durability_io.hpp"
 #include "wal_stream_pool.hpp"
 #include "feed_slots.hpp"
 #include "feed_prefix.hpp"
@@ -502,6 +503,7 @@ void ChunkStore::FlushWalBatch(
     if (chunk->wal_batch.empty()) {
         return;
     }
+    ThrowIfDurabilityPoisoned();
     if (chunk->checkpoint_io) {
         throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
@@ -520,6 +522,7 @@ void ChunkStore::FlushWalBatch(
     bool first_create = false;
     bool stream_artifact_touched = false;
     bool batch_write_started = false;
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     try {
         EnsureWalAppendStream(
             chunk_coord,
@@ -556,6 +559,9 @@ void ChunkStore::FlushWalBatch(
         }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) ExitAbruptly(86);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
+            // In relaxed mode this hook simulates an append failure: there
+            // is no file sync to fail.
+            if (force_sync) ScopedDurabilitySync::Fail();
             throw std::runtime_error(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());
         }
@@ -569,6 +575,7 @@ void ChunkStore::FlushWalBatch(
             SyncFilePath(chunk->wal_path);
             if (first_create) {
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
+                    ScopedDurabilitySync::Fail();
                     throw std::runtime_error(
                         "injected WAL sync failure after file sync before directory sync: " + chunk->wal_path.string());
                 }
@@ -595,6 +602,11 @@ void ChunkStore::FlushWalBatch(
         // and no later retry can observe records that were never
         // acknowledged. The batch itself is retained for the caller.
         try {
+            // Undo the append even if its sync fenced the store. This sync
+            // only persists the removal of the rejected tail. It neither
+            // clears the fence nor credits any earlier bytes as durable.
+            const ScopedDurabilitySync rollback_sync(
+                durability_poisoned_.load(std::memory_order_acquire) ? nullptr : &durability_poisoned_);
             TruncateWalTail(chunk_coord, chunk, pre_flush_size, force_sync);
             snapshot_write.Finish();
         } catch (const std::exception& repair_error) {
@@ -687,11 +699,11 @@ ChunkStore::UnsyncedArtifacts ChunkStore::ForgetUnsynced(
     return forgotten;
 }
 
-void ChunkStore::FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool synced) {
+void ChunkStore::FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool restore) {
     std::lock_guard lock(unsynced_mutex_);
     // Tracked again before they leave the in-flight set, so a failure (out
     // of memory) leaves them covered by every drain.
-    if (!synced) {
+    if (restore) {
         InsertUnsyncedLocked(forgotten);
     }
     for (const auto& file : forgotten.files) {
@@ -710,6 +722,8 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     bool own_stream) {
+    ThrowIfDurabilityPoisoned();
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     // A boundary starts a commit that syncs what it writes: a transaction,
     // durable in every mode, or a conditional write, whose rollback relies
     // on the synced WAL. From here on a checkpoint must not replace a WAL
@@ -759,6 +773,7 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     try {
         PauseWalBoundarySyncForTests();
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BOUNDARY_SYNC_FAIL_ONCE")) {
+            ScopedDurabilitySync::Fail();
             throw std::runtime_error("injected rollback boundary sync failure: " + wal_path.string());
         }
         const auto exists = [](const std::filesystem::path& path) {
@@ -780,16 +795,18 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
             SyncDirectoryPath(directory);
         }
         SyncDirectoryPath(data_dir_);
-    } catch (...) {
+        ThrowIfDurabilityPoisoned();
+    } catch (const std::exception&) {
         try {
-            FinishForgottenUnsynced(forgotten, /*synced=*/false);
+            // A failed store keeps no work for a later durability retry.
+            FinishForgottenUnsynced(forgotten, !durability_poisoned_.load(std::memory_order_acquire));
         } catch (const std::bad_alloc&) {
             // The entries stay in flight, where every drain still includes
             // them; the sync failure is the error to report.
         }
         throw;
     }
-    FinishForgottenUnsynced(forgotten, /*synced=*/true);
+    FinishForgottenUnsynced(forgotten, /*restore=*/false);
     chunk->wal_boundary_durable = true;
 }
 
@@ -800,6 +817,7 @@ void ChunkStore::FlushWalBatchForEviction(
     if (chunk->wal_batch.empty()) {
         return;
     }
+    ThrowIfDurabilityPoisoned();
     if (chunk->checkpoint_io) {
         throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
@@ -820,6 +838,7 @@ void ChunkStore::FlushWalBatchForEviction(
             prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
         SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
         bool file_write_started = false;
+        const ScopedDurabilitySync sync_scope(&durability_poisoned_);
         try {
             const auto wal_parent_path = chunk->wal_path.parent_path();
             EnsureWalParentDirectoryCached(
@@ -875,6 +894,7 @@ void ChunkStore::FlushWalBatchForEviction(
                 SyncFilePath(chunk->wal_path);
                 if (needs_header) {
                     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
+                        ScopedDurabilitySync::Fail();
                         throw std::runtime_error(
                             "injected WAL sync failure after file sync before directory sync: " +
                             chunk->wal_path.string());
@@ -895,6 +915,8 @@ void ChunkStore::FlushWalBatchForEviction(
             // Same torn-append repair as FlushWalBatch: the retained batch
             // must never be re-appended behind partial bytes.
             try {
+                const ScopedDurabilitySync rollback_sync(
+                    durability_poisoned_.load(std::memory_order_acquire) ? nullptr : &durability_poisoned_);
                 TruncateWalTail(chunk_coord, chunk, pre_flush_size, force_sync);
                 snapshot_write.Finish();
             } catch (const std::exception& repair_error) {
@@ -964,6 +986,7 @@ void ChunkStore::FlushWalBatchesForReopen() {
 }
 
 void ChunkStore::FlushAllPendingWalBatches() noexcept {
+    if (durability_poisoned_.load(std::memory_order_acquire)) return;
     std::vector<std::shared_ptr<LargeChunk>> large_chunks;
     {
         std::lock_guard lock(large_chunks_mutex_);

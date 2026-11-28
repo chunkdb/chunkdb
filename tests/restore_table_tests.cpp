@@ -357,6 +357,8 @@ void SwapRefusals() {
         Throws([&] { catalog.SwapTables("t", "t_restored"); });
     }
     assert(catalog.Fence("t") && catalog.Fence("t_restored") && catalog.TableCount() == 0U);
+    Throws<TableFencedError>([&] { catalog.WalBarrier(); });
+    Throws<TableFencedError>([&] { catalog.SwapTables("t", "t_restored"); });
     catalog.RecoverTable("t");
     catalog.RecoverTable("t_restored");
     swapped.Check(true);
@@ -400,6 +402,20 @@ void SwapMarksSlots() {
     catalog.SwapTables("t", "t_restored");
     swapped.Check(true);
     assert(Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
+}
+
+void SwapSlotSyncFailureFencesParticipant() {
+    Swapped swapped{Source()};
+    auto& catalog = swapped.catalog;
+    {
+        // Fails publication of the source slot's resync mark, before any exchange.
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("before directory sync") != std::string::npos);
+    }
+    assert(catalog.Fence("t") && !catalog.Fence("t_restored"));
+    Throws<TableFencedError>([&] { catalog.SwapTables("t", "t_restored"); });
+    catalog.RecoverTable("t");
+    swapped.Check(false);
 }
 
 // The marks are durable: a restart keeps them.
@@ -598,6 +614,8 @@ void RenameRefusals() {
         Throws([&] { catalog.RenameTable("t", "t_new", nullptr); });
     }
     assert(catalog.Fence("t_new") && catalog.Fence("t") && catalog.Find("t") == nullptr && catalog.Find("t_new") == nullptr);
+    Throws<TableFencedError>([&] { catalog.WalBarrier(); });
+    Throws<TableFencedError>([&] { catalog.RenameTable("t", "t_new", nullptr); });
     Throws<TableFencedError>([&] { (void)catalog.Create("t", geometry, catalog.default_options()); });
     catalog.RecoverTable("t_new");
     CheckLive(source, catalog, "t_new");
@@ -659,6 +677,7 @@ int main() {
         FeedAfterSwap();
         SwapRefusals();
         SwapMarksSlots();
+        SwapSlotSyncFailureFencesParticipant();
         SwapMarksSurviveRestart();
     } else {
         SwapRefusedOnWindows();

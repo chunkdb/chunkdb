@@ -1083,8 +1083,12 @@ void TestParallelBarrierFailureStillFlushesOtherTables() {
             second->Acquire()->store().RuntimeStats().wal_barriers;
     };
     assert(barriers() == 1U);
+    assert(Contains(ErrorOf([&] { catalog.WalBarrier(); }), "fail-closed"));
+    assert(barriers() == 2U);
+    assert(catalog.Fence("alpha") && !catalog.Fence("beta"));
+    assert(ReadBits(catalog, "alpha", 0, 0) == "1111");
+    catalog.RecoverTable("alpha");
     catalog.WalBarrier();
-    assert(barriers() == 3U);
 }
 
 // Holds the single maintenance worker after the next turn it ends.
@@ -1237,6 +1241,24 @@ void TestSetOptionsRefusesFailClosedTable() {
     assert(catalog.Find("p") == nullptr);
 }
 
+void TestFailedDropCannotReopenAfterSyncError() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-fenced-drop");
+    TableCatalog catalog(Config(dir.path()));
+    TableOptions options;
+    options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    (void)catalog.Create("p", kDefaultGeometry, options);
+    WriteBits(catalog, "p", 0, 0, "0001");
+    SetFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    assert(!ErrorOf([&] { WriteBits(catalog, "p", 0, 0, "0010"); }).empty());
+    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    SetFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
+    assert(!ErrorOf([&] { catalog.Drop("p"); }).empty());
+    ClearFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
+    assert(catalog.Fence("p") && !catalog.Find("p"));
+    catalog.RecoverTable("p");
+    assert(ReadBits(catalog, "p", 0, 0) == "0001");
+}
+
 std::uint64_t ChunkVersion(TableCatalog& catalog, const std::string& table) {
     auto lease = catalog.Find(table)->Acquire();
     return lease->store().GetChunkVersion(0, 0);
@@ -1365,6 +1387,7 @@ int main(int argc, char** argv) {
     TestWalBarrierLeavesNoDroppedTableOnWorker();
     TestReopenKeepsAcknowledgedWrites();
     TestSetOptionsRefusesFailClosedTable();
+    TestFailedDropCannotReopenAfterSyncError();
     TestRecreatedTableNeverReusesVersionTokens();
     TestCrashBoundaries(argv[0]);
     std::cout << "table catalog tests passed\n";

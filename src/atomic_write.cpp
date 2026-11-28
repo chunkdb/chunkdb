@@ -157,6 +157,7 @@ void AtomicWriteImpl(
         *out_replaced = false;
     }
     const auto parent = path.parent_path();
+    if (fsync_directory) ScopedDurabilitySync::Check();
     EnsureDirectoryPathExists(parent, fsync_directory);
 
     const std::filesystem::path tmp_path = BuildAtomicTmpPath(path);
@@ -174,13 +175,13 @@ void AtomicWriteImpl(
     }
 
     std::error_code rename_ec;
-    if (before_replace) {
-        try { before_replace(); }
-        catch (const std::exception&) {
-            std::error_code cleanup_ec;
-            std::filesystem::remove(tmp_path, cleanup_ec);
-            throw;
-        }
+    try {
+        if (fsync_directory) ScopedDurabilitySync::Check();
+        if (before_replace) before_replace();
+    } catch (const std::exception&) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove(tmp_path, cleanup_ec);
+        throw;
     }
     for (int attempt = 0; attempt < kAtomicWriteRetryCount; ++attempt) {
         rename_ec = ReplacePathAtomically(tmp_path, path);
@@ -221,6 +222,7 @@ void AtomicWriteImpl(
             after_rename_failpoint != nullptr &&
             ConsumeFailpointEnv(after_rename_failpoint);
         if (generic_failure || targeted_failure) {
+            if (generic_failure) ScopedDurabilitySync::Fail();
             throw std::runtime_error(
                 "injected atomic write failure after replace before directory sync: " + path.string());
         }

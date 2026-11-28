@@ -227,18 +227,17 @@ void UnknownReplacementPublishesWholeImage() {
     assert(users.Snapshot() != before);
     const auto stored = ReadUsersFile(dir.path());
     assert(stored && *stored == users.Snapshot());
-#if defined(__APPLE__)
-    // This failpoint fails F_FULLFSYNC, so it exists only on macOS.
     {
-        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
+        // The unchanged retry must write a fresh file. Refuse it if the
+        // temp write fails, even though the visible user already matches.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE", "1");
         bool unknown = false;
         try { users.SetLimits("admin", 1U, 7U); }
         catch (const UsersOutcomeUnknownError&) { unknown = true; }
-        assert(unknown); // An unchanged retry must confirm the outstanding rename.
+        assert(unknown);
     }
-#endif
     {
-        // The unchanged retry confirms the outstanding rename with a directory sync, once.
+        // The unchanged retry publishes a replacement with a directory sync, once.
         const auto data_dir = std::filesystem::weakly_canonical(dir.path());
         std::atomic<int> syncs{0};
         SetDirectorySyncObserverForTests([&](const std::filesystem::path& synced) {

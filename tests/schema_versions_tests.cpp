@@ -408,8 +408,21 @@ void TestCatalogChangeFailures() {
     SetFailpoint("CHUNKDB_FAILPOINT_ALTER_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "");
     const auto table = catalog.Find("world");
     assert(table->Info().schema.version == 2U && table->Info().schema.columns[1].name == "lamp");
-    auto lease = *table->Acquire();
-    ExpectRow(lease.store(), 0, 0, Row{std::uint64_t{9}, std::uint64_t{15}, std::monostate{}});
+    {
+        auto lease = *table->Acquire();
+        ExpectRow(lease.store(), 0, 0, Row{std::uint64_t{9}, std::uint64_t{15}, std::monostate{}});
+    }
+    SetFailpoint("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
+    ExpectThrow<std::runtime_error>(
+        [&] {
+            catalog.ChangeColumns(
+                "world", [](const TableSchema& schema) { return chunkdb::RenameColumn(schema, "lamp", "light"); });
+        },
+        "injected directory sync failure");
+    SetFailpoint("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "");
+    assert(catalog.Fence("world") && !catalog.Find("world"));
+    catalog.RecoverTable("world");
+    assert(catalog.Find("world")->Info().schema.columns[1].name == "light");
 }
 
 }  // namespace

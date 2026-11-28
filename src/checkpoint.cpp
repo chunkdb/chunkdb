@@ -205,6 +205,7 @@ bool ChunkStore::CheckpointChunk(
     // rollback intent still needs at the next start; replacing that WAL with
     // an image would make the store unopenable.
     ThrowIfDurabilityPoisoned();
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     // The image and the WAL change, in relaxed mode without a sync.
     chunk->wal_boundary_durable = false;
     if (!ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get())) {
@@ -372,6 +373,7 @@ bool ChunkStore::CheckpointChunk(
                 "injected checkpoint failure after image replacement");
         }
         PauseCheckpointBeforeWalRemovalForTests();
+        ThrowIfDurabilityPoisoned();
         if (archive_enabled && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_IMAGE_PUBLISH_ONCE")) ExitAbruptly(86);
         if (!files.active) CloseWalAppendStream(chunk);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CHECKPOINT_WAL_REMOVE_FAIL_ONCE")) {
@@ -501,9 +503,9 @@ bool ChunkStore::CheckpointChunk(
         // Every checkpoint failure boundary leaves a reader-safe old/new
         // combination: the prior WAL remains until image publication is
         // complete, and a published image may coexist with that WAL. Close
-        // this generation so the existing same-process retry path remains
-        // available; a failure publishing the even generation still leaves
-        // the store odd and fail-closed.
+        // this generation so readers can still use the old/new pair. An
+        // unpublished temporary file can be rewritten in a later checkpoint,
+        // while a failed sync of a live artifact has already fenced the store.
         snapshot_write.Finish();
         LogMessage(
             LogLevel::kError,

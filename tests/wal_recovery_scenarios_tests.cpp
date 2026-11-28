@@ -657,27 +657,17 @@ void TestUndurableCommitReportsUnknownOutcome() {
     config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
     const std::vector<std::uint8_t> payload(16, 0x07);
     const std::vector<std::uint8_t> presence(2, 0xFF);
-    const std::vector<const char*> failpoints = {
-        "CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE",
-        "CHUNKDB_FAILPOINT_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE",
-        "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_UNLINK_FAIL_ONCE",
-        "CHUNKDB_FAILPOINT_CONDITIONAL_COMMIT_RETRY_SYNC_FAIL_ONCE",
-    };
     {
         chunkdb::ChunkStore store(config);
         store.SetBlockBits(0, 0, "00000001");
-        for (const auto* name : failpoints) {
-            SetEnvVar(name, "1");
-        }
+        SetEnvVar("CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
         std::string error;
         try {
             (void)store.CasChunkStateBytes(0, 0, store.GetChunkVersion(0, 0), payload, presence);
         } catch (const std::exception& e) {
             error = e.what();
         }
-        for (const auto* name : failpoints) {
-            UnsetEnvVar(name);
-        }
+        UnsetEnvVar("CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
         assert(error.find("may or may not be applied") != std::string::npos);
         assert(store.BlockExists(1, 0));  // applied in memory
     }
@@ -728,22 +718,33 @@ void TestMacosDurabilityUsesFullSync() {
         UnsetEnvVar(failpoint);
         return failed;
     };
+    const auto fenced = [](chunkdb::ChunkStore& store) {
+        try { store.WalBarrier(); }
+        catch (const std::runtime_error& error) {
+            return std::string(error.what()).find("fail-closed") != std::string::npos;
+        }
+        return false;
+    };
     {
         chunkdb::ChunkStore store(config);
         store.SetBlockBits(0, 0, "00000001");  // the WAL exists from here on
         assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", [&] { store.SetBlockBits(1, 0, "00000001"); }));
         assert(!store.BlockExists(1, 0));
+        assert(fenced(store));
+    }
+    {
+        chunkdb::ChunkStore store(config);
         store.SetBlockBits(1, 0, "00000001");
-        // Another large chunk: its directory is created and synced first. A
-        // failure there leaves the store fail-closed, so it comes last.
+        // A different large chunk requires syncing its directory entry.
         assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", [&] { store.SetBlockBits(100, 100, "00000001"); }));
+        assert(fenced(store));
     }
     auto relaxed = BuildConfig(relaxed_dir);
     {
         chunkdb::ChunkStore store(relaxed);
         store.SetBlockBits(0, 0, "00000011");
         assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", [&] { store.WalBarrier(); }));
-        store.WalBarrier();
+        assert(fenced(store));
     }
     std::filesystem::remove_all(strict_dir);
     std::filesystem::remove_all(relaxed_dir);

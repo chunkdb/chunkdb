@@ -2072,16 +2072,13 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
     // commands on it would wait forever. Unless it is served again or gone,
     // it is fenced, with a fence made now, while a failure still serves it.
     auto fence = PrepareFence(table, table->name_, kFenceDropUnknown);
+    const char* const store_fence = Table::StoreFenceReason(*store);
     // A table created later under this name must not issue this table's
     // tokens again: the data directory keeps a floor above all of them,
     // durably before the drop. Failing here fails the drop.
     RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
     admission.Dismiss();
-    bool gone = false;
-    ScopeExit retire([&] {
-        if (gone) RetireTable(*table, options);
-        else FenceTable(*table, options, std::move(fence));
-    });
+    ScopeExit retire([&] { FenceTable(*table, options, std::move(fence)); });
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
@@ -2097,6 +2094,10 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
             throw;  // state unknown: fenced until recovered
         }
         if (in_place) {
+            if (store_fence || unsynced->durability_failed_on_close) {
+                fence.mapped().reason = store_fence ? store_fence : kFenceDurability;
+                throw;
+            }
             // Still in place: serve it again and report the failure.
             try {
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_DROP_REOPEN_FAIL_ONCE"))
@@ -2116,9 +2117,8 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
             }
             throw;
         }
-        // Moved out, but a later step (directory sync) failed: the table is
-        // gone from this server; the failure is still reported.
-        gone = true;
+        // The move is visible but may not survive a crash. Reserve the name
+        // until recovery inspects it.
         throw std::runtime_error(
             "table '" + table->name_ + "' was removed but the change may not be durable: " +
             e.what());
@@ -2406,6 +2406,7 @@ void TableCatalog::RewriteManifest(
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
+        const ScopedDurabilitySync sync_scope(&store->durability_poisoned_);
         auto manifest = ReadStoreManifest(table.dir_);
         if (!manifest.has_value()) {
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
@@ -2437,6 +2438,13 @@ void TableCatalog::RewriteManifest(
         if (!replaced) {
             throw;
         }
+        if (store->durability_poisoned_.load(std::memory_order_acquire)) {
+            // Memory still has the old schema. Keep the new manifest for
+            // explicit recovery and stop serving this table in the meantime.
+            restore.Dismiss();
+            FenceTable(table, previous, std::move(fence));
+            throw;
+        }
         // The manifest holds the change; only its directory sync failed.
         // Serve what the file says, then report the failure.
         write_failure = std::current_exception();
@@ -2450,6 +2458,10 @@ void TableCatalog::RewriteManifest(
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
+    if (unsynced->durability_failed_on_close) {
+        fence.mapped().reason = kFenceDurability;
+        throw TableFencedError(FencedMessage(table.name_, kFenceDurability));
+    }
     std::shared_ptr<ChunkStore> reopened;
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE")) {
@@ -2474,14 +2486,17 @@ void TableCatalog::RewriteManifest(
 
 void TableCatalog::WalBarrier() {
     if (config_.access_mode == AccessMode::kReadOnly) return;
+    migration_health_->Check();
     std::vector<std::shared_ptr<Table>> tables;
+    std::string fenced;
     {
         std::shared_lock lock(tables_mutex_);
+        if (!fenced_.empty()) fenced = fenced_.begin()->first;
         for (const auto& [_, table] : tables_) {
             tables.push_back(table);
         }
     }
-    if (tables.empty()) return;
+    if (tables.empty() && fenced.empty()) return;
     const auto pool = resources_->MaintenanceWorkers();
     std::vector<std::shared_ptr<MaintenanceTask>> barriers(tables.size());
     std::vector<std::exception_ptr> failures(tables.size());
@@ -2492,7 +2507,10 @@ void TableCatalog::WalBarrier() {
             // Acquire on the caller, so workers never wait for an exclusive
             // catalog operation that is itself draining maintenance.
             auto lease = table->Acquire();
-            if (!lease) continue;
+            if (!lease) {
+                ThrowIfFenced(table->name());
+                continue;
+            }
             // `tables` keeps each table alive until every barrier ends. The
             // task holds only the lease and releases it within its turn, so a
             // dropped table is never destroyed on a maintenance worker.
@@ -2517,6 +2535,8 @@ void TableCatalog::WalBarrier() {
     for (const auto& failure : failures) {
         if (failure) std::rethrow_exception(failure);
     }
+    if (!fenced.empty()) ThrowIfFenced(fenced);
+    migration_health_->Check();
 }
 
 TableOptionsUpdate TableOptionsUpdate::From(const TableOptions& options) {

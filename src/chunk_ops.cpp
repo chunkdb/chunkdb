@@ -14,6 +14,7 @@
 #include "chunk_store_internal.hpp"
 #include "statement_control.hpp"
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
@@ -66,6 +67,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // WAL can be gone after a power loss, leaving an intent that cannot be
     // applied. A relaxed write, or a process that crashed, may also have
     // left the image this frame's value records apply over without a sync.
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     MakeWalBoundaryDurableLocked(chunk_coord, chunk, /*own_stream=*/false);
 
     // Reserve the version token before anything about this mutation can become
@@ -92,6 +94,10 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     const auto saved_pending_updates = chunk->pending_updates;
     const auto saved_wal_bytes = chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = chunk->pending_wal_flush_updates;
+    const WriteOutcomeUnknownError unknown_outcome(
+        "the conditional write may or may not be applied: its commit record could not be made durable"
+        "; the store is fail-closed until RECOVER TABLE or a restart",
+        WriteOutcomeUnknownError::Stage::kConditionalCommitSync);
     SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     std::filesystem::path rollback_intent_path;
     try {
@@ -177,6 +183,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         chunk->wal_bytes = saved_wal_bytes;
         chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         try {
+            ThrowIfDurabilityPoisoned();
             // Synced in every mode before the intent goes: once it is gone,
             // nothing else would cut the rejected frame off after a crash.
             TruncateWalTail(chunk_coord, chunk, committed_wal_size, /*force_sync=*/true);
@@ -237,6 +244,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     std::vector<std::uint8_t>().swap(previous_payload);
     std::vector<std::uint8_t>().swap(previous_presence);
     feed.Commit();
+    if (!commit_record_durable) {
+        throw unknown_outcome;
+    }
     // Past the commit point a failed warning must not turn the committed
     // mutation into a command error. Called inside a handler: names the
     // exception being handled.
@@ -258,42 +268,11 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     try {
         ClearCommittedConditionalIntent(rollback_intent_path);
     } catch (...) {
-        if (!commit_record_durable) {
-            // The CKRC replace was visible but its first directory sync did
-            // not complete. A successful sync now makes either the retained
-            // CKRC or its already-visible unlink durable; both recover as
-            // committed. Never enter the rollback path after CKRC is visible.
-            try {
-                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CONDITIONAL_COMMIT_RETRY_SYNC_FAIL_ONCE")) {
-                    throw std::runtime_error("injected commit intent retry sync failure");
-                }
-                SyncDirectoryPath(rollback_intent_path.parent_path());
-                commit_record_durable = true;
-            } catch (const std::exception& completion_error) {
-                const std::string reason =
-                    "visible commit intent could not be made durable after "
-                    "cleanup failure on chunk (" +
-                    std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) + "): " +
-                    completion_error.what();
-                PoisonDurability(reason);
-                // Past the commit point: the write is applied in memory and
-                // a restart may keep it or not, so the error must not read
-                // as "not applied".
-                throw WriteOutcomeUnknownError(
-                    "the conditional write on chunk (" + std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) +
-                    ") may or may not be applied: its commit record could not be made durable (" +
-                    completion_error.what() + "); the store is fail-closed until RECOVER TABLE or a restart",
-                    WriteOutcomeUnknownError::Stage::kConditionalCommitSync);
-            }
-        }
         // The mutation is committed. CKRC is safe if retained: startup removes
         // it without truncating any WAL bytes. If the unlink survives, normal
         // replay reaches the same committed state.
         log_committed("conditional mutation committed but intent cleanup was incomplete");
     }
-    (void)commit_record_durable;
 
     try {
         MaybeCheckpointChunk(chunk_coord, chunk);

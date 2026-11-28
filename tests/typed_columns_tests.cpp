@@ -292,18 +292,18 @@ void TestFailedWriteRollsBack() {
     chunkdb::test::ScopedTempDir dir("chunkdb-typed-columns-rollback");
     auto config = Config(dir.path());
     config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
-    chunkdb::ChunkStore store(config);
-    store.SetBlock(0, 0, {{"id", std::uint64_t{7}}, {"temp", std::int64_t{5}}});
-    const auto before = store.GetChunkStateBytes(0, 0);
-    const auto version = store.GetChunkVersion(0, 0);
-    const std::vector<std::function<void()>> writes = {
-        [&] { store.SetBlock(0, 0, {{"light", std::uint64_t{1}}, {"temp", std::monostate{}}, {"big", std::uint64_t{9}}}); },
-        [&] { store.SetBlock(1, 0, {{"id", std::uint64_t{8}}}); },
-        [&] { store.UnsetBlock(0, 0); },
+    const std::vector<std::function<void(chunkdb::ChunkStore&)>> writes = {
+        [](chunkdb::ChunkStore& store) { store.SetBlock(0, 0, {{"light", std::uint64_t{1}}, {"temp", std::monostate{}}, {"big", std::uint64_t{9}}}); },
+        [](chunkdb::ChunkStore& store) { store.SetBlock(1, 0, {{"id", std::uint64_t{8}}}); },
+        [](chunkdb::ChunkStore& store) { store.UnsetBlock(0, 0); },
     };
     for (const auto& write : writes) {
+        chunkdb::ChunkStore store(config);
+        store.SetBlock(0, 0, {{"id", std::uint64_t{7}}, {"temp", std::int64_t{5}}});
+        const auto before = store.GetChunkStateBytes(0, 0);
+        const auto version = store.GetChunkVersion(0, 0);
         SetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
-        assert(!ErrorOf(write).empty());
+        assert(!ErrorOf([&] { write(store); }).empty());
         UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
         assert(store.GetChunkStateBytes(0, 0) == before);
         assert(store.GetChunkVersion(0, 0) == version);

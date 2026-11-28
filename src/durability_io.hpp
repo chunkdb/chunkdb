@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -9,6 +10,23 @@
 #include <vector>
 
 namespace chunkdb {
+
+// Binds path syncs (including the directory step of AtomicWrite) to the
+// open store. A barrier passes the same fence to its sync workers.
+class ScopedDurabilitySync {
+  public:
+    explicit ScopedDurabilitySync(std::atomic<bool>* fence) noexcept;
+    ~ScopedDurabilitySync();
+    ScopedDurabilitySync(const ScopedDurabilitySync&) = delete;
+    ScopedDurabilitySync& operator=(const ScopedDurabilitySync&) = delete;
+
+    static std::atomic<bool>* Current() noexcept;
+    static void Check();
+    static void Fail() noexcept;
+
+  private:
+    std::atomic<bool>* previous_;
+};
 
 // Sync the already admitted native generation without reopening its path.
 // Labels are diagnostic and observer values, never I/O instructions.

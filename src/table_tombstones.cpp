@@ -110,6 +110,8 @@ std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64
             snapshot.Finish();
         }
         store.reset();
+        if (unsynced->durability_failed_on_close)
+            throw std::runtime_error("table durability failed while closing after tombstone compaction");
         store = OpenStore(table->name_, table->dir_, table->geometry().config(), 0U, options);
         store->AdoptUnsynced(*unsynced);
         const auto floor = store->RetainedDeletionFloor();

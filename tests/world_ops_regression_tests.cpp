@@ -28,6 +28,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -741,6 +742,7 @@ void RunIntentEstablishmentFailureCase(
     config.checkpoint_update_interval = 1'000'000;
     config.checkpoint_wal_bytes = 1'000'000;
 
+    const bool published = std::string_view(failpoint) == "CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE";
     std::uint64_t expected = 0;
     {
         chunkdb::ChunkStore store(config);
@@ -759,17 +761,22 @@ void RunIntentEstablishmentFailureCase(
         assert(threw);
         assert(store.GetChunkVersion(0, 0) == expected);
         assert(store.GetBlockBits(0, 0) == "10101");
-        assert(!HasRollbackIntent(dir.path()));
+        assert(HasRollbackIntent(dir.path()) == published);
 
-        // This targets the original moved-from-vector crash: an ordinary write
-        // in the same chunk must remain usable after intent establishment
-        // rejects the conditional command.
-        store.SetBlockBits(1, 1, "11100");
-        store.WalBarrier();
+        bool refused = false;
+        try { store.SetBlockBits(1, 1, "11100"); }
+        catch (const std::runtime_error& error) {
+            refused = std::string_view(error.what()).find("fail-closed") != std::string_view::npos;
+        }
+        assert(refused == published);
     }
     {
         chunkdb::ChunkStore restarted(config);
         assert(restarted.GetBlockBits(0, 0) == "10101");
+        if (published) {
+            assert(!restarted.BlockExists(1, 1));
+            restarted.SetBlockBits(1, 1, "11100");
+        }
         assert(restarted.GetBlockBits(1, 1) == "11100");
         assert(!HasRollbackIntent(dir.path()));
     }
@@ -850,68 +857,34 @@ void TestPreExistingCommittedIntentFailuresAreSafe() {
     }
 }
 
-void RunCommittedIntentCleanupFailureCase(
-    ConditionalKind kind,
-    const char* failpoint,
-    bool arm_rollback_failure) {
-    chunkdb::test::ScopedTempDir dir("chunkdb-reg-intent-commit-cleanup");
-    auto config = BaseConfig(dir.path());
-    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
-    config.checkpoint_update_interval = 1'000'000;
-    config.checkpoint_wal_bytes = 1'000'000;
-
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetBlockBits(0, 0, "10101");
-        const auto expected = store.GetChunkVersion(0, 0);
-        {
-            ScopedEnv cleanup_failure(failpoint, "1");
-            if (arm_rollback_failure) {
-                ScopedEnv commit_boundary_failure(
-                    "CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE",
-                    "1");
-                ScopedEnv commit_completion_failure(
-                    "CHUNKDB_FAILPOINT_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE",
-                    "1");
-                ScopedEnv rollback_failure(
-                    "CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE", "1");
-                ApplyConditional(kind, &store, expected);
-            } else {
-                ApplyConditional(kind, &store, expected);
-            }
-        }
-        assert(store.GetBlockBits(0, 0) ==
-               (kind == ConditionalKind::kCas ? "11111" : "01010"));
-        store.SetBlockBits(1, 1, "11001");
-        store.WalBarrier();
-    }
-    {
-        chunkdb::ChunkStore restarted(config);
-        assert(restarted.GetBlockBits(0, 0) ==
-               (kind == ConditionalKind::kCas ? "11111" : "01010"));
-        assert(restarted.GetBlockBits(1, 1) == "11001");
-        assert(!HasRollbackIntent(dir.path()));
-    }
-}
-
 void TestCommittedIntentCleanupFailuresRemainCommitted() {
     for (const auto kind : {ConditionalKind::kCas, ConditionalKind::kBatch}) {
-        RunCommittedIntentCleanupFailureCase(
-            kind,
-            "CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE",
-            false);
-        RunCommittedIntentCleanupFailureCase(
-            kind,
-            "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_UNLINK_FAIL_ONCE",
-            false);
-        RunCommittedIntentCleanupFailureCase(
-            kind,
-            "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_AFTER_UNLINK_BEFORE_DIR_SYNC_ONCE",
-            false);
-        RunCommittedIntentCleanupFailureCase(
-            kind,
-            "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_AFTER_UNLINK_BEFORE_DIR_SYNC_ONCE",
-            true);
+        for (const bool sync_failure : {false, true}) {
+            chunkdb::test::ScopedTempDir dir("chunkdb-reg-intent-commit-cleanup");
+            auto config = BaseConfig(dir.path());
+            config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+            config.checkpoint_update_interval = 1'000'000;
+            config.checkpoint_wal_bytes = 1'000'000;
+            const auto committed = kind == ConditionalKind::kCas ? "11111" : "01010";
+            {
+                chunkdb::ChunkStore store(config);
+                store.SetBlockBits(0, 0, "10101");
+                ScopedEnv failure(sync_failure ?
+                    "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_AFTER_UNLINK_BEFORE_DIR_SYNC_ONCE" :
+                    "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_UNLINK_FAIL_ONCE", "1");
+                ApplyConditional(kind, &store, store.GetChunkVersion(0, 0));
+                assert(store.GetBlockBits(0, 0) == committed);
+                bool fenced = false;
+                try { store.WalBarrier(); }
+                catch (const std::runtime_error& error) {
+                    fenced = std::string_view(error.what()).find("fail-closed") != std::string_view::npos;
+                }
+                assert(fenced == sync_failure);
+            }
+            chunkdb::ChunkStore restarted(config);
+            assert(restarted.GetBlockBits(0, 0) == committed);
+            assert(!HasRollbackIntent(dir.path()));
+        }
     }
 }
 
@@ -1321,44 +1294,40 @@ void TestBarrierOverflowFallbackSucceeds() {
     assert(store.RuntimeStats().wal_barriers >= 1);
 }
 
-void TestBarrierFailClosedRetainsBookkeeping() {
-    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-failclosed");
-    chunkdb::ChunkStore store(BaseConfig(dir.path()));
-    store.SetBlockBits(0, 0, "10101");
+void AssertBarrierFenced(chunkdb::ChunkStore& store) {
+    try {
+        store.WalBarrier();
+        assert(false);
+    } catch (const std::runtime_error& error) {
+        assert(std::string_view(error.what()).find("fail-closed") != std::string_view::npos);
+    }
+}
 
-    // Normal (non-overflow) barrier that fails: the drained file/dir set must
-    // be restored so a retry still covers the same writes.
-    bool threw = false;
-    {
-        ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+void TestBarrierSyncFailureFencesStore() {
+    for (const bool overflow : {false, true}) {
+        chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-failclosed");
+        chunkdb::ChunkStore store(BaseConfig(dir.path()));
+        store.SetBlockBits(0, 0, "10101");
+        if (overflow) store.ForceUnsyncedOverflowForTests();
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+            try {
+                store.WalBarrier();
+                assert(false);
+            } catch (const std::runtime_error& error) {
+                assert(std::string_view(error.what()).find("injected barrier sync failure") != std::string_view::npos);
+            }
+        }
+        AssertBarrierFenced(store);
+        assert(store.RuntimeStats().wal_barriers == 0U);
+        assert(store.GetBlockBits(0, 0) == "10101");
         try {
-            store.WalBarrier();
-        } catch (const std::exception&) {
-            threw = true;
+            store.SetBlockBits(1, 0, "11111");
+            assert(false);
+        } catch (const std::runtime_error& error) {
+            assert(std::string_view(error.what()).find("fail-closed") != std::string_view::npos);
         }
     }
-    assert(threw);
-    assert(store.UnsyncedTrackedCountForTests() > 0);  // bookkeeping retained
-    // A retry (no fault) now succeeds and drains the set.
-    store.WalBarrier();
-    assert(store.UnsyncedTrackedCountForTests() == 0);
-
-    // Same guarantee on the overflow path.
-    store.SetBlockBits(8, 8, "11111");
-    store.ForceUnsyncedOverflowForTests();
-    bool overflow_threw = false;
-    {
-        ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
-        try {
-            store.WalBarrier();
-        } catch (const std::exception&) {
-            overflow_threw = true;
-        }
-    }
-    assert(overflow_threw);
-    assert(store.UnsyncedOverflowFlagForTests());  // overflow retained for retry
-    store.WalBarrier();
-    assert(!store.UnsyncedOverflowFlagForTests());
 }
 
 void RunBarrierCheckpointReplacementCase(bool overflow) {
@@ -1576,7 +1545,7 @@ void TestBarrierTracksDirectoriesAboveLimit() {
     assert(recovered.GetBlockBits(32, 0) == "11111");
 }
 
-void TestBarrierParallelSyncFailureRetainsBookkeeping() {
+void TestBarrierParallelSyncFailureFencesStore() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-parallel-fail");
     chunkdb::ChunkStore store(BaseConfig(dir.path()));
     // Enough files for the barrier to sync them on several threads.
@@ -1587,7 +1556,7 @@ void TestBarrierParallelSyncFailureRetainsBookkeeping() {
     assert(tracked >= 64U);
 
     // One file sync fails, on whichever thread takes it: the barrier reports
-    // it and keeps everything it drained for the retry.
+    // it and refuses any retry.
     bool threw = false;
     {
         ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE", "1");
@@ -1598,9 +1567,8 @@ void TestBarrierParallelSyncFailureRetainsBookkeeping() {
         }
     }
     assert(threw);
-    assert(store.UnsyncedTrackedCountForTests() == tracked);
-    store.WalBarrier();
-    assert(store.UnsyncedTrackedCountForTests() == 0U);
+    AssertBarrierFenced(store);
+    assert(store.RuntimeStats().wal_barriers == 0U);
 }
 
 void TestBarrierSyncsPendingBatchesInItsSyncStep() {
@@ -1616,7 +1584,7 @@ void TestBarrierSyncsPendingBatchesInItsSyncStep() {
         assert(store.UnsyncedTrackedCountForTests() == 0U);
 
         // The barrier writes them without a sync and leaves their WALs to its
-        // sync step, which keeps them for the retry when it fails.
+        // sync step. A failure there fences the store.
         bool threw = false;
         {
             ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
@@ -1627,9 +1595,9 @@ void TestBarrierSyncsPendingBatchesInItsSyncStep() {
             }
         }
         assert(threw);
-        assert(store.UnsyncedTrackedCountForTests() >= 32U);
-        store.WalBarrier();
-        assert(store.UnsyncedTrackedCountForTests() == 0U);
+        assert(std::filesystem::exists(
+            chunkdb::ChunkWalPath(dir.path(), store.geometry(), store.geometry().BlockToChunk(31 * 4, 0))));
+        AssertBarrierFenced(store);
     }
     chunkdb::ChunkStore recovered(config);
     assert(recovered.GetBlockBits(31 * 4, 0) == "10101");
@@ -1828,9 +1796,9 @@ void TestBarrierCoversConcurrentRollbackBoundary() {
     RunBarrierConcurrentBoundaryCase(/*transaction=*/true);
 }
 
-// A boundary whose own syncs fail after a barrier drained its chunk's files
-// tracks them again, so the next barrier syncs them.
-void TestFailedBoundaryAfterDrainIsSyncedByNextBarrier() {
+// The first barrier can finish before the concurrent boundary fails.
+// That failure must still fence the next barrier.
+void TestFailedBoundaryAfterDrainFencesNextBarrier() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-boundary-fail");
     auto config = BaseConfig(dir.path());
     config.wal_group_commit_updates = 8;
@@ -1873,11 +1841,9 @@ void TestFailedBoundaryAfterDrainIsSyncedByNextBarrier() {
         boundary.join();
     }
     assert(boundary_failed);
-    assert(store.UnsyncedTrackedCountForTests() > 0U);
     const SyncedFileLog synced;
-    store.WalBarrier();
-    assert(synced.Contains(wal));
-    assert(store.UnsyncedTrackedCountForTests() == 0U);
+    AssertBarrierFenced(store);
+    assert(!synced.Contains(wal));
 }
 
 // A failed append to a WAL with another link (a backup's hard link) replaces
@@ -2492,17 +2458,17 @@ int main() {
     TestConditionalCommittedWarningFailuresKeepTheCommit();
     TestConditionalCommittedNonStdFailuresKeepTheCommit();
     TestBarrierOverflowFallbackSucceeds();
-    TestBarrierFailClosedRetainsBookkeeping();
+    TestBarrierSyncFailureFencesStore();
     TestBarrierCoversConcurrentCheckpointReplacement();
     TestBarrierAfterDrainReplacementCannotDowngradeDurability();
     TestBarrierCoversConcurrentEmptyChunkGc();
     TestBarrierTracksDirectoriesAboveLimit();
-    TestBarrierParallelSyncFailureRetainsBookkeeping();
+    TestBarrierParallelSyncFailureFencesStore();
     TestBarrierSyncsPendingBatchesInItsSyncStep();
     TestBarrierAllowsCheckpointsWhileSyncing();
     TestSweptDirectoryCountsOnce();
     TestBarrierCoversConcurrentRollbackBoundary();
-    TestFailedBoundaryAfterDrainIsSyncedByNextBarrier();
+    TestFailedBoundaryAfterDrainFencesNextBarrier();
     TestRollbackReplaceAfterFloorSyncsEntry();
     TestEvictionKeepsRecentlyUsedResident();
     TestScanContentionFallbackCachesTheChunk();

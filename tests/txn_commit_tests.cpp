@@ -542,6 +542,32 @@ void TestRepairFailureFailsClosed() {
     assert(ReadCounter(again, kA) == 0U && ReadCounter(again, kB) == 3U);
 }
 
+void TestFrameSyncFailureLeavesRollbackIntent() {
+    ScopedTempDir dir("chunkdb-txn-frame-sync");
+    const auto config = Config(dir.path());
+    {
+        ChunkStore store(config);
+        WriteCounter(store, kA, 1);
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        auto writes = Writes(store, *snapshot, {{kA, 2}, {kB, 4}});
+        std::optional<ScopedEnv> fault;
+        chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+            if (path.filename() == ".chunkdb.intents" && !fault)
+                fault.emplace("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", "1");
+        });
+        assert(Throws([&] { (void)store.CommitTransaction(*snapshot, {}, std::move(writes)); }));
+        chunkdb::SetDirectorySyncObserverForTests({});
+        assert(fault);
+        fault.reset();
+        assert(HasTxnIntent(dir.path()));
+        assert(ReadCounter(store, kA) == 1U && ReadCounter(store, kB) == 0U);
+        assert(Throws([&] { store.WalBarrier(); }));
+    }
+    ChunkStore reopened(config);
+    assert(!HasTxnIntent(dir.path()));
+    assert(ReadCounter(reopened, kA) == 1U && ReadCounter(reopened, kB) == 0U);
+}
+
 // A commit record that is visible but cannot be made durable: the outcome
 // is unknown and the store fail-closed; once visible it is never undone.
 void TestCommitRecordNotDurable() {
@@ -550,20 +576,14 @@ void TestCommitRecordNotDurable() {
     {
         ChunkStore store(config);
         WriteCounter(store, kA, 1);
-        // A failed directory sync that the retry completes is a commit.
-        {
-            auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
-            ScopedEnv fail("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-            assert(store.CommitTransaction(*snapshot, {}, Writes(store, *snapshot, {{kA, 2}})) > 0U);
-            assert(!HasTxnIntent(dir.path()));
-        }
         auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
         ScopedEnv fail("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-        ScopedEnv retry_fail("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE", "1");
         assert(ThrowsAs<chunkdb::WriteOutcomeUnknownError>(
             [&] { (void)store.CommitTransaction(*snapshot, {}, Writes(store, *snapshot, {{kA, 3}, {kB, 4}})); }));
         assert(ReadCounter(store, kA) == 3U && ReadCounter(store, kB) == 4U);
+        assert(HasTxnIntent(dir.path()));
         assert(Throws([&] { WriteCounter(store, kC, 1); }));
+        assert(Throws([&] { store.WalBarrier(); }));
     }
     ChunkStore reopened(config);
     assert(ReadCounter(reopened, kA) == 3U && ReadCounter(reopened, kB) == 4U);
@@ -1016,6 +1036,7 @@ int main(int argc, char** argv) {
     TestBoundaryFailureChangesNothing();
     TestAppendFailureChangesNothing();
     TestRepairFailureFailsClosed();
+    TestFrameSyncFailureLeavesRollbackIntent();
     TestCommitRecordNotDurable();
     TestIntentsOnDisk();
     TestRelaxedBoundaryMakesImageDurable();
