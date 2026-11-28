@@ -155,6 +155,7 @@ Options use the same TLV layout as the root manifest:
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
+| 14 | follower base revision `u64`, including zero | absent |
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is not a known option.
 
@@ -163,6 +164,10 @@ The parent epoch differs from the table's current epoch; the fork revision prese
 New tables omit both fields.
 Schema and option replacements preserve lineage and unknown compatible option entries.
 Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields.
+
+Type 14 marks a follower table, which changes only through APPLY; its store id is the primary's epoch.
+A build that does not know type 14 refuses to open the table.
+At a start the follower's completed revision is the higher of the base revision and the highest revision its coordinate index recovers; its version clock starts above it, below the persisted ceiling when that is higher.
 Committed image and WAL revisions retain their numeric values; reserved tokens belonging to the parent epoch do not set the restored frontier.
 
 ### Feature activation decision

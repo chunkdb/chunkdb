@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -47,6 +48,9 @@
 #include "reply_stream.hpp"
 #include "returning.hpp"
 #include "statement_control.hpp"
+#include "replication_push.hpp"
+#include "chunkdb/change_feed.hpp"
+#include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
 
@@ -592,7 +596,8 @@ struct FileUsage {
     sides(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks,
         info.geometry.large_chunk_depth_chunks);
     key("options");
-    Protocol::AppendMapHeader(reply, 8);
+    const bool follower = store != nullptr ? store->follower() : info.follower;
+    Protocol::AppendMapHeader(reply, follower ? 9U : 8U);
     key("durability_mode");
     Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
     key("checkpoint_updates");
@@ -609,6 +614,10 @@ struct FileUsage {
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
     key("slot_max_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
+    if (follower) {
+        key("follower");
+        Protocol::AppendBoolean(reply, true);
+    }
     key("epoch");
     Protocol::AppendBulk(reply, StoreIdHex(store != nullptr ? store->store_id() : info.store_id));
     if (revision) {
@@ -946,6 +955,134 @@ void ForEachExpressionParameter(const BlockWritePlan& plan, Use&& use) {
     return bytes;
 }
 
+
+// A follower changes only through APPLY (docs/design/REPLICATION_APPLY.md).
+void RequireLocalWrites(const ChunkStore& store, std::string_view table, std::string_view verb) {
+    if (store.follower())
+        throw TableArgumentError("follower", "table '" + std::string(table) + "' is a follower: " + std::string(verb) +
+            " is refused; it changes only through APPLY");
+}
+
+// CREATE TABLE ... WITH follower = 'epoch': the epoch, and the statement
+// without the option, whose other options DefinitionFrom reads.
+[[nodiscard]] std::optional<StoreId> TakeFollowerOption(cql::CreateTable& create) {
+    const auto at = std::find_if(create.options.begin(), create.options.end(),
+        [](const cql::Option& option) { return option.name == "follower"; });
+    if (at == create.options.end()) return std::nullopt;
+    const auto* text = std::get_if<cql::Text>(&at->value);
+    const auto epoch = text != nullptr ? ParseEpochHex(text->value) : std::nullopt;
+    if (!epoch) throw std::invalid_argument("option follower takes the primary's epoch, 32 hex digits");
+    if (std::all_of(epoch->begin(), epoch->end(), [](std::uint8_t byte) { return byte == 0U; }))
+        throw std::invalid_argument("option follower takes an epoch that is not zero");
+    create.options.erase(at);
+    if (std::any_of(create.options.begin(), create.options.end(),
+            [](const cql::Option& option) { return option.name == "follower"; }))
+        throw std::invalid_argument("option follower is given twice");
+    return epoch;
+}
+
+[[nodiscard]] std::string ApplyReply(bool applied) {
+    return Protocol::SimpleString(applied ? "applied" : "skipped");
+}
+
+[[nodiscard]] std::string ApplySchemaMismatch(std::uint64_t current, std::uint64_t actual, const std::string& table) {
+    return Protocol::Error("SCHEMA_MISMATCH",
+        "the push was encoded for schema version " + std::to_string(actual) + "; the follower has schema version " +
+            std::to_string(current),
+        {{"current", std::to_string(current)}, {"actual", std::to_string(actual)}, {"table", table}});
+}
+
+// APPLY $1 into the follower whose epoch the push names.
+[[nodiscard]] std::string ApplyPush(
+    const std::function<std::shared_ptr<Table>(const StoreId&)>& find, const std::optional<std::string>& frame) {
+    if (!frame.has_value()) throw std::invalid_argument("the push cannot be NULL");
+    const auto value = DecodeReplicationValue(*frame);
+    const auto header = ReadReplicationPushHeader(value);
+    const auto table = find(header.epoch);
+    const auto lease = table != nullptr ? table->Acquire() : std::nullopt;
+    if (!lease) throw TableNotFoundError("no table of this server has epoch " + StoreIdHex(header.epoch));
+    ChunkStore& store = lease->store();
+    const std::string& name = table->name();
+    if (!store.follower())
+        throw TableArgumentError("not_follower", "table '" + name + "' has the push's epoch but is not a follower");
+    const Geometry& geometry = store.geometry();
+    const auto push = ReadReplicationPush(value, geometry.dims(), name);
+    const auto apply = store.LockReplicationApply();
+    if (push.kind == ReplicationPushKind::kProgress) return ApplyReply(store.ApplyReplicatedProgress(push.revision));
+    if (const auto completed = store.CompletedRevision(); completed && push.revision <= *completed) return ApplyReply(false);
+    const auto& schema = geometry.layout().schema();
+    if (push.schema_version != schema.version) return ApplySchemaMismatch(schema.version, push.schema_version, name);
+    const auto coordinates = [](const ChunkCoord& coord) {
+        return std::to_string(coord.x) + "," + std::to_string(coord.y) + "," + std::to_string(coord.z);
+    };
+    const auto values = [](const std::vector<Column>& columns, const std::vector<std::optional<std::string>>& row,
+                            const char* what) {
+        if (row.size() != columns.size())
+            throw TableArgumentError("apply", std::string(what) + " has " + std::to_string(row.size()) +
+                " values for " + std::to_string(columns.size()) + " columns");
+        std::vector<ColumnValue> decoded;
+        decoded.reserve(row.size());
+        for (std::size_t i = 0; i < row.size(); ++i) decoded.push_back(ParameterValue(columns[i], i + 1U, row[i]));
+        return decoded;
+    };
+    std::vector<TxnChunkWrite> writes;
+    writes.reserve(push.chunks.size());
+    for (const auto& chunk : push.chunks) {
+        if (chunk.version != push.revision)
+            throw TableArgumentError("apply", "chunk " + coordinates(chunk.coord) + " has version " +
+                std::to_string(chunk.version) + ", not the push's revision " + std::to_string(push.revision));
+        ChunkState state;
+        if (chunk.rows) {
+            state = store.ReadChunkState(chunk.coord);
+            for (const auto& row : chunk.blocks) {
+                if (BlockCoord(geometry, row.x, row.y, row.z) != chunk.coord)
+                    throw TableArgumentError("apply", "a block of chunk " + coordinates(chunk.coord) + " lies in another chunk");
+                if (!row.after) {
+                    if (geometry.dims() == 3U) store.UnsetBlockInState3D(state, row.x, row.y, row.z);
+                    else store.UnsetBlockInState(state, row.x, row.y);
+                    continue;
+                }
+                auto decoded = values(schema.columns, *row.after, "a block row");
+                std::vector<ColumnAssignment> assignments;
+                assignments.reserve(decoded.size());
+                for (std::size_t i = 0; i < decoded.size(); ++i)
+                    assignments.push_back(ColumnAssignment{.column = schema.columns[i].name, .value = std::move(decoded[i])});
+                if (geometry.dims() == 3U) store.SetBlockInState3D(state, row.x, row.y, row.z, assignments);
+                else store.SetBlockInState(state, row.x, row.y, assignments);
+            }
+            if (chunk.chunk_row) {
+                const auto& chunk_schema = geometry.chunk_schema();
+                state.chunk_columns = std::make_shared<const ChunkColumnState>(
+                    EncodeChunkColumns(chunk_schema, values(chunk_schema.columns, *chunk.chunk_row, "the chunk row")));
+            }
+        } else if (chunk.form) {
+            const std::span<const std::uint8_t> bytes(
+                reinterpret_cast<const std::uint8_t*>(chunk.form->data()), chunk.form->size());
+            const auto limit = ChunkFormBytes(geometry, false);
+            const auto form = ParseChunkFormSections(bytes, limit, ChunkFormReadMode::kMutation);
+            if (form.header.schema_version != schema.version)
+                return ApplySchemaMismatch(schema.version, form.header.schema_version, name);
+            if (form.header.chunk_version != push.revision || form.header.commit_time_ms != push.commit_time_ms)
+                throw TableArgumentError("apply", "the form of chunk " + coordinates(chunk.coord) +
+                    " does not carry the push's revision and commit time");
+            // The table's value limit, as rows meet in SetBlockInState.
+            state = DecodeSectionedChunkState(geometry, bytes, store.var_max_chunk_bytes(), {}, limit);
+        } else {
+            // A deletion leaves the chunk written and empty.
+            state = store.ReadChunkState(chunk.coord);
+            std::fill(state.payload.begin(), state.payload.end(), std::uint8_t{0});
+            std::fill(state.presence_bitmap.begin(), state.presence_bitmap.end(), std::uint8_t{0});
+            state.vars = ChunkVars{};
+            state.chunk_columns.reset();
+        }
+        state.written = true;
+        writes.push_back(TxnChunkWrite{.coord = chunk.coord, .state = std::move(state)});
+    }
+    // The primary's user, in the follower's WAL frames and feed.
+    const ScopedWriteUser user(push.user ? std::string_view(*push.user) : std::string_view{});
+    return ApplyReply(store.ApplyReplicatedCommit(push.revision, push.commit_time_ms, std::move(writes)));
+}
+
 }  // namespace
 
 const User* CommandEngine::CurrentUser(SessionState& session) const {
@@ -1084,6 +1221,7 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
                 info.migration = migrate.name;
             },
             [&](const cql::ShowMigrations&) { info.verb = "SHOW MIGRATIONS"; },
+            [&](const cql::Apply&) { info.verb = "APPLY"; },
         },
         statement);
 }
@@ -1200,6 +1338,28 @@ bool CommandEngine::HasServerRight(SessionState& session, ServerRight right) con
     if (!config_.require_auth) return true;
     const User* user = CurrentUser(session);
     return user != nullptr && chunkdb::HasServerRight(*user, right);
+}
+
+std::shared_ptr<Table> CommandEngine::TableOfEpoch(const StoreId& epoch) const {
+    {
+        std::lock_guard lock(epoch_tables_mutex_);
+        if (const auto found = epoch_tables_.find(epoch); found != epoch_tables_.end()) {
+            // Still the table serving its name: a drop, swap or rename retires it.
+            if (auto table = found->second.lock(); table != nullptr && catalog_->Find(table->name()) == table)
+                return table;
+        }
+    }
+    auto table = catalog_->FindByEpoch(epoch);
+    if (table != nullptr) {
+        std::lock_guard lock(epoch_tables_mutex_);
+        if (epoch_tables_.size() >= 4096U) std::erase_if(epoch_tables_, [](const auto& entry) { return entry.second.expired(); });
+        epoch_tables_[epoch] = table;
+    }
+    return table;
+}
+
+void CommandEngine::RequireReplication(SessionState& session) const {
+    if (!HasServerRight(session, ServerRight::kReplication)) throw PermissionDeniedError("REPLICATION");
 }
 
 void CommandEngine::RequireMonitor(SessionState& session) const {
@@ -1414,6 +1574,14 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
             return reject(ErrorReply(error));
         }
         request.parameter_bytes_limit = kMaxStatementParameterBytes;
+        request.plan = PayloadPlan::kParameters;
+        return request;
+    }
+    if (std::holds_alternative<cql::Apply>(parsed.statement)) {
+        // Only REPLICATION sends a push that large.
+        if (!HasServerRight(session, ServerRight::kReplication))
+            return reject(ErrorReply(PermissionDeniedError("REPLICATION")));
+        request.parameter_limits = {catalog_->feed_buffer_bytes()};
         request.plan = PayloadPlan::kParameters;
         return request;
     }
@@ -1941,6 +2109,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
                                                                       : AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
+                    RequireLocalWrites(store, set.table, "SET BLOCK");
                     RequireDimensions(store.geometry(), set.dims);
                     const auto& layout = store.geometry().layout();
                     std::vector<ColumnAssignment> values;
@@ -1977,6 +2146,7 @@ std::string CommandEngine::ExecuteStatement(
                     if (session.transaction != nullptr) {
                         const auto lease = TxnLease(session, del.table);
                         ChunkStore& store = lease.store();
+                        RequireLocalWrites(store, del.table, "DELETE BLOCK");
                         RequireDimensions(store.geometry(), del.dims);
                         TxnWrite(
                             *session.transaction, store, BlockCoord(store.geometry(), del.x, del.y, del.z),
@@ -1987,6 +2157,7 @@ std::string CommandEngine::ExecuteStatement(
                         return NullReply();
                     }
                     const auto lease = AcquireNamedTable(session, del.table);
+                    RequireLocalWrites(lease.store(), del.table, "DELETE BLOCK");
                     RequireDimensions(lease.store().geometry(), del.dims);
                     return VersionReply(del.dims == 3U
                         ? lease.store().UnsetBlock3D(del.x, del.y, del.z, del.if_version)
@@ -2031,6 +2202,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
                                                                       : AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
+                    RequireLocalWrites(store, set.table, "SET CHUNK");
                     const auto& geometry = store.geometry();
                     RequireDimensions(geometry, set.dims);
                     const ChunkCoord coord{set.chunk_x, set.chunk_y, set.chunk_z};
@@ -2318,8 +2490,14 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireCreateRight(session, create.table);
-                    (void)catalog_->Create(create.table,
-                        [&] { return DefinitionFrom(create, catalog_->default_options()); }, create.if_not_exists);
+                    cql::CreateTable plain = create;
+                    const auto follower = TakeFollowerOption(plain);
+                    if (follower) RequireReplication(session);
+                    (void)catalog_->Create(create.table, [&] {
+                        auto definition = DefinitionFrom(plain, catalog_->default_options());
+                        definition.follower_epoch = follower;
+                        return definition;
+                    }, create.if_not_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::AlterTable& alter) {
@@ -2539,6 +2717,12 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Ping&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     return Protocol::SimpleString("PONG");
+                },
+                [&](const cql::Apply& apply) {
+                    command_class = MetricsRegistry::CommandClass::kChunkWrite;
+                    RequireReplication(session);
+                    return ApplyPush([this](const StoreId& epoch) { return TableOfEpoch(epoch); },
+                        parameters[apply.push.index - 1U]);
                 },
                 [&](const cql::Backup& backup) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
@@ -3219,6 +3403,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
     RequireNoVersionInTxn(session, if_version);
     const auto lease = session.transaction != nullptr ? TxnLease(session, table) : AcquireNamedTable(session, table);
     ChunkStore& store = lease.store();
+    RequireLocalWrites(store, table, set != nullptr ? "SET BLOCK" : "DELETE BLOCK");
     const Geometry& geometry = store.geometry();
     RequireDimensions(geometry, set != nullptr ? set->dims : del->dims);
     const auto& layout = geometry.layout();

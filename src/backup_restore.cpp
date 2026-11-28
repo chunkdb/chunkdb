@@ -211,6 +211,8 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
     manifest.schema = WithoutPendingNarrowing(manifest.schema);
     manifest.store_id = new_epoch;
     manifest.lineage = TableLineage{old_epoch, cut.revision};
+    // A new epoch is no copy of a primary: the restored table takes writes.
+    manifest.follower.reset();
     AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
     return new_epoch;

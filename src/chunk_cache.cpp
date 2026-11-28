@@ -200,6 +200,16 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             // An image without a WAL may be of an earlier schema version.
             BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
+            // A follower recovers its frontier at open and advances it only
+            // through APPLY. Local tables still admit persisted revisions on load.
+            if (loaded.revision != 0) {
+                if (!follower_base_) {
+                    RaiseVersionClockAbove(loaded.revision);
+                } else if (access_mode_ != AccessMode::kReadOnly &&
+                           loaded.revision >= version_clock_.load(std::memory_order_acquire)) {
+                    throw std::runtime_error("recovered chunk revision is ahead of the follower clock; run RECOVER TABLE or restart");
+                }
+            }
             // Not make_shared, which cannot take the deleter; as a result a
             // weak_ptr that outlives the instance (the WAL stream pool keeps
             // them) keeps only the control block, not the object's storage.
@@ -208,12 +218,6 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
                 RegularChunkDeleter{live_chunk_instances_, chunk_coord});
             selected->vars = std::move(loaded.vars);
             selected->chunk_columns = std::move(loaded.chunk_columns);
-            // The persisted revision survives eviction and restart, so
-            // versions do not change on reload. A chunk without a producing
-            // commit keeps revision zero and consumes no write reservation.
-            if (loaded.revision != 0) {
-                RaiseVersionClockAbove(loaded.revision);
-            }
             selected->version = loaded.revision;
             // A surviving header or interrupted creation is not a committed mutation.
             selected->written = loaded.revision != 0;

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <sstream>
+#include <utility>
 
 #include "backup.hpp"
 #include "checkpoint.hpp"
@@ -111,6 +112,9 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
     };
     std::shared_lock<BackupMaintenanceGate> metadata;
     std::unique_lock operations(operations_mutex_, std::defer_lock);
+    TableOptions options;
+    FenceNode undo_fence;
+    ServedNode entry;
     try {
         RestoreProgressLog progress(request);
         const auto copy = CopyBackupTable(request.backup, request.table, staging, request.cancelled, std::ref(progress));
@@ -122,7 +126,8 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
             throw FeatureAdmissionError("feature_disabled", "table_lineage",
                 "restore requires table_lineage on the backed-up table; enable it on the source and create another backup");
         require_features();
-        RequireValidTableOptions(DecodeTableOptions(manifest.options));
+        options = DecodeTableOptions(manifest.options);
+        RequireValidTableOptions(options);
         RequireRecoverableOptions(request.name, manifest);
         result.parent_epoch = copy.cut.epoch;
         result.fork_revision = copy.cut.revision;
@@ -131,6 +136,7 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, request.cancelled);
         manifest.store_id = result.epoch;
         manifest.lineage = TableLineage{result.parent_epoch, result.fork_revision};
+        manifest.follower.reset();
         std::ostringstream findings;
         if (VerifyTableDirectory(staging, findings).errors != 0U)
             throw std::runtime_error("restored table failed verification: " + findings.str());
@@ -144,6 +150,9 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         require_features();
         operations.lock();
         require_name();
+        RequireUnusedEpoch(result.epoch);
+        undo_fence = PrepareFence(nullptr, request.name, kFenceRestore, result.epoch);
+        entry = PrepareServed(request.name);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"))
             throw std::runtime_error("injected failure before publishing a restored table");
         // A stop accepted until here leaves nothing restored; after it the
@@ -167,7 +176,6 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
     // From here the table is in tables/. If it cannot be made durable or
     // opened, take it back out, as Create does, so the name is not left with
     // a table this server does not serve.
-    const auto options = DecodeTableOptions(manifest.options);
     std::shared_ptr<ChunkStore> store;
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_OPEN_FAIL_ONCE"))
@@ -175,28 +183,31 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         SyncDirectoryPath(TablesDir());
         SyncDirectoryPath(StagingDir());
         store = OpenStore(request.name, target, manifest.geometry, 0U, options);
+        Geometry geometry = store->geometry();
+        entry.mapped() = std::shared_ptr<Table>(new Table(request.name, target, result.epoch, std::move(geometry), options,
+            std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     } catch (const std::exception& e) {
-        LogMessage(LogLevel::kError, LogComponent::kStore, "restored table cannot be made durable or opened; removing it",
-            {{"table", request.name}, {"error", e.what()}});
+        store.reset();
         try {
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_UNDO_FAIL_ONCE"))
                 throw std::runtime_error("injected failure removing a restored table");
             MoveToDropped(target, request.name);
         } catch (const std::exception& undo_error) {
+            {
+                std::unique_lock lock(tables_mutex_);
+                fenced_.insert(std::move(undo_fence));
+            }
             LogMessage(LogLevel::kError, LogComponent::kStore,
                 "restored table could not be removed again; it is fenced until RECOVER TABLE or a restart opens it",
                 {{"table", request.name}, {"error", undo_error.what()}});
-            std::unique_lock lock(tables_mutex_);
-            fenced_.insert(PrepareFence(nullptr, request.name, kFenceRestore));
         }
+        LogMessage(LogLevel::kError, LogComponent::kStore, "restored table could not be made durable or opened",
+            {{"table", request.name}, {"error", e.what()}});
         throw;
     }
-    Geometry geometry = store->geometry();
-    auto table = std::shared_ptr<Table>(new Table(request.name, target, result.epoch, std::move(geometry), options,
-        std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     {
         std::unique_lock lock(tables_mutex_);
-        tables_.emplace(request.name, std::move(table));
+        tables_.insert(std::move(entry));
     }
     LogMessage(LogLevel::kInfo, LogComponent::kStore, "table restored",
         {{"table", request.name}, {"store_id", StoreIdHex(result.epoch)}, {"parent_epoch", StoreIdHex(result.parent_epoch)},
@@ -362,6 +373,8 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         if (failure) std::rethrow_exception(failure);
         throw std::runtime_error("SWAP TABLES needs an atomic directory exchange, which was refused: " + exchanged.message());
     }
+    // Each fence reserves the epoch now on disk under its name.
+    std::swap(fences[0].mapped().epoch, fences[1].mapped().epoch);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE");
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SYNC_FAIL_ONCE"))
@@ -525,6 +538,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
             {{"table", from}, {"name", to}, {"error", error.what()}});
         table->ended_.store(kWatchRenamed, std::memory_order_release);
         old_fence.mapped().reason = kFenceRenameUnknown;
+        old_fence.mapped().epoch.reset();
         {
             std::unique_lock lock(tables_mutex_);
             // A node insert does not allocate.

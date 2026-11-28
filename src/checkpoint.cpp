@@ -280,7 +280,9 @@ bool ChunkStore::CheckpointChunk(
             durability_mode_ != DurabilityMode::kRelaxed ||
             barrier_durability_floor_.load(std::memory_order_acquire) || archive_enabled;
         const bool chunk_populated = ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get());
-        if (!chunk_populated) {
+        // A follower never collects on its own: its empty chunks keep an
+        // image until the primary's collection arrives through APPLY.
+        if (!chunk_populated && !follower_base_) {
             if (chunk->version != 0U) {
                 if (std::filesystem::exists(wal_path)) SyncFilePath(wal_path);
                 coordinate_index_->PublishTombstone({.kind = ChunkIndexKind::kDeleted, .coord = chunk_coord,

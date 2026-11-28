@@ -159,7 +159,8 @@ void ChunkStore::InitializeCoordinateIndex() {
             .commit_time_ms = loaded.commit_time_ms, .chunk_columns = std::move(loaded.chunk_columns)});
     }
     coordinate_index_->CompleteRecovery();
-    if (const auto highest = coordinate_index_->maximum_recovered_revision(); highest != 0U) RaiseVersionClockAbove(highest);
+    if (const auto highest = coordinate_index_->maximum_recovered_revision(); highest != 0U && !follower_base_)
+        RaiseVersionClockAbove(highest);
     coordinate_index_complete_ = true;
     std::vector<ChunkCoord>{}.swap(coordinate_startup_candidates_);
 }

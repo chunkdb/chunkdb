@@ -144,6 +144,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
             if (table) {
                 ddl = std::unique_lock(table->ddl_mutex_);
+                if (request.kind == MigrationRequest::Kind::kAlter || request.kind == MigrationRequest::Kind::kCreateSlot)
+                    table->RequireLocalDdl("MIGRATE");
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
                     // Checked before any outcome is recorded, a conditional no-op included.
                     if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
@@ -298,6 +300,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             journal.directory_action = MigrationDirectoryAction::kCreate;
             journal.operation_name = OperationName(request.table);
             journal.table_id = NewStoreId();
+            RequireUnusedEpoch(journal.table_id);
             staging = StagingDir() / journal.operation_name;
             EnsureDirectoryPathExists(StagingDir(), true);
             if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("migration stage already exists");

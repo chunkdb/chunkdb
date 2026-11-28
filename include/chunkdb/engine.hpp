@@ -399,6 +399,9 @@ class CommandEngine {
 
     EngineConfig config_;
     std::shared_ptr<TableCatalog> catalog_;
+    // APPLY's tables by epoch, checked against the catalog on each use.
+    mutable std::mutex epoch_tables_mutex_;
+    mutable std::map<StoreId, std::weak_ptr<Table>> epoch_tables_;
     std::shared_ptr<MetricsRegistry> metrics_;
     // SHOW STATUS reports the time since.
     const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
@@ -488,6 +491,9 @@ class CommandEngine {
     // Whether the session's user holds `right`; every right without auth.
     [[nodiscard]] bool HasServerRight(SessionState& session, ServerRight right) const;
     // MONITOR, or ADMIN on `*`, which includes what MONITOR allows.
+    void RequireReplication(SessionState& session) const;
+    // The table APPLY writes into: the one whose epoch the push names.
+    [[nodiscard]] std::shared_ptr<Table> TableOfEpoch(const StoreId& epoch) const;
     void RequireMonitor(SessionState& session) const;
     // CREATE TABLE: ADMIN on the name, on a prefix of it, or on `*`.
     void RequireCreateRight(SessionState& session, const std::string& table) const;

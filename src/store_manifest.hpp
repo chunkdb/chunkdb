@@ -59,6 +59,8 @@ inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
 inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
+// Types 12 and 13 are max_disk_bytes and expire_column.
+inline constexpr std::uint16_t kOptionFollower = 14;               // u64 base revision, including zero
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel};
@@ -72,6 +74,10 @@ struct StoreManifest {
     // Owned metadata is separate from mutable options, so option replacements
     // cannot erase the restore relationship. Both TLVs are absent or present.
     std::optional<TableLineage> lineage{};
+    // A follower table (docs/design/REPLICATION_APPLY.md): changed only by
+    // APPLY, with its store id the primary's epoch. The value is the base
+    // revision, below which the follower holds the primary's state.
+    std::optional<std::uint64_t> follower{};
     // Omitted only by block-only construction APIs; the encoded envelope
     // always contains its complete companion domain and shared history.
     std::optional<TableSchema> chunk_schema{};

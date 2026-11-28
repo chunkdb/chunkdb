@@ -25,6 +25,7 @@
 #include "txn_block_rows.hpp"
 #include "wal_writer.hpp"
 #include "change_feed.hpp"
+#include "feature_flags.hpp"
 #include "feed_prefix.hpp"
 #include "feed_slots.hpp"
 
@@ -367,13 +368,59 @@ std::uint64_t ChunkStore::CommitTransaction(
     TxnSnapshot& snapshot,
     const std::vector<ChunkCoord>& read_set,
     std::vector<TxnChunkWrite> writes) {
+    return CommitTransactionImpl(snapshot, read_set, std::move(writes), nullptr);
+}
+
+std::unique_lock<std::mutex> ChunkStore::LockReplicationApply() {
+    return std::unique_lock<std::mutex>(replication_apply_mutex_);
+}
+
+bool ChunkStore::ApplyReplicatedCommit(
+    std::uint64_t revision, std::uint64_t commit_time_ms, std::vector<TxnChunkWrite> writes) {
+    if (!follower_base_) throw std::logic_error("APPLY into a table that is not a follower");
+    if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
+    RequireFeature(features_, *FindFeature("feed_slots"));
+    if (revision == 0U) throw std::invalid_argument("the push's revision is out of range");
+    if (revision < version_clock_.load(std::memory_order_acquire)) return false;
+    if (writes.empty()) return ApplyReplicatedProgress(revision);
+    auto snapshot = BeginTxnSnapshot(std::chrono::hours(24));
+    const ReplicatedIdentity identity{.revision = revision, .commit_time_ms = commit_time_ms};
+    (void)CommitTransactionImpl(*snapshot, {}, std::move(writes), &identity);
+    return true;
+}
+
+bool ChunkStore::ApplyReplicatedProgress(std::uint64_t revision) {
+    if (!follower_base_) throw std::logic_error("APPLY into a table that is not a follower");
+    if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
+    RequireFeature(features_, *FindFeature("feed_slots"));
+    if (revision < version_clock_.load(std::memory_order_acquire)) return false;
+    ReserveReplicatedRevision(revision);
+    version_clock_.store(revision + 1U, std::memory_order_seq_cst);
+    return true;
+}
+
+std::uint64_t ChunkStore::CommitTransactionImpl(
+    TxnSnapshot& snapshot,
+    const std::vector<ChunkCoord>& read_set,
+    std::vector<TxnChunkWrite> writes,
+    const ReplicatedIdentity* replicated) {
     RequireOwnTxnSnapshot(snapshot);
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
+    // APPLY holds the per-store apply lock and its table lease. The lock
+    // serializes progress and commits, the lease excludes reopen, and a
+    // follower refuses local revision allocation. Cold loads validate their
+    // revisions against this clock without advancing it.
+    if (replicated != nullptr && replicated->revision < version_clock_.load(std::memory_order_seq_cst))
+        throw std::invalid_argument("the push's revision is not above the follower's revision");
 
     // Everything the caller passed is checked before any chunk is touched.
-    if (writes.size() > query_limits_.txn_max_written_chunks) {
+    // APPLY takes the primary's commit whatever this table's limit: a commit
+    // it refused would stop the follower for good.
+    const std::size_t written_limit = replicated != nullptr
+        ? std::max(writes.size(), query_limits_.txn_max_written_chunks) : query_limits_.txn_max_written_chunks;
+    if (writes.size() > written_limit) {
         throw std::invalid_argument(
             "a transaction writes at most " + std::to_string(query_limits_.txn_max_written_chunks) + " chunks");
     }
@@ -567,8 +614,10 @@ std::uint64_t ChunkStore::CommitTransaction(
         const auto& chunk = *target.chunk;
         const bool same_metadata = write.state.chunk_columns ? chunk.chunk_columns &&
             write.state.chunk_columns->bytes == chunk.chunk_columns->bytes : !chunk.chunk_columns;
-        if (write.state.payload == chunk.payload && write.state.presence_bitmap == chunk.presence_bitmap &&
-            write.state.vars == chunk.vars && same_metadata && (!write.state.written || chunk.written)) {
+        // APPLY writes every chunk of the primary's commit: each took its revision.
+        if (replicated == nullptr && write.state.payload == chunk.payload &&
+            write.state.presence_bitmap == chunk.presence_bitmap && write.state.vars == chunk.vars &&
+            same_metadata && (!write.state.written || chunk.written)) {
             continue;
         }
         // Under the locks, against the chunk the transaction read: only the
@@ -581,6 +630,8 @@ std::uint64_t ChunkStore::CommitTransaction(
     if (changes.empty()) {
         return 0;
     }
+
+    if (replicated != nullptr) ReserveReplicatedRevision(replicated->revision);
 
     // Each WAL's size becomes a durable boundary the transaction can go back
     // to.
@@ -612,14 +663,19 @@ std::uint64_t ChunkStore::CommitTransaction(
     // before the intent removal and the inline checkpoints below.
     std::optional<FeedWriteGuard> feed;
     feed.emplace(*this);
-    const std::uint64_t version = NextChunkVersion();
+    const std::uint64_t version = replicated != nullptr ? replicated->revision : NextChunkVersion();
     feed->Version(version);
     std::uint64_t commit_time_ms = 0;
-    for (const auto& change : changes) {
-        commit_time_ms = NextCommitTimeMs(*change.target->chunk);
+    if (replicated != nullptr) {
+        commit_time_ms = replicated->commit_time_ms;
+    } else {
+        for (const auto& change : changes) {
+            commit_time_ms = NextCommitTimeMs(*change.target->chunk);
+        }
     }
-    // Loaded after the version was taken, as a plain write does.
-    const bool keep_states = txn_history_->OpenCount() > 0U;
+    // Replication keeps the clock at its old position until the commit point.
+    // A snapshot can still open at that position, so reserve its history now.
+    bool keep_states = replicated != nullptr || txn_history_->OpenCount() > 0U;
 
     // Everything that allocates happens before the intent.
     TxnIntent intent{.state = TxnIntentState::kRollback, .version = version, .entries = {}};
@@ -632,7 +688,8 @@ std::uint64_t ChunkStore::CommitTransaction(
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
         feed->Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
-        WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser());
+        const auto user = replicated != nullptr ? std::optional{CurrentWriteUser()} : SlotWriteUser();
+        WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, user);
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
         AppendVarDiff(&frame, chunk.vars, state.vars);
@@ -653,9 +710,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     const auto intent_path = TxnIntentPath(data_dir_, version);
     const auto intent_dir = intent_path.parent_path();
-    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
+    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, written_limit);
     intent.state = TxnIntentState::kCommitted;
-    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
+    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, written_limit);
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.
@@ -816,6 +873,15 @@ std::uint64_t ChunkStore::CommitTransaction(
     // follows is either non-throwing or contained, as after an ordinary
     // write's commit point (FinishOrdinaryMutationLocked).
 
+    if (replicated != nullptr) {
+        // The pre-WAL check and APPLY admission keep the live clock at or
+        // below version. The producer bound stays held while a new snapshot
+        // sees this revision, and an older one counted itself before reading
+        // the clock.
+        version_clock_.store(version + 1U, std::memory_order_seq_cst);
+        keep_states = txn_history_->OpenCount() > 0U;
+    }
+
     // Memory takes the new states; the replaced ones go to the history (into
     // nodes made before the intent) for older snapshots. Moves only.
     for (auto& change : changes) {
@@ -840,7 +906,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         change.keep.coordinate.Publish(chunk.present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk.chunk_columns.get()), version);
         chunk.pending_updates += 1;
         chunk.wal_bytes += change.bytes.size();
-        if (!change.keep.node.empty()) {
+        if (keep_states) {
             TxnHistory::Fill(change.keep.node, std::move(previous));
             txn_history_->Publish(change.keep.node);
         }

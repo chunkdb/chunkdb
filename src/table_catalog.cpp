@@ -268,6 +268,7 @@ Table::Table(
       dir_(std::move(dir)),
       store_id_(store_id),
       lineage_(store->lineage()),
+      follower_(store->follower()),
       feed_buffer_bytes_(feed_buffer_bytes),
       effective_feed_buffer_bytes_(options.feed_buffer_bytes.value_or(feed_buffer_bytes)),
       feed_linger_(feed_linger),
@@ -561,6 +562,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireValidFeedSlotName(name);
     if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
+    RequireLocalDdl("CREATE SLOT");
     if (if_not_exists) {
         auto lease = Acquire();
         if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
@@ -939,7 +941,14 @@ TableInfo Table::Info() const {
         .feed_buffer_bytes = FeedBufferBytes(),
         .slot_max_bytes = slot_max_bytes_,
         .chunk_schema = geometry_.chunk_schema(),
+        .follower = follower_,
     };
+}
+
+void Table::RequireLocalDdl(std::string_view verb) const {
+    if (follower_)
+        throw TableArgumentError("follower", "table '" + name_ + "' is a follower: " + std::string(verb) +
+            " is refused; it changes only through APPLY");
 }
 
 const char* Table::FenceReason() const {
@@ -1418,12 +1427,16 @@ void TableCatalog::OpenExistingTables() {
     }
     std::sort(found.begin(), found.end());
 
-    // Every manifest is read and checked against the option flags before any
-    // table opens, so a refused start changes nothing on disk.
+    // Check the manifests for duplicate epochs and conflicting option flags
+    // before opening any table.
     std::vector<FoundTable> tables;
+    std::set<StoreId> epochs;
     std::string mismatches;
     for (const auto& [name, dir] : found) {
         tables.push_back(ReadTableToOpen(name, dir));
+        const auto& epoch = tables.back().manifest.store_id;
+        if (!epochs.insert(epoch).second)
+            throw std::runtime_error("duplicate table epoch " + StoreIdHex(epoch) + " in tables/ (table '" + name + "')");
         mismatches += OptionFlagMismatches(name, tables.back().options);
     }
     if (!mismatches.empty()) throw std::runtime_error(OptionMismatchMessage(mismatches));
@@ -1559,6 +1572,30 @@ std::shared_ptr<Table> TableCatalog::Find(std::string_view name) const {
     return it != tables_.end() ? it->second : nullptr;
 }
 
+std::shared_ptr<Table> TableCatalog::FindByEpoch(const StoreId& epoch) const {
+    std::shared_lock lock(tables_mutex_);
+    for (const auto& [_, table] : tables_)
+        if (table->store_id() == epoch) return table;
+    for (const auto& [_, fenced] : fenced_)
+        if (fenced.epoch == epoch) return fenced.table;
+    return nullptr;
+}
+
+void TableCatalog::RequireUnusedEpoch(const StoreId& epoch, std::string_view except) const {
+    std::shared_lock lock(tables_mutex_);
+    const auto matches = [&](const auto& entry, const auto& id) {
+        return entry.first != except && id == epoch;
+    };
+    const bool served = std::any_of(tables_.begin(), tables_.end(), [&](const auto& entry) {
+        return matches(entry, entry.second->store_id());
+    });
+    if (served || std::any_of(fenced_.begin(), fenced_.end(), [&](const auto& entry) {
+            return matches(entry, entry.second.epoch);
+        }))
+        throw TableArgumentError("epoch_in_use", "epoch " + StoreIdHex(epoch) +
+            " is already the epoch of a table of this server; a follower and its primary are on different servers");
+}
+
 std::vector<TableInfo> TableCatalog::List() const {
     std::vector<std::shared_ptr<Table>> tables;
     {
@@ -1631,10 +1668,12 @@ std::optional<TableFence> TableCatalog::Fence(std::string_view name) const {
     };
 }
 
-TableCatalog::FenceNode TableCatalog::PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason) {
+TableCatalog::FenceNode TableCatalog::PrepareFence(
+    std::shared_ptr<Table> table, const std::string& name, const char* reason, std::optional<StoreId> epoch) {
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE")) throw std::bad_alloc();
     std::map<std::string, Fenced, std::less<>> one;
-    one.emplace(name, Fenced{std::move(table), reason});
+    if (table) epoch = table->store_id();
+    one.emplace(name, Fenced{std::move(table), reason, epoch});
     return one.extract(one.begin());
 }
 
@@ -1716,9 +1755,16 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
     const auto dir = TablesDir() / table_name;
     // Refuse what opening would refuse while a fail-closed store still
     // serves reads.
-    if (IsDirectory(dir)) RequireRecoverableOptions(table_name, ReadOpenableManifest(dir));
+    std::optional<StoreId> epoch;
+    if (IsDirectory(dir)) {
+        const auto manifest = ReadOpenableManifest(dir);
+        RequireRecoverableOptions(table_name, manifest);
+        RequireUnusedEpoch(manifest.store_id, table_name);
+        epoch = manifest.store_id;
+    }
     // Made now, so that neither fencing again nor publishing allocates.
     auto fence = PrepareFence(table, table_name, kFenceRecovery);
+    fence.mapped().epoch = epoch;
     auto entry = PrepareServed(table_name);
     EnterStatementDecision();
     serving.Dismiss();
@@ -1837,11 +1883,18 @@ std::shared_ptr<Table> TableCatalog::Create(
     if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE " + table_name + " first");
     }
+    // One table of an epoch per data directory: APPLY finds a follower by it.
+    const auto epoch = prepared.follower_epoch ? *prepared.follower_epoch : NewStoreId();
+    RequireUnusedEpoch(epoch);
+    const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
+    if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
+    const auto features = TableScopedFeatures(directory_manifest->features);
+    if (prepared.follower_epoch) RequireFeature(features, *FindFeature("feed_slots"));
     const auto target = TablesDir() / table_name;
     // Made now, so that neither serving the table nor fencing it after a
     // failed undo allocates once it is in tables/.
     auto entry = PrepareServed(table_name);
-    auto undo_fence = PrepareFence(nullptr, table_name, kFenceCreate);
+    auto undo_fence = PrepareFence(nullptr, table_name, kFenceCreate, epoch);
 
     // Build the complete table under a private name, then publish it with
     // one rename: a crash leaves the staging directory (removed at the next
@@ -1849,14 +1902,13 @@ std::shared_ptr<Table> TableCatalog::Create(
     EnsureDirectoryPathExists(StagingDir(), /*durable_sync=*/true);
     const auto staging = StagingDir() / UniqueOperationName(table_name);
     if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("table staging directory already exists");
-    const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
-    if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
     const StoreManifest manifest{
-        .features = TableScopedFeatures(directory_manifest->features),
+        .features = features,
         .geometry = geometry,
-        .store_id = NewStoreId(),
+        .store_id = epoch,
         .options = EncodeTableOptions(options),
         .schema = table_schema,
+        .follower = prepared.follower_epoch ? std::optional<std::uint64_t>(0U) : std::nullopt,
         .chunk_schema = table_geometry.chunk_schema(),
     };
     try {
@@ -2177,6 +2229,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
+    table->RequireLocalDdl("ALTER TABLE");
     std::optional<TableSchema> changed;
     {
         // Check the store before catalog admission: another exclusive control
@@ -2270,6 +2323,7 @@ void TableCatalog::CheckColumnValues(std::string_view name, const std::function<
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
+    table->RequireLocalDdl("ALTER TABLE");
     const TableOptions options = table->Info().options;
     // 1. Every write to the column must pass the check from here on.
     RewriteManifest(

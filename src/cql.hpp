@@ -430,6 +430,8 @@ struct CompactTombstones {
     std::uint64_t before = 0U;
 };
 struct ShowTableStats { std::string table; };
+// APPLY $1: one WATCH t REPLICATION push (docs/design/REPLICATION_APPLY.md).
+struct Apply { Parameter push; };
 
 using Statement = std::variant<
     GetBlock,
@@ -475,7 +477,8 @@ using Statement = std::variant<
     Migrate,
     ShowMigrations,
     CompactTombstones,
-    ShowTableStats>;
+    ShowTableStats,
+    Apply>;
 
 struct Parsed {
     Statement statement;

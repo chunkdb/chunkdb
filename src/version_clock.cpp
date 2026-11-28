@@ -324,7 +324,19 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
     version_clock_ceiling_.store(new_ceiling, std::memory_order_release);
 }
 
+void ChunkStore::ReserveReplicatedRevision(std::uint64_t revision) {
+    // Like an ordinary reservation, the issued revision must be below the
+    // durable ceiling. Its successor can equal the ceiling but cannot wrap.
+    if (revision == std::numeric_limits<std::uint64_t>::max())
+        throw std::invalid_argument("the push's revision is out of range");
+    if (revision < version_clock_ceiling_.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(version_clock_mutex_);
+    if (revision >= version_clock_ceiling_.load(std::memory_order_acquire))
+        ExtendVersionClockCeilingLocked(revision);
+}
+
 std::uint64_t ChunkStore::NextChunkVersion() {
+    if (follower_base_) throw std::invalid_argument("a follower takes its revisions only through APPLY");
     if (access_mode_ == AccessMode::kReadOnly) {
         return NewChunkVersionToken();
     }
@@ -404,6 +416,19 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     while (current < next &&
            !version_clock_.compare_exchange_weak(current, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
     }
+}
+
+void ChunkStore::StartFollowerClock() {
+    if (!follower_base_ || access_mode_ == AccessMode::kReadOnly) return;
+    // A follower takes its versions from the primary: its revision is the
+    // highest one its data holds (every applied commit, collection and
+    // compaction left one in the coordinate index) or its base. Progress
+    // applied before the start is not kept. The clock may start below its
+    // persisted ceiling, which only bounds tokens; the directory's version
+    // floor does not apply.
+    const std::uint64_t position = std::max(*follower_base_, coordinate_index_->maximum_recovered_revision());
+    ReserveReplicatedRevision(position);
+    version_clock_.store(position + 1U, std::memory_order_seq_cst);
 }
 
 std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y) {

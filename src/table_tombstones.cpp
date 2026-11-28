@@ -26,6 +26,7 @@ std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
+    table->RequireLocalDdl("COMPACT TOMBSTONES");
     const auto options = table->Info().options;
     auto fence = PrepareFence(table, table->name_, "tombstone compaction could not reopen it");
     auto store = table->BeginExclusive();

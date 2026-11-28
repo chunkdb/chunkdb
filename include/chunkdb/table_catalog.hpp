@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -150,6 +151,8 @@ struct TableInfo {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     TableSchema chunk_schema{};
+    // A follower table (docs/design/REPLICATION_APPLY.md).
+    bool follower = false;
 };
 
 struct CatalogTableStatus {
@@ -173,6 +176,18 @@ struct TableDefinition {
     TableOptions options;
     std::optional<TableSchema> schema;
     std::optional<TableSchema> chunk_schema{};
+    // A follower of this epoch at revision 0 (docs/design/REPLICATION_APPLY.md).
+    std::optional<StoreId> follower_epoch{};
+};
+
+// A table refused for a reason a client can test: INVALID_ARGUMENT reason=...
+class TableArgumentError : public std::invalid_argument {
+  public:
+    TableArgumentError(std::string reason, const std::string& message)
+        : std::invalid_argument(message), reason_(std::move(reason)) {}
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+  private:
+    std::string reason_;
 };
 
 // RESTORE TABLE (docs/design/RESTORE_TABLE.md).
@@ -240,6 +255,12 @@ class Table : public std::enable_shared_from_this<Table> {
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    // A follower table (docs/design/REPLICATION_APPLY.md), fixed when the
+    // table opens: APPLY alone changes its data, schema, tombstones and slots.
+    [[nodiscard]] bool follower() const noexcept { return follower_; }
+    // Throws TableArgumentError reason=follower for a follower; DDL calls it
+    // under ddl_mutex_.
+    void RequireLocalDdl(std::string_view verb) const;
     [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
     // Changes when the table's columns change.
     [[nodiscard]] Geometry geometry() const;
@@ -380,6 +401,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::filesystem::path dir_;
     const StoreId store_id_;
     const std::optional<TableLineage> lineage_;
+    const bool follower_;
     const std::size_t feed_buffer_bytes_;
     std::atomic<std::size_t> effective_feed_buffer_bytes_;
     const std::chrono::milliseconds feed_linger_;
@@ -472,6 +494,8 @@ class TableCatalog {
 
     // nullptr when there is no such table.
     [[nodiscard]] std::shared_ptr<Table> Find(std::string_view name) const;
+    // The serving table whose epoch (store id) is `epoch`, or null.
+    [[nodiscard]] std::shared_ptr<Table> FindByEpoch(const StoreId& epoch) const;
     // Captures one common directory boundary before the first transaction
     // statement. Callers hold no table lease; later reads use these original
     // snapshots even when they first touch a table in a later statement.
@@ -695,10 +719,16 @@ class TableCatalog {
         // nullptr for a table that never served.
         std::shared_ptr<Table> table;
         const char* reason = nullptr;
+        // The epoch on disk under this name, which can differ from table
+        // after a swap. A rename can leave a fence with no directory.
+        std::optional<StoreId> epoch{};
     };
     using FenceNode = std::map<std::string, Fenced, std::less<>>::node_type;
     // Made before the step that may fail, so that fencing does not allocate.
-    [[nodiscard]] static FenceNode PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason);
+    [[nodiscard]] static FenceNode PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason,
+        std::optional<StoreId> epoch = std::nullopt);
+    // Called under catalog operations admission, before publishing a table.
+    void RequireUnusedEpoch(const StoreId& epoch, std::string_view except = {}) const;
     // RetireTable, with the table's name fenced until RecoverTable.
     void FenceTable(Table& table, const TableOptions& options, FenceNode fence);
     void ThrowIfFenced(std::string_view name) const;
