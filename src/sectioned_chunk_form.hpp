@@ -77,6 +77,20 @@ enum class ChunkFormReadMode { kRead, kMutation };
     const ChunkFormHeader& header, std::span<const ChunkFormSection> sections,
     std::size_t max_bytes);
 
+// A section of a form whose body the caller writes in place.
+struct ChunkFormSectionLength {
+    std::uint16_t kind = 0;
+    std::size_t length = 0;
+};
+
+// Checks the sections as SerializeChunkFormSections does, reserves the whole
+// form in `out` and appends its header and directory. The caller then
+// appends every body in directory order, each copied once. Returns the form's
+// size.
+std::size_t AppendChunkFormHead(
+    std::vector<std::uint8_t>* out, const ChunkFormHeader& header,
+    std::span<const ChunkFormSectionLength> sections, std::size_t max_bytes);
+
 // Validate presence, descriptors, array widths/padding and complete coverage of
 // fixed/validity bodies without guessing column types. A typed codec must also
 // match IDs, widths and nullability against the applicable schema/projection.

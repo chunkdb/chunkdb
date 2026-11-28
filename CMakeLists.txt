@@ -1017,7 +1017,9 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
     target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)
-    target_include_directories(chunkdb_server_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(chunkdb_server_bench_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/bench)
     if(WIN32)
         target_link_libraries(chunkdb_server_bench_test PRIVATE ws2_32)
     endif()
