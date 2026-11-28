@@ -38,6 +38,7 @@
 #include "feature_flags.hpp"
 #include "backup.hpp"
 #include "catalog_feed.hpp"
+#include "crypto.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
 #include "store_manifest.hpp"
@@ -742,7 +743,7 @@ void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
         [&](const cql::SwapTables& swap) -> std::optional<CatalogScope> { return tables({swap.first, swap.second}); },
         [&](const cql::CreateSlot& create) -> std::optional<CatalogScope> { return tables({create.table}); },
         [&](const cql::DropSlot& drop) -> std::optional<CatalogScope> { return tables({drop.table}); },
-        // An attach can record the slot's owner.
+        // An attach can record the slot's first owner.
         [&](const cql::Watch& watch) -> std::optional<CatalogScope> {
             if (!watch.slot) return std::nullopt;
             return tables({watch.table});
@@ -1295,6 +1296,32 @@ CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
     return state;
 }
 
+std::array<std::uint8_t, 16> CommandEngine::CatalogDigest() const {
+    crypto::Sha256 hash;
+    // These defaults appear in the records of tables with no explicit limit.
+    const std::array limits{static_cast<std::uint64_t>(catalog_->feed_buffer_bytes()),
+                           static_cast<std::uint64_t>(catalog_->slot_max_bytes())};
+    for (auto limit : limits) {
+        std::array<std::uint8_t, 8> bytes{};
+        for (auto& byte : bytes) {
+            byte = static_cast<std::uint8_t>(limit);
+            limit >>= 8U;
+        }
+        hash.Update(bytes);
+    }
+    if (config_.users) {
+        for (const auto& [name, user] : config_.users->Snapshot().users) {
+            std::string record;
+            AppendUserMap(record, name, user);
+            hash.Update(std::string_view(record));
+        }
+    }
+    const auto full = hash.Finish();
+    std::array<std::uint8_t, 16> digest{};
+    std::copy_n(full.begin(), digest.size(), digest.begin());
+    return digest;
+}
+
 Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string_view name) const {
     const auto not_found = [name] {
         return TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1532,12 +1559,26 @@ std::string CommandEngine::ExecuteStatement(
             std::optional<CatalogScope> scope;
             std::string_view user;
             const std::atomic<CommandEngineTestHook*>& hook;
+            bool marked = false;
+            bool decided = false;
             ~CatalogRefresh() {
-                if (!scope) return;
-                if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
-                feed.Refresh(*scope, user);
+                if (!marked) return;
+                if (decided) {
+                    if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
+                }
+                feed.Refresh(*scope, user, decided);
             }
-        } catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_};
+        };
+        CatalogRefresh catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_};
+        // Mark before admitting the decision. A stop accepted during admission
+        // releases the mark without taking a statement revision.
+        std::optional<ScopedDecisionHook> catalog_mark;
+        if (catalog_refresh.scope) catalog_mark.emplace([this, &catalog_refresh] {
+            if (catalog_refresh.marked) return;
+            catalog_feed_->Begin();
+            catalog_refresh.marked = true;
+            if (auto* test = hook_.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kAfterCatalogMark, {});
+        }, catalog_refresh.decided);
         return std::visit(
             Overloaded{
                 [&](const cql::ShowConnections&) {
@@ -1709,7 +1750,7 @@ std::string CommandEngine::ExecuteStatement(
                                 session.user_incarnation, std::string{}, session.user_generation);
                             session.watch_right->RequireCatalog(users);
                         }
-                        session.catalog_watch = catalog_feed_->Subscribe(users, session.watch_options.notify);
+                        session.catalog_watch = catalog_feed_->Subscribe(users, session.watch_options.notify, watch.after);
                         // Catalog watches share one output budget, apart from every table's watches.
                         session.table.reset();
                         std::string reply;

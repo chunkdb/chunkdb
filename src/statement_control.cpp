@@ -3,9 +3,12 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/statement_mutex.hpp"
 
+#include <utility>
+
 namespace chunkdb {
 namespace {
 thread_local StatementControl* current_statement = nullptr;
+thread_local ScopedDecisionHook* decision_hook = nullptr;
 
 const char* StopMessage(StatementStopReason reason) {
     switch (reason) {
@@ -180,7 +183,17 @@ ScopedStatementControl::ScopedStatementControl(StatementControl* current) noexce
     : previous_(current_statement) { current_statement = current; }
 ScopedStatementControl::~ScopedStatementControl() { current_statement = previous_; }
 void CheckStatementCancellation() { if (current_statement) current_statement->Check(); }
-void EnterStatementDecision() { if (current_statement) current_statement->EnterDecision(); }
+void EnterStatementDecision() {
+    // First, while a stop can still be accepted: a statement whose hook fails
+    // is stopped or fails before the decision, never refused as too late.
+    auto* const hook = decision_hook;
+    if (hook != nullptr && hook->hook_) hook->hook_();
+    if (current_statement) current_statement->EnterDecision();
+    if (hook != nullptr) hook->entered_ = true;
+}
+ScopedDecisionHook::ScopedDecisionHook(std::function<void()> hook, bool& entered) noexcept
+    : hook_(std::move(hook)), entered_(entered), previous_(std::exchange(decision_hook, this)) {}
+ScopedDecisionHook::~ScopedDecisionHook() { decision_hook = previous_; }
 void ReportStatementProgress(const StatementProgress& progress) {
     if (current_statement) current_statement->ReportProgress(progress);
 }

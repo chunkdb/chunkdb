@@ -469,6 +469,25 @@ class Parser {
         return Take().text;
     }
 
+    // The `epoch revision` after AFTER: 32 hex digits, read as text so that a
+    // leading digit is not lexed as a number, then an unsigned revision.
+    [[nodiscard]] FeedPosition AfterPosition() {
+        // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
+        while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
+        const auto start = at_;
+        while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
+        const auto hex = line_.substr(start, at_ - start);
+        if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
+            return std::isxdigit(c) != 0;
+        })) Fail(start + 1U, "epoch must be 32 hex digits");
+        FeedPosition position;
+        const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
+        for (std::size_t i = 0; i < position.epoch.size(); ++i)
+            position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
+        position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+        return position;
+    }
+
     [[nodiscard]] std::string SlotName() {
         const Token& token = Peek();
         if (token.kind != TokenKind::kText) {
@@ -1504,6 +1523,7 @@ class Parser {
             // CATALOG is a keyword here: a table named catalog cannot be watched.
             if (Accept("catalog")) {
                 watch.catalog = true;
+                if (Accept("after")) watch.after = AfterPosition();
                 return watch;
             }
             watch.table = Name("a table name");
@@ -1523,20 +1543,7 @@ class Parser {
                     if (*watch.ack_timeout_ms == 0U) Fail(column, "ACK TIMEOUT must be positive");
                 } else if (Accept("after")) {
                     if (watch.after) Fail(column, "AFTER is given twice");
-                    // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
-                    while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
-                    const auto start = at_;
-                    while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
-                    const auto hex = line_.substr(start, at_ - start);
-                    if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
-                        return std::isxdigit(c) != 0;
-                    })) Fail(start + 1U, "epoch must be 32 hex digits");
-                    FeedPosition position;
-                    const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
-                    for (std::size_t i = 0; i < position.epoch.size(); ++i)
-                        position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
-                    position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
-                    watch.after = position;
+                    watch.after = AfterPosition();
                 } else break;
             }
             if (watch.ack_timeout_ms && !watch.slot) Fail(1, "ACK TIMEOUT requires SLOT");

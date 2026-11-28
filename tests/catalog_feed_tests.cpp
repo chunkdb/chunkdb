@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <cassert>
+#include <cstdlib>
+#include <functional>
 #include <cstddef>
 #include <map>
 #include <set>
@@ -127,10 +131,13 @@ struct FakeCatalog {
     std::set<std::string, std::less<>> unknown;
     std::size_t reads = 0U;
     bool fail = false;
+    // Runs inside a whole-catalog read, as a statement running meanwhile would.
+    std::function<void()> during_whole_read;
 
     CatalogState Read(const CatalogScope& scope) {
         ++reads;
         if (fail) throw std::runtime_error("catalog read failed");
+        if (scope.all_tables && during_whole_read) during_whole_read();
         CatalogState state;
         state.unknown_tables = unknown;
         state.unknown_slots = unknown;
@@ -154,7 +161,8 @@ struct FakeCatalog {
 };
 
 std::shared_ptr<CatalogFeed> MakeFeed(FakeCatalog& catalog, std::size_t buffer_bytes = 1U << 20U) {
-    return std::make_shared<CatalogFeed>([&catalog](const CatalogScope& scope) { return catalog.Read(scope); }, buffer_bytes);
+    return std::make_shared<CatalogFeed>([&catalog](const CatalogScope& scope) { return catalog.Read(scope); }, buffer_bytes,
+        std::make_unique<CatalogClock>(std::filesystem::path{}, CatalogClock::Mode::kMemory));
 }
 
 std::string NextBytes(CatalogSubscription& subscription) {
@@ -163,22 +171,43 @@ std::string NextBytes(CatalogSubscription& subscription) {
     return *frame->bytes;
 }
 
+// A statement that can change the catalog: marked, then refreshed.
+void Change(CatalogFeed& feed, const CatalogScope& scope, std::string_view user) {
+    feed.Begin();
+    feed.Refresh(scope, user);
+}
+
+// The revision of a progress push.
+std::uint64_t ProgressRevision(const std::string& bytes) {
+    const auto reply = Parse(bytes);
+    assert(reply.type == '>' && reply.items.size() == 3U && reply.items[0].value == "progress");
+    return std::stoull(reply.items[2].value);
+}
+
+// The next catalog push, after any progress.
+std::string NextPushBytes(CatalogSubscription& subscription) {
+    for (;;) {
+        auto bytes = NextBytes(subscription);
+        if (Parse(bytes).items.at(0).value != "progress") return bytes;
+    }
+}
+
 void TestNoSubscriberReadsNothing() {
     FakeCatalog catalog;
     catalog.SetTable("t", "one");
     auto feed = MakeFeed(catalog);
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(catalog.reads == 0U);
     {
         auto watch = feed->Subscribe(true, {});
         assert(catalog.reads == 1U);
     }
     // The last watch left: nothing is read again until the next one.
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(catalog.reads == 1U);
     auto watch = feed->Subscribe(true, {});
     assert(catalog.reads == 2U);
-    // Each read of the whole catalog takes a new revision.
+    // Every statement took a revision, watched or not.
     assert(watch->revision() == 2U);
     const auto whole = CatalogPush(NextBytes(*watch));
     assert(whole.revision == 2U);
@@ -193,9 +222,9 @@ void TestWholeCatalogThenChanges() {
     auto feed = MakeFeed(catalog);
     std::size_t notified = 0U;
     auto watch = feed->Subscribe(true, [&] { ++notified; });
-    assert(watch->revision() == 1U);
+    assert(watch->revision() == 0U);
     const auto whole = CatalogPush(NextBytes(*watch));
-    assert(whole.revision == 1U && whole.user_null);
+    assert(whole.revision == 0U && whole.user_null);
     assert(Render(whole.events) == "table create t . one|table create x . x1|user create u . user|slot create s t owner u");
     assert(!watch->Next());
 
@@ -204,21 +233,23 @@ void TestWholeCatalogThenChanges() {
     catalog.records.erase(UserKey("u"));
     // Outside the scope: published only by a statement on x.
     catalog.SetTable("x", "x2");
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(notified == 1U);
     const auto change = CatalogPush(NextBytes(*watch));
-    assert(change.epoch == whole.epoch && change.revision == 2U && !change.user_null && change.user == "admin");
+    assert(change.epoch == whole.epoch && change.revision == 1U && !change.user_null && change.user == "admin");
     assert(Render(change.events) == "user drop u . .|table alter t . two|slot create s2 t owner u");
     assert(!watch->Next());
 
-    // Nothing changed: no push and no revision.
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
-    assert(!watch->Next() && notified == 1U);
+    // Nothing changed: the revision reaches the watch as progress.
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    assert(notified == 2U);
+    assert(ProgressRevision(NextBytes(*watch)) == 2U);
+    assert(!watch->Next());
 
     catalog.records.erase(TableKey("t"));
     catalog.records.erase(SlotKey("t", "s"));
     catalog.records.erase(SlotKey("t", "s2"));
-    feed->Refresh(CatalogScope{.tables = {}, .all_tables = true}, {});
+    Change(*feed, CatalogScope{.tables = {}, .all_tables = true}, {});
     const auto dropped = CatalogPush(NextBytes(*watch));
     assert(dropped.revision == 3U && dropped.user_null);
     assert(Render(dropped.events) == "table drop t . .|slot drop s t .|slot drop s2 t .|table alter x . x2");
@@ -246,19 +277,21 @@ void TestUsersHiddenWithoutManagesUsers() {
     // A user change and a new slot owner: only the full watch sees them.
     catalog.SetUser("u", "user2");
     catalog.SetSlot("t", "s", "v");
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto seen = CatalogPush(NextBytes(*full));
     assert(!seen.user_null && seen.user == "admin");
     assert(Render(seen.events) == "user alter u . user2|slot alter s t owner v");
+    // The limited watch only learns that its catalog stays as it was.
+    assert(ProgressRevision(NextBytes(*limited)) == seen.revision);
     assert(!limited->Next());
 
     catalog.SetTable("t", "two");
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto table = CatalogPush(NextBytes(*limited));
     // Who ran the statement is user information too.
-    assert(table.revision == 3U && table.user_null);
+    assert(table.revision == 2U && table.user_null);
     assert(Render(table.events) == "table alter t . two");
-    assert(CatalogPush(NextBytes(*full)).revision == 3U);
+    assert(CatalogPush(NextBytes(*full)).revision == 2U);
 }
 
 void TestUnknownTableKeepsRecords() {
@@ -270,17 +303,18 @@ void TestUnknownTableKeepsRecords() {
     (void)NextBytes(*watch);
     // A fenced table that never served cannot be read: it is not dropped.
     catalog.unknown.insert("t");
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    assert(ProgressRevision(NextBytes(*watch)) == 1U);
     assert(!watch->Next());
     // The next refresh reads it again, whatever it is for.
     catalog.unknown.clear();
     catalog.SetTable("t", "two");
     catalog.SetUser("v", "user");
-    feed->Refresh(CatalogScope{.tables = {}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {}, .all_tables = false}, "admin");
     const auto retried = CatalogPush(NextBytes(*watch));
     assert(Render(retried.events) == "table alter t . two|user create v . user");
     catalog.records.erase(TableKey("t"));
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto dropped = CatalogPush(NextBytes(*watch));
     assert(Render(dropped.events) == "table drop t . .");
 }
@@ -293,15 +327,15 @@ void TestOverflowSendsResyncAndWholeCatalog() {
     auto watch = feed->Subscribe(true, {});
     const auto whole = CatalogPush(NextBytes(*watch));
     catalog.SetTable("t", "two");
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     catalog.SetTable("u", "three");
-    feed->Refresh(CatalogScope{.tables = {"u"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"u"}, .all_tables = false}, "admin");
     const auto resync = Parse(NextBytes(*watch));
     assert(resync.type == '>' && resync.items.size() == 5U && resync.items[0].value == "resync");
-    assert(resync.items[1].value == whole.epoch && resync.items[2].value == "3");
+    assert(resync.items[1].value == whole.epoch && resync.items[2].value == "2");
     assert(resync.items[3].type == '_' && resync.items[4].type == '_');
     const auto again = CatalogPush(NextBytes(*watch));
-    assert(again.revision == 3U && again.user_null);
+    assert(again.revision == 2U && again.user_null);
     assert(Render(again.events) == "table create t . two|table create u . three");
     assert(!watch->Next());
 }
@@ -314,7 +348,7 @@ void TestFailureEndsWatches() {
     auto watch = feed->Subscribe(true, [&] { ++notified; });
     (void)NextBytes(*watch);
     catalog.fail = true;
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(notified == 1U);
     const auto end = watch->Next();
     assert(end && end->close && end->bytes->starts_with("-ERR INTERNAL "));
@@ -328,7 +362,7 @@ void TestFailureEndsWatches() {
     const auto whole = CatalogPush(NextBytes(*fresh));
     assert(Render(whole.events) == "table create t . two");
     catalog.SetTable("t", "three");
-    feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(CatalogPush(NextBytes(*fresh)).events.size() == 1U);
     assert(!watch->Next());
 }
@@ -367,37 +401,50 @@ bool HasEvent(const Push& push, std::string_view kind, std::string_view action, 
     });
 }
 
-// Stops the statement that runs as the catalog refresh starts.
-struct StopBeforeRefresh final : CommandEngineTestHook {
-    StatementControl* control = nullptr;
-    void Run(Point point, std::string_view) override {
-        if (point == Point::kBeforeCatalogRefresh && control != nullptr) (void)control->RequestStop(StatementStopReason::kCancelled);
-    }
-};
-
-void TestCancelledStatementKeepsWatch() {
+void TestRefusedStatementTakesNoRevision() {
     EngineFixture fixture;
     auto watcher = fixture.Watcher();
     const auto whole = CatalogPush(NextBytes(*watcher->catalog_watch));
     assert(HasEvent(whole, "table", "create", "default"));
+    const auto recorded = *ReadCatalogRevision(fixture.dir.path());
     auto ddl = fixture.Session();
-    StopBeforeRefresh hook;
-    fixture.engine->SetHookForTests(&hook);
-    StatementControl control(StatementControl::Clock::now(), 0U);
-    assert(control.Start());
-    hook.control = &control;
-    {
-        // A statement that fails before its decision, then is cancelled
-        // while the refresh reads the table it named.
-        const ScopedStatementControl scope(&control);
-        assert(fixture.Run(*ddl, "ALTER TABLE default DROP COLUMN nosuch").starts_with("-ERR "));
-    }
-    hook.control = nullptr;
-    fixture.engine->SetHookForTests(nullptr);
+    // Refused before its decision: no mark, no revision, nothing to watch.
+    assert(fixture.Run(*ddl, "ALTER TABLE default DROP COLUMN nosuch").starts_with("-ERR "));
     assert(!watcher->catalog_watch->Next());
-    assert(fixture.Run(*ddl, "CREATE TABLE after_stop (n u8) CHUNK 4 x 4") == "+OK\r\n");
+    assert(*ReadCatalogRevision(fixture.dir.path()) == recorded);
+    assert(fixture.Run(*ddl, "CREATE TABLE after_refusal (n u8) CHUNK 4 x 4") == "+OK\r\n");
     const auto created = CatalogPush(NextBytes(*watcher->catalog_watch));
-    assert(created.revision == whole.revision + 1U && HasEvent(created, "table", "create", "after_stop"));
+    assert(created.revision == whole.revision + 1U);
+    assert(HasEvent(created, "table", "create", "after_refusal"));
+}
+
+void TestCancelAfterCatalogMark() {
+    EngineFixture fixture;
+    auto watcher = fixture.Watcher();
+    const auto whole = CatalogPush(NextBytes(*watcher->catalog_watch));
+    const auto recorded = *ReadCatalogRevision(fixture.dir.path());
+    auto ddl = fixture.Session();
+    StatementControl control(StatementControl::Clock::time_point{}, 0U);
+    assert(control.Start());
+    struct CancelAtMark final : CommandEngineTestHook {
+        explicit CancelAtMark(StatementControl& control) : control(control) {}
+        void Run(Point point, std::string_view) override {
+            if (point == Point::kAfterCatalogMark) assert(control.RequestStop(StatementStopReason::kCancelled));
+        }
+        StatementControl& control;
+    } hook(control);
+    fixture.engine->SetHookForTests(&hook);
+    {
+        const ScopedStatementControl statement(&control);
+        assert(fixture.Run(*ddl, "CREATE TABLE cancelled_t (n u8) CHUNK 4 x 4").starts_with("-ERR CANCELLED "));
+    }
+    fixture.engine->SetHookForTests(nullptr);
+    assert(!fixture.catalog->Find("cancelled_t"));
+    assert(!watcher->catalog_watch->Next());
+    assert(*ReadCatalogRevision(fixture.dir.path()) == recorded);
+    assert(fixture.Run(*ddl, "CREATE TABLE next_t (n u8) CHUNK 4 x 4") == "+OK\r\n");
+    const auto created = CatalogPush(NextBytes(*watcher->catalog_watch));
+    assert(created.revision == whole.revision + 1U && HasEvent(created, "table", "create", "next_t"));
 }
 
 struct FeedCleanupFailure final : FeedTestHook {
@@ -430,11 +477,11 @@ void TestTableNeedingRecoveryKeepsWatch() {
     assert(!watcher->catalog_watch->Next());
     // A new watch reads the whole catalog, the table included.
     auto late = fixture.Watcher();
-    const auto whole = CatalogPush(NextBytes(*late->catalog_watch));
+    const auto whole = CatalogPush(NextPushBytes(*late->catalog_watch));
     assert(HasEvent(whole, "table", "create", "realm") && HasEvent(whole, "table", "create", "default"));
     assert(fixture.Run(*session, "CREATE TABLE later (n u8) CHUNK 2 x 2") == "+OK\r\n");
-    assert(HasEvent(CatalogPush(NextBytes(*watcher->catalog_watch)), "table", "create", "later"));
-    assert(HasEvent(CatalogPush(NextBytes(*late->catalog_watch)), "table", "create", "later"));
+    assert(HasEvent(CatalogPush(NextPushBytes(*watcher->catalog_watch)), "table", "create", "later"));
+    assert(HasEvent(CatalogPush(NextPushBytes(*late->catalog_watch)), "table", "create", "later"));
 }
 
 void TestConcurrentStatements() {
@@ -444,8 +491,8 @@ void TestConcurrentStatements() {
     std::map<std::string, std::string> tables;
     std::uint64_t revision = first.revision;
     const auto apply = [&](const Push& push) {
-        // Every event moves from the state of the previous one.
-        assert(push.revision == revision + 1U);
+        // Every event moves from the state of the previous one, in revision order.
+        assert(push.revision > revision);
         revision = push.revision;
         for (const auto& event : push.events) {
             assert(event.kind == "table");
@@ -472,6 +519,8 @@ void TestConcurrentStatements() {
     for (auto& thread : threads) thread.join();
     while (auto frame = watcher->catalog_watch->Next()) {
         assert(!frame->close);
+        // A statement whose change an earlier event carried sends progress.
+        if (Parse(*frame->bytes).items.at(0).value == "progress") continue;
         apply(CatalogPush(*frame->bytes));
     }
     std::set<std::string> listed;
@@ -489,11 +538,11 @@ void TestRenameAndSwap() {
     auto watcher = fixture.Watcher();
     (void)NextBytes(*watcher->catalog_watch);
     assert(fixture.Run(*session, "ALTER TABLE a RENAME TO c") == "+OK\r\n");
-    const auto renamed = CatalogPush(NextBytes(*watcher->catalog_watch));
+    const auto renamed = CatalogPush(NextPushBytes(*watcher->catalog_watch));
     assert(renamed.events.size() == 2U && HasEvent(renamed, "table", "drop", "a") && HasEvent(renamed, "table", "create", "c"));
 #ifndef _WIN32
     assert(fixture.Run(*session, "SWAP TABLES b, c") == "+OK\r\n");
-    const auto swapped = CatalogPush(NextBytes(*watcher->catalog_watch));
+    const auto swapped = CatalogPush(NextPushBytes(*watcher->catalog_watch));
     assert(swapped.events.size() == 2U && HasEvent(swapped, "table", "alter", "b") && HasEvent(swapped, "table", "alter", "c"));
 #endif
 }
@@ -524,6 +573,350 @@ void TestSecondWatchRefused() {
     assert(fixture.Run(*table, "WATCH CATALOG").starts_with("-ERR INVALID_ARGUMENT") && !table->catalog_watch);
 }
 
+FeedPosition At(const StoreId& epoch, std::uint64_t revision) { return FeedPosition{.epoch = epoch, .revision = revision}; }
+
+bool IsResync(const std::string& bytes) { return Parse(bytes).items.at(0).value == "resync"; }
+
+void TestResumeAfter() {
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    auto feed = MakeFeed(catalog);
+    // Keeps the history: it reads nothing after the whole catalog.
+    auto keeper = feed->Subscribe(true, {});
+    (void)NextBytes(*keeper);
+    catalog.SetTable("t", "two");
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    const auto epoch = feed->epoch();
+    // At a revision the history covers: only the later changes.
+    auto behind = feed->Subscribe(true, {}, At(epoch, 0U));
+    assert(behind->revision() == 0U);
+    const auto change = CatalogPush(NextBytes(*behind));
+    assert(change.revision == 1U);
+    assert(Render(change.events) == "table alter t . two");
+    assert(!behind->Next());
+    // At the current revision: nothing until the next change.
+    auto current = feed->Subscribe(true, {}, At(epoch, 1U));
+    assert(current->revision() == 1U);
+    assert(!current->Next());
+    // Another epoch, or a revision ahead: resync, then the whole catalog.
+    auto other = feed->Subscribe(true, {}, At(StoreId{1}, 1U));
+    assert(IsResync(NextBytes(*other)));
+    assert(CatalogPush(NextBytes(*other)).revision == 1U);
+    auto ahead = feed->Subscribe(true, {}, At(epoch, 9U));
+    assert(IsResync(NextBytes(*ahead)));
+    assert(Render(CatalogPush(NextBytes(*ahead)).events) == "table create t . two");
+}
+
+void TestProgressCoalesces() {
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    auto feed = MakeFeed(catalog);
+    auto watch = feed->Subscribe(true, {});
+    (void)NextBytes(*watch);
+    const CatalogScope scope{.tables = {"t"}, .all_tables = false};
+    Change(*feed, scope, "admin");
+    Change(*feed, scope, "admin");
+    assert(ProgressRevision(NextBytes(*watch)) == 2U);
+    assert(!watch->Next());
+
+    Change(*feed, scope, "admin");
+    catalog.SetTable("t", "two");
+    Change(*feed, scope, "admin");
+    const auto changed = CatalogPush(NextBytes(*watch));
+    assert(changed.revision == 4U && Render(changed.events) == "table alter t . two");
+    assert(!watch->Next());
+}
+
+void TestDurableClock() {
+    test::ScopedTempDir dir("chunkdb-catalog-clock");
+    StoreId epoch{};
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        epoch = clock.epoch();
+        assert(clock.revision() == 0U);
+        // A start writes nothing: the first mark creates the record.
+        assert(!ReadCatalogRevision(dir.path()).has_value());
+        clock.Begin();
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        assert(clock.End() == 1U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 1U}));
+        // A read while a statement runs takes a new revision, still marked.
+        clock.Begin();
+        assert(clock.Snapshot() == 2U);
+        assert(ReadCatalogRevision(dir.path())->revision == 2U);
+        clock.Begin();
+        assert(clock.End() == 3U);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        // Stopped while a statement runs, as a crash stops it.
+    }
+    {
+        // The catalog may have changed after revision 3: the start takes 4.
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() == epoch && clock.revision() == 4U);
+        // The record is still marked: a read takes a new revision and records it.
+        assert(clock.Snapshot() == 5U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 5U}));
+        // Unmarked now: a read keeps it.
+        assert(clock.Snapshot() == 5U);
+    }
+    {
+        // Unchanged after a clean stop.
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() == epoch && clock.revision() == 5U);
+    }
+    {
+        // Several writers: the record stays marked, and the next start moves on.
+        CatalogClock shared(dir.path(), CatalogClock::Mode::kShared);
+        shared.Begin();
+        (void)shared.End();
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = true}));
+    }
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() == epoch && clock.revision() == 6U);
+    }
+    // A damaged record starts a new epoch.
+    auto bytes = EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch, .revision = 5U});
+    bytes[30] ^= 1U;
+    {
+        std::ofstream out(dir.path() / std::string(kCatalogRevisionFileName), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    bool refused = false;
+    try { (void)DecodeCatalogRevision(bytes); } catch (const std::runtime_error&) { refused = true; }
+    assert(refused);
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() != epoch && clock.revision() == 0U);
+    }
+    // A missing record starts a new epoch as well.
+    std::filesystem::remove(dir.path() / std::string(kCatalogRevisionFileName));
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() != epoch);
+        (void)clock.Snapshot();
+        assert(ReadCatalogRevision(dir.path())->epoch == clock.epoch());
+    }
+}
+
+void TestCancelKeepsNeededMark() {
+    test::ScopedTempDir dir("chunkdb-catalog-cancel-mark");
+    CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+    clock.Begin();
+    clock.Begin();
+    assert(clock.End() == 1U);
+    assert(ReadCatalogRevision(dir.path())->in_progress);
+    // The remaining statement was stopped before applying, so the committed
+    // revision stands and its mark clears.
+    assert(clock.End(false) == 1U);
+    const auto settled = *ReadCatalogRevision(dir.path());
+    assert(settled.revision == 1U && !settled.in_progress);
+
+    clock.Begin();
+    clock.Begin();
+    assert(clock.End(false) == 1U);
+    assert(ReadCatalogRevision(dir.path())->in_progress);
+    clock.Hold(true);
+    assert(clock.End(false) == 1U);
+    assert(ReadCatalogRevision(dir.path())->in_progress);
+}
+
+void TestDurableResume() {
+    test::ScopedTempDir dir("chunkdb-catalog-resume");
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    const auto feed_at = [&] {
+        return std::make_shared<CatalogFeed>([&catalog](const CatalogScope& scope) { return catalog.Read(scope); }, 1U << 20U,
+            std::make_unique<CatalogClock>(dir.path(), CatalogClock::Mode::kDurable));
+    };
+    FeedPosition seen;
+    {
+        auto feed = feed_at();
+        auto watch = feed->Subscribe(true, {});
+        (void)NextBytes(*watch);
+        catalog.SetTable("t", "two");
+        Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+        seen = At(feed->epoch(), CatalogPush(NextBytes(*watch)).revision);
+        // A statement that changes nothing moves the watch on with progress.
+        Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+        seen.revision = ProgressRevision(NextBytes(*watch));
+    }
+    {
+        // After a restart, a consumer at the last revision continues without
+        // the whole catalog.
+        auto feed = feed_at();
+        auto watch = feed->Subscribe(true, {}, seen);
+        assert(feed->epoch() == seen.epoch && watch->revision() == seen.revision);
+        assert(!watch->Next());
+        catalog.SetTable("t", "three");
+        Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+        assert(Render(CatalogPush(NextBytes(*watch)).events) == "table alter t . three");
+        // One step behind: the history after the restart does not hold it.
+        auto behind = feed->Subscribe(true, {}, At(seen.epoch, seen.revision - 1U));
+        assert(IsResync(NextBytes(*behind)));
+    }
+}
+
+void TestCatalogDefaultsAcrossStarts() {
+    test::ScopedTempDir dir("chunkdb-catalog-defaults");
+    CatalogConfig config;
+    config.data_dir = dir.path();
+    const auto watch = [&](const std::string& after, bool resync) {
+        auto catalog = std::make_shared<TableCatalog>(config);
+        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+        SessionState session;
+        assert(engine.Execute(session, "HELLO 3").starts_with("%"));
+        if (after.empty()) assert(engine.Execute(session, "CREATE TABLE inherited (n u8) CHUNK 4 x 4") == "+OK\r\n");
+        const auto reply = engine.Execute(session, after.empty() ? "WATCH CATALOG" : "WATCH CATALOG AFTER " + after);
+        const auto start = Parse(reply);
+        const auto position = Field(start, "epoch").value + " " + Field(start, "revision").value;
+        if (resync) {
+            assert(position != after);
+            assert(IsResync(NextBytes(*session.catalog_watch)));
+        } else if (!after.empty()) {
+            assert(position == after);
+            assert(!session.catalog_watch->Next());
+            return position;
+        }
+        const auto whole = Parse(NextBytes(*session.catalog_watch));
+        assert(whole.items.at(0).value == "catalog");
+        const auto& events = whole.items.at(5).items;
+        const auto table = std::find_if(events.begin(), events.end(), [](const Resp& event) {
+            return Field(event, "kind").value == "table" && Field(event, "name").value == "inherited";
+        });
+        assert(table != events.end());
+        const auto& options = Field(Field(*table, "data"), "options");
+        assert(Field(options, "feed_buffer_bytes").value == std::to_string(config.feed_buffer_bytes));
+        assert(Field(options, "slot_max_bytes").value == std::to_string(config.slot_max_bytes));
+        return position;
+    };
+    auto position = watch({}, false);
+    config.feed_buffer_bytes /= 2U;
+    position = watch(position, true);
+    config.slot_max_bytes /= 2U;
+    position = watch(position, true);
+    (void)watch(position, false);
+}
+
+void ArmFailpoint(const char* name) {
+#ifdef _WIN32
+    (void)_putenv_s(name, "1");
+#else
+    (void)setenv(name, "1", 1);
+#endif
+}
+
+template <typename Fn> bool Throws(Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+void TestStatementDuringSubscribeRead() {
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    auto feed = MakeFeed(catalog);
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    const auto epoch = feed->epoch();
+    // A CREATE TABLE begins while the first watch reads the catalog, and its
+    // table is already there when the read reaches it.
+    bool begun = false;
+    catalog.during_whole_read = [&] {
+        if (begun) return;
+        begun = true;
+        feed->Begin();
+        catalog.SetTable("t2", "new");
+    };
+    auto watch = feed->Subscribe(true, {}, At(epoch, 1U));
+    // The read is not the catalog of revision 1: the consumer rebuilds.
+    assert(watch->revision() == 2U);
+    assert(IsResync(NextBytes(*watch)));
+    const auto whole = CatalogPush(NextBytes(*watch));
+    assert(whole.revision == 2U);
+    assert(Render(whole.events) == "table create t . one|table create t2 . new");
+    // The statement ends: the read already showed its change.
+    feed->Refresh(CatalogScope{.tables = {"t2"}, .all_tables = false}, "admin");
+    assert(ProgressRevision(NextBytes(*watch)) == 3U);
+    assert(!watch->Next());
+}
+
+void TestFailedRecordWrites() {
+    test::ScopedTempDir dir("chunkdb-catalog-write-fail");
+    StoreId epoch{};
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        epoch = clock.epoch();
+        // A mark that cannot be written refuses the statement.
+        ArmFailpoint("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE");
+        assert(Throws([&] { clock.Begin(); }));
+        assert(!ReadCatalogRevision(dir.path()).has_value());
+        clock.Begin();
+        clock.Begin();
+        ArmFailpoint("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE");
+        assert(Throws([&] { (void)clock.End(); }));
+        // The record is unknown after the failure: the next mark is written again.
+        clock.Begin();
+        const auto marked = *ReadCatalogRevision(dir.path());
+        assert(marked.in_progress && marked.revision == 1U);
+        // Stopped with statements running, as a crash stops them.
+    }
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() == epoch && clock.revision() == 2U);
+        clock.Begin();
+        ArmFailpoint("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE");
+        assert(Throws([&] { (void)clock.End(); }));
+        // Revision 3 was never handed out; a read records it first.
+        assert(clock.Snapshot() == 3U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 3U}));
+        // Held: marked even with nothing running, and a read takes a new revision.
+        clock.Hold(true);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        assert(clock.Snapshot() == 4U);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        // Released, a settled refresh at the current revision clears the mark.
+        clock.Hold(false);
+        clock.Settle(3U);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        clock.Settle(4U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 4U}));
+    }
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.revision() == 4U);
+    }
+}
+
+void TestUnreadTableKeepsMark() {
+    test::ScopedTempDir dir("chunkdb-catalog-unread");
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    const auto feed_at = [&] {
+        return std::make_shared<CatalogFeed>([&catalog](const CatalogScope& scope) { return catalog.Read(scope); }, 1U << 20U,
+            std::make_unique<CatalogClock>(dir.path(), CatalogClock::Mode::kDurable));
+    };
+    FeedPosition seen;
+    {
+        auto feed = feed_at();
+        auto watch = feed->Subscribe(true, {});
+        (void)NextBytes(*watch);
+        catalog.unknown.insert("t");
+        Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+        seen = At(feed->epoch(), ProgressRevision(NextBytes(*watch)));
+        // Its slots may differ from the published records: the record stays marked.
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+    }
+    catalog.unknown.clear();
+    {
+        auto feed = feed_at();
+        auto watch = feed->Subscribe(true, {}, seen);
+        assert(IsResync(NextBytes(*watch)));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -533,10 +926,20 @@ int main() {
     TestUnknownTableKeepsRecords();
     TestOverflowSendsResyncAndWholeCatalog();
     TestFailureEndsWatches();
-    TestCancelledStatementKeepsWatch();
+    TestRefusedStatementTakesNoRevision();
+    TestCancelAfterCatalogMark();
     TestTableNeedingRecoveryKeepsWatch();
     TestConcurrentStatements();
     TestRenameAndSwap();
     TestResyncWithSmallBudget();
     TestSecondWatchRefused();
+    TestResumeAfter();
+    TestProgressCoalesces();
+    TestDurableClock();
+    TestCancelKeepsNeededMark();
+    TestDurableResume();
+    TestCatalogDefaultsAcrossStarts();
+    TestStatementDuringSubscribeRead();
+    TestFailedRecordWrites();
+    TestUnreadTableKeepsMark();
 }

@@ -247,15 +247,17 @@ Unsigned values may exceed signed int64 and use big numbers; decode values and m
 
 ## WATCH and durable slots
 
-WATCH replies with a map containing `epoch` and `revision`, and starts after that position.
-Epoch is the 32-hex-digit table identity.
+WATCH replies with a map containing `epoch` and `revision` for its starting position.
+The 32-hex-digit epoch identifies the table for a table watch and the catalog for WATCH CATALOG.
 The following list notation describes push elements, rather than literal wire bytes:
 
 - `[change, epoch, revision, commit_time_ms, user, schema_version, blocks, tag, txn, chunk_changes]`, with each block `[x, y, before, after]` or `[x, y, z, before, after]`.
 - `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
-- `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, from WATCH CATALOG, with a catalog epoch and revision; each event is a map of `kind`, `action`, `name`, `table` and `data`, see [WATCH CATALOG](reference/FEED.md#watch-catalog).
+- `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, from WATCH CATALOG [AFTER epoch revision], with an event map of `kind`, `action`, `name`, `table` and `data` for each visible change.
+
+When no catalog change is pending for a watch, `progress` can advance it past one or more invisible revisions, as described in [WATCH CATALOG](reference/FEED.md#watch-catalog).
 
 Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims`, the watched block columns, and all chunk columns of its `schema_version`.
 Resync lineage fields are null when no parent lineage is recorded.

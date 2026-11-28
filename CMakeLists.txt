@@ -87,6 +87,7 @@ add_library(chunkdb_core STATIC
     src/feed_protocol.cpp
     src/change_feed.cpp
     src/catalog_feed.cpp
+    src/catalog_revision.cpp
     src/feed_slot_records.cpp
     src/feed_slots.cpp
     src/slot_watch.cpp
@@ -670,6 +671,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_migrations_crash_test PRIVATE chunkdb_core)
     add_test(NAME migrations_crash COMMAND chunkdb_migrations_crash_test)
     set_tests_properties(migrations_crash PROPERTIES TIMEOUT 600)
+
+    add_executable(chunkdb_catalog_revision_crash_test tests/catalog_revision_crash_tests.cpp)
+    target_link_libraries(chunkdb_catalog_revision_crash_test PRIVATE chunkdb_core)
+    add_test(NAME catalog_revision_crash COMMAND chunkdb_catalog_revision_crash_test)
+    set_tests_properties(catalog_revision_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_migrations_engine_test tests/migrations_engine_tests.cpp)
     target_link_libraries(chunkdb_migrations_engine_test PRIVATE chunkdb_core)
@@ -1284,6 +1290,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_migrations_engine_test
         chunkdb_recover_table_test
         chunkdb_migrations_crash_test
+        chunkdb_catalog_revision_crash_test
         chunkdb_migrations_records_test
         chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
@@ -1521,6 +1528,7 @@ if(CHUNKDB_BUILD_TESTS)
         backup_crash
         restore_crash
         migrations_crash
+        catalog_revision_crash
         feed_slots_crash
         durability_crash_hardening
         snapshot_generation_linger

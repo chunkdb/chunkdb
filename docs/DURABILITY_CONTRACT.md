@@ -76,6 +76,12 @@ It leaves revision and recovery records unchanged; restore a consistent backup, 
 A missing or malformed clock beside a valid initialized marker, or a malformed marker, is also refused and has the same remedies.
 Read-only inspection remains available and reports an unknown completed revision as null.
 
+## Catalog revision
+
+With `catalog_revision`, the catalog revision record is synced before a catalog statement changes anything and again before its revision is published to WATCH CATALOG.
+A crash between the two moves the next start to a new revision, so a published revision never names two catalog states; see [catalog revision](design/CATALOG_REVISION.md).
+A filesystem rollback or a cold copy of the data directory keeps the catalog epoch, so a consumer must not resume against it with AFTER.
+
 ## Platforms and scope
 
 - Linux uses fdatasync where applicable, with fsync fallback and directory fsync.

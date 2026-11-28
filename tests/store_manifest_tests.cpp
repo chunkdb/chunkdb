@@ -1017,7 +1017,7 @@ void TestNamedFeatureRegistry() {
         assert((bits & feature.incompat) == 0U);
         bits |= feature.incompat;
         assert(feature.table_scoped == (feature.incompat != chunkdb::kFeatureActivation &&
-            feature.incompat != chunkdb::kFeatureMigrations));
+            feature.incompat != chunkdb::kFeatureMigrations && feature.incompat != chunkdb::kFeatureCatalogRevision));
     }
     assert(!chunkdb::FindFeature("unknown"));
     assert(bits == chunkdb::kKnownFeatures.incompat);
