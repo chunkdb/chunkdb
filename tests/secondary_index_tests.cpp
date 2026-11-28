@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #endif
 
+#include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "secondary_index.hpp"
 #include "test_utils.hpp"
@@ -659,6 +660,8 @@ void CrashModel(const ChunkLayout& layout, Model& model, int steps) {
     }
 }
 
+constexpr std::string_view kCrashBeforeRunRename = "CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE";
+
 int CrashChildBody(const std::filesystem::path& root, const char* point) {
     const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
     const auto column = ColumnIndex(layout, "u");
@@ -689,8 +692,19 @@ int CrashChildBody(const std::filesystem::path& root, const char* point) {
 #else
     setenv(point, "1", 1);
 #endif
-    if (std::string_view(point).find("MERGE") != std::string_view::npos) index.Merge();
-    else index.Flush();
+    if (std::string_view(point) == kCrashBeforeRunRename) {
+        try {
+            index.Flush();
+        } catch (const std::runtime_error& error) {
+            if (std::string_view(error.what()).starts_with("injected atomic write failure after temp flush and close"))
+                ExitAbruptly(86);
+            throw;
+        }
+    } else if (std::string_view(point).find("MERGE") != std::string_view::npos) {
+        index.Merge();
+    } else {
+        index.Flush();
+    }
     return 1;
 }
 
@@ -716,60 +730,107 @@ int CrashChild(const char* executable, const std::filesystem::path& root, const 
 #endif
 }
 
-// A crash after a run is in place but before its manifest, or after a merge's
-// manifest but before the replaced runs are removed, recovers the index of
-// the current chunk state with no stray file.
+// Crashes during run or manifest publication leave a recoverable index of the
+// current chunk state. Only the writer cleans up unlisted files.
 void CrashBoundaries(const char* executable) {
     if (!kFailpointsCompiled) return;
-    for (const auto* point : {"CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE",
+    for (const auto* point : {kCrashBeforeRunRename.data(), "CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE",
              "CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE",
              "CHUNKDB_FAILPOINT_CRASH_INDEX_MERGE_AFTER_MANIFEST_ONCE",
              "CHUNKDB_FAILPOINT_CRASH_INDEX_REBUILD_BEFORE_READY_ONCE"}) {
         test::ScopedTempDir directory("chunkdb-secondary-index-crash");
         const auto root = directory.path() / "index";
         assert(CrashChild(executable, root, point) == 86);
-        const bool orphaned_run = std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE" ||
+        const auto manifest = SecondaryIndex::ManifestPath(root);
+        const auto manifest_temp = root / "manifest.tmp";
+        const auto before = Files(root);
+        const auto run_temp = std::find_if(before.begin(), before.end(), [](const auto& file) {
+            const auto name = file.string();
+            return name.starts_with("run-") && name.find(".tmp.") != std::string::npos;
+        });
+        const bool before_manifest_rename =
             std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE";
+        assert(std::filesystem::exists(manifest_temp) == before_manifest_rename);
+        assert((run_temp != before.end()) == (std::string_view(point) == kCrashBeforeRunRename));
+        const bool orphaned_run = std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE" ||
+            before_manifest_rename;
         std::uint64_t orphan_generation = 0U;
+        const auto manifest_bytes = LoadFile(manifest);
+        const auto previous = ParseIndexManifest(manifest_bytes);
         if (orphaned_run) {
-            for (const auto& file : Files(root)) {
+            for (const auto& file : before) {
                 const auto name = file.string();
                 if (!name.starts_with("run-")) continue;
                 std::uint64_t generation = 0U;
                 assert(TryParseUint64(name.substr(4U), &generation));
                 orphan_generation = std::max(orphan_generation, generation);
             }
-            assert(orphan_generation > 0U);
+            assert(orphan_generation > previous.generation);
         }
         const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
         const auto column = ColumnIndex(layout, "u");
         Model model;
         CrashModel(layout, model, 1);
+        const auto expected = Expected(layout, column, 0U, model);
+        if (before_manifest_rename || run_temp != before.end()) {
+            const auto temporary = before_manifest_rename ? manifest_temp : root / *run_temp;
+            const auto temporary_bytes = LoadFile(temporary);
+            SecondaryIndex reader(root, layout, column, Identity(1U), true);
+            assert(reader.Open(model.Source()).rebuilt.empty());
+            assert(Same(Effective(reader), expected));
+            assert(reader.Verify(model.Source()).empty());
+            assert(Files(root) == before);
+            assert(LoadFile(manifest) == manifest_bytes);
+            assert(LoadFile(temporary) == temporary_bytes);
+        }
+
+        bool floor_synced = false;
+        const auto orphan_path = SecondaryIndex::RunPath(root, orphan_generation);
+        if (orphaned_run) {
+            SetDirectorySyncObserverForTests([&](const auto& synced) {
+                if (synced != root) return;
+                const auto published = ParseIndexManifest(LoadFile(manifest));
+                assert(published.generation == orphan_generation && published.runs == previous.runs);
+                assert(!std::filesystem::exists(manifest_temp) && std::filesystem::exists(orphan_path));
+                floor_synced = true;
+            });
+        }
         SecondaryIndex index(root, layout, column, Identity(1U));
         const auto report = index.Open(model.Source());
+        if (orphaned_run) {
+            SetDirectorySyncObserverForTests({});
+            assert(floor_synced);
+        }
         // An index that crashed before it was ready builds again.
         assert(report.rebuilt.empty() == (std::string_view(point).find("REBUILD") == std::string_view::npos));
-        assert(Same(Effective(index), Expected(layout, column, 0U, model)));
+        assert(Same(Effective(index), expected));
         assert(index.Verify(model.Source()).empty());
         std::size_t runs = 0U;
         for (const auto& file : Files(root)) {
-            assert(file == "manifest" || file.string().starts_with("run-"));
-            if (file != "manifest") ++runs;
+            if (file == "manifest") continue;
+            const auto name = file.string();
+            std::uint64_t generation = 0U;
+            assert(name.starts_with("run-") && TryParseUint64(name.substr(4U), &generation) && generation > 0U);
+            ++runs;
         }
         assert(runs == index.runs());
         if (orphaned_run) {
-            assert(!std::filesystem::exists(SecondaryIndex::RunPath(root, orphan_generation)));
+            assert(!std::filesystem::exists(orphan_path));
             SecondaryIndex reopened(root, layout, column, Identity(1U));
-            if (std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE") {
+            if (!before_manifest_rename) {
                 assert(reopened.Open(model.Source()).rebuilt.empty());
                 assert(reopened.manifest_generation() >= orphan_generation);
                 reopened.Flush();
             } else {
+                // Explicit rebuild can also be the first writer to see a stale temporary.
+                std::ofstream(manifest_temp) << "abandoned";
+                assert(std::filesystem::exists(manifest_temp));
                 reopened.Rebuild(model.Source());
+                assert(!std::filesystem::exists(manifest_temp));
             }
             assert(reopened.manifest_generation() > orphan_generation);
-            assert(!std::filesystem::exists(SecondaryIndex::RunPath(root, orphan_generation)));
-            assert(Same(Effective(reopened), Expected(layout, column, 0U, model)));
+            assert(!std::filesystem::exists(orphan_path));
+            assert(Same(Effective(reopened), expected));
         }
     }
 }

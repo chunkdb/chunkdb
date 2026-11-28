@@ -32,6 +32,7 @@ constexpr std::size_t kRunFooterBytes = 44U;
 constexpr std::size_t kBlockEntries = 512U;
 constexpr std::size_t kBlockBytes = 64U * 1024U;
 constexpr std::string_view kManifestName = "manifest";
+constexpr std::string_view kManifestTemporaryName = "manifest.tmp";
 constexpr std::string_view kRunPrefix = "run-";
 
 void Crash(const char* point) { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
@@ -329,10 +330,21 @@ std::vector<std::uint8_t> LoadWhole(const std::filesystem::path& path) {
     return ReadRange(input, 0U, size, "index manifest");
 }
 
-bool RunGeneration(const std::filesystem::path& path, std::uint64_t* generation) {
-    const auto name = path.filename().string();
+bool RunGeneration(const std::string& name, std::uint64_t* generation) {
     if (!name.starts_with(kRunPrefix)) return false;
     return TryParseUint64(name.substr(kRunPrefix.size()), generation) && *generation != 0U;
+}
+
+bool RemovePublicationTemporary(const std::filesystem::path& path, const std::string& name) {
+    // Like CleanupAtomicTmpArtifacts, remove only known temporary names here.
+    // The sole index writer owns both the fixed manifest name and the run temps.
+    if (name != kManifestTemporaryName) {
+        const auto suffix = name.find(".tmp.", kRunPrefix.size());
+        std::uint64_t generation = 0U;
+        if (suffix == std::string::npos || !RunGeneration(name.substr(0U, suffix), &generation)) return false;
+    }
+    std::filesystem::remove(path);
+    return true;
 }
 
 }  // namespace
@@ -604,11 +616,13 @@ void SecondaryIndex::RemoveUnlisted() {
     auto generation_floor = manifest_.generation;
     bool has_unlisted_run = false;
     std::vector<std::filesystem::path> unlisted;
+    // Remove stale temporaries first, then publish and sync the generation
+    // floor, then remove the orphaned runs that supplied it.
     for (const auto& item : std::filesystem::directory_iterator(directory_)) {
         const auto name = item.path().filename().string();
         std::uint64_t generation = 0U;
-        if (name == kManifestName) continue;
-        if (RunGeneration(item.path(), &generation)) {
+        if (name == kManifestName || RemovePublicationTemporary(item.path(), name)) continue;
+        if (RunGeneration(name, &generation)) {
             if (listed.contains(generation)) continue;
             generation_floor = std::max(generation_floor, generation);
             has_unlisted_run = true;
@@ -707,8 +721,10 @@ void SecondaryIndex::RebuildFromSource(const IndexChunkSource& source) {
     std::uint64_t generation = manifest_.generation;
     EnsureDirectoryPathExists(directory_, true);
     for (const auto& item : std::filesystem::directory_iterator(directory_)) {
+        const auto name = item.path().filename().string();
+        if (RemovePublicationTemporary(item.path(), name)) continue;
         std::uint64_t found = 0U;
-        if (RunGeneration(item.path(), &found)) generation = std::max(generation, found);
+        if (RunGeneration(name, &found)) generation = std::max(generation, found);
     }
     Clear();
     issued_ = std::max(issued_, generation);
@@ -850,11 +866,11 @@ void SecondaryIndex::PublishManifest(IndexManifest next) {
     RequireWriter();
     next.identity = identity_;
     EnsureDirectoryPathExists(directory_, true);
-    // A synced temporary manifest replaces the old one atomically; a crash
-    // before the rename leaves the old one and a file open removes.
+    // A synced temporary manifest replaces the old one atomically. Discard
+    // the sole writer's fixed temporary before creating it exclusively.
     const auto path = ManifestPath(directory_);
-    auto temporary = path;
-    temporary += ".tmp";
+    const auto temporary = directory_ / kManifestTemporaryName;
+    std::filesystem::remove(temporary);
     WriteAtomicTempFile(temporary, SerializeIndexManifest(next), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE");
     // From here the manifest on disk may already be the new one while memory
