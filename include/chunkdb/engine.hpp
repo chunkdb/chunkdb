@@ -179,7 +179,10 @@ struct SessionTransaction {
     std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes{};
     // The bytes of `writes`, also counted in budget->bytes.
     std::size_t bytes = 0;
-    // Set when a statement got CONFLICT: the snapshot and the writes are
+    // The message a write's PUBLISH gave, which COMMIT publishes; at most
+    // kMaxFeedMessageBytes, outside `bytes`.
+    std::optional<FeedMessage> message{};
+    // Set when a statement got CONFLICT: the snapshot, writes and message are
     // gone, and every statement but COMMIT and ROLLBACK answers this reply,
     // so a statement sent after the conflict never runs outside the
     // transaction.
@@ -190,19 +193,21 @@ struct SessionTransaction {
         std::unique_ptr<TxnSnapshot> snapshot;
         std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes;
         std::set<ChunkCoord, ChunkCoordLess> read_set;
+        std::optional<FeedMessage> message{};
     };
 
     // Ends the transaction, keeping `reply` as the answer and releasing its
-    // bytes; the snapshot and the copies are returned, so a caller holding a
-    // lock can destroy them after releasing it.
+    // bytes; the snapshot, copies and message are returned, so a caller
+    // holding a lock can destroy them after releasing it.
     [[nodiscard]] Released Detach(std::string reply) {
-        Released released{std::move(snapshot), std::exchange(writes, {}), std::exchange(read_set, {})};
+        Released released{std::move(snapshot), std::exchange(writes, {}), std::exchange(read_set, {}),
+            std::exchange(message, std::nullopt)};
         budget->bytes.fetch_sub(bytes);
         bytes = 0;
         aborted = std::move(reply);
         return released;
     }
-    // Drops the snapshot and the writes, keeping `reply` as the answer.
+    // Drops the snapshot, writes and message, keeping `reply` as the answer.
     void Abort(std::string reply) { (void)Detach(std::move(reply)); }
 };
 

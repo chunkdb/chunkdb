@@ -103,6 +103,13 @@ struct Returning {
     // In the order given; empty for *, every column in schema order.
     std::vector<std::string> columns;
 };
+// PUBLISH 'channel' payload on a write (docs/design/MESSAGES.md): the message
+// its commit publishes in the change feed.
+struct Publish {
+    std::string channel;
+    // Text, Bytes or a Parameter.
+    Literal payload;
+};
 struct SetBlock {
     std::int64_t x = 0;
     std::int64_t y = 0;
@@ -116,6 +123,8 @@ struct SetBlock {
     std::shared_ptr<const expr::WriteExpressions> expressions;
     // RETURNING; null without it.
     std::shared_ptr<const Returning> returning;
+    // PUBLISH; null without it.
+    std::shared_ptr<const Publish> publish;
 };
 struct DeleteBlock {
     std::int64_t x = 0;
@@ -128,6 +137,8 @@ struct DeleteBlock {
     std::shared_ptr<const expr::WriteExpressions> expressions;
     // RETURNING (OLD only); null without it.
     std::shared_ptr<const Returning> returning;
+    // PUBLISH; null without it.
+    std::shared_ptr<const Publish> publish;
 };
 struct GetChunk {
     std::int64_t chunk_x = 0;
@@ -148,6 +159,8 @@ struct SetChunk {
     std::optional<std::vector<Assignment>> metadata;
     std::vector<std::string> columns;
     bool if_absent = false;
+    // PUBLISH; null without it.
+    std::shared_ptr<const Publish> publish;
 };
 // A chunk range or ball; dims selects whether z0 and z1 participate.
 struct GetArea {

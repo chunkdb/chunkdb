@@ -44,6 +44,13 @@ std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::share
 inline std::span<const FeedArea> FeedAreas(const std::optional<FeedArea>& area) noexcept {
     return area ? std::span<const FeedArea>(&*area, 1U) : std::span<const FeedArea>{};
 }
+// Whether a filtered change that kept this of its commit is sent: AREA drops
+// a change that keeps no data, with its messages; a change that carries a
+// message is otherwise sent even without data.
+inline bool FeedEntryKept(const FeedEntry& entry, bool area_filtered, bool has_message) noexcept {
+    return !entry.blocks.empty() || !entry.chunk_changes.empty() || !entry.chunk_forms.empty() ||
+        (!area_filtered && has_message);
+}
 // True when `areas` is empty or one of them holds chunk `coord`.
 bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord);
 // The indexes in `columns` of the projected column `ids`, in their order, as FilterFeedEntry and ChunkFeedEntry
@@ -56,11 +63,12 @@ std::size_t FeedChunksEncodedBytes(const FeedEntry& entry);
 // Merges consecutive chunks pushes of a lagging watch into one push. Each chunk
 // keeps its newest version and form, in the order chunks first appear; the push
 // takes the position, commit time and user of the newest merged push.
+// A push that carries a message is never merged: it is sent alone.
 class FeedChunksMerge {
   public:
     // Adds a chunks push above the merged ones. Returns false and changes
-    // nothing when its schema version differs from theirs or the merged push
-    // would encode to more than `limit` bytes.
+    // nothing when its schema version differs from theirs, either push carries
+    // a message, or the merged push would encode to more than `limit` bytes.
     bool Add(const std::shared_ptr<const FeedEntry>& entry, std::size_t limit);
     [[nodiscard]] bool empty() const noexcept { return newest_ == nullptr; }
     // The merged push with its frame, or the only push as it was added; empties the merge.

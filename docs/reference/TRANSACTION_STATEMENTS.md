@@ -97,6 +97,7 @@ Ordinary statement errors leave the transaction open without applying the failed
 CANCEL and a statement timeout stop the running statement; the transaction stays open.
 An IF condition of SET BLOCK or DELETE BLOCK, a value computed from the block, and RETURNING read the transaction's view and count as a read of the chunk; CONDITION_FAILED also leaves the transaction open ([Expressions](EXPRESSIONS.md#in-writes)).
 RETURNING answers a null `version` for a chunk the transaction wrote, since its version is known only at COMMIT.
+A write with [PUBLISH](BLOCKS.md#publish) stages its message, and COMMIT publishes it in the transaction's change; a second PUBLISH is refused and leaves the transaction open, and a transaction that publishes commits even when it changes nothing.
 A conflict ends its work and writes nothing.
 The connection keeps returning that conflict until ROLLBACK or COMMIT closes it; SHOW CONNECTIONS, CANCEL and KILL CONNECTION still return their own reply.
 

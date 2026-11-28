@@ -1086,7 +1086,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 15);
+    Protocol::AppendArrayHeader(reply, 16);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1102,6 +1102,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "watch_catalog");
+    Protocol::AppendBulk(reply, "messages");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
@@ -1122,7 +1123,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     for (const auto& name : session.hello_options.unknown_options) deferred(name, "unknown_option");
     entry("idle_timeout_ms", session.idle_timeout_ms);
     Protocol::AppendBulk(reply, "limits");
-    Protocol::AppendMapHeader(reply, 7);
+    Protocol::AppendMapHeader(reply, 8);
     entry("max_area_chunks", limits.max_area_chunks);
     entry("max_area_response_bytes", limits.max_area_response_bytes);
     entry("txn_max_written_chunks", limits.txn_max_written_chunks);
@@ -1130,6 +1131,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     entry("max_watches", session.max_watches);
     entry("max_returning_rows", kMaxReturningRows);
     entry("max_expression_nodes", 256U);
+    entry("max_message_bytes", kMaxFeedMessageBytes);
     return reply;
 }
 

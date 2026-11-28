@@ -622,7 +622,7 @@ struct FeedArchiveReader::Impl {
         use_empty(first_schema, 0U, 0U);
     }
 
-    bool Apply(Cursor& cursor, FeedEntry* entry, std::size_t* frame_bytes) {
+    bool Apply(Cursor& cursor, FeedEntry* entry, std::size_t* frame_bytes, std::optional<FeedMessage>& message) {
         if (!cursor.initialized) {
             Initialize(cursor);
             if (cursor.done) return false;
@@ -630,7 +630,7 @@ struct FeedArchiveReader::Impl {
         auto [path, file] = Open(cursor);
         const auto bytes = file->At(cursor.offset, cursor.frame_size);
         if (bytes.size() != cursor.frame_size) throw std::runtime_error("feed archive WAL shortened while reading");
-        const auto info = InspectFeedFrame(bytes, geometry, features);
+        auto info = InspectFeedFrame(bytes, geometry, features);
         if (info.revision != cursor.next) throw std::runtime_error("feed archive WAL changed identity");
         LoadBase(cursor, info.schema_version, path == cursor.path && (cursor.last == 0U || cursor.movable));
         if (info.schema_version < cursor.schema_version) throw std::runtime_error("feed archive schema versions do not increase");
@@ -653,6 +653,11 @@ struct FeedArchiveReader::Impl {
             entry->commit_time_ms = info.commit_time_ms;
             entry->user = info.user;
             entry->dims = geometry.dims();
+            if (info.message) {
+                // One frame of a commit carries its message.
+                if (message) throw std::runtime_error("an archived feed change carries more than one message");
+                message = std::move(info.message);
+            }
             const auto& layout = geometry.LayoutAt(info.schema_version);
             std::optional<Geometry> historical_geometry;
             if (info.schema_version != geometry.layout().schema().version) {
@@ -745,8 +750,9 @@ struct FeedArchiveReader::Impl {
             const bool deliver = revision > position.revision;
             bool consumed = false;
             std::size_t frame_bytes = 0U;
+            std::optional<FeedMessage> message;
             for (auto& cursor : cursors) if (!cursor.done && cursor.next == revision)
-                consumed = Apply(cursor, deliver ? entry.get() : nullptr, &frame_bytes) || consumed;
+                consumed = Apply(cursor, deliver ? entry.get() : nullptr, &frame_bytes, message) || consumed;
             if (!deliver) continue;
             if (entry->schema_version == 0U) {
                 if (consumed) position.revision = revision;
@@ -754,7 +760,15 @@ struct FeedArchiveReader::Impl {
             }
             if (filter && chunk_forms) entry->kind = FeedEntry::Kind::kChunks;
             // A filtered watch sends nothing of a change that keeps nothing.
-            const bool sent = !filter || !entry->blocks.empty() || !entry->chunk_changes.empty() || !entry->chunk_forms.empty();
+            const bool sent = !filter || FeedEntryKept(*entry, filter->area.has_value(), message.has_value());
+            if (sent && message) {
+                // AREA applies to the whole revision: a different chunk can
+                // keep a change whose MESSAGE was on an excluded chunk.
+                const auto message_bytes = 7U + message->channel.size() + 5U + message->payload.size() + 5U;
+                if (message_bytes > entry_budget - frame_bytes)
+                    throw std::length_error("archived change exceeds the table feed buffer");
+                entry->messages.push_back(std::move(*message));
+            }
             if ((!chunk_forms || filter) && sent) {
                 entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
                 if (entry->protocol_frame->size() > entry_budget) throw std::length_error("archived change exceeds the table feed buffer");

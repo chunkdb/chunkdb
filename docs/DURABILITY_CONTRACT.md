@@ -23,6 +23,7 @@ Committed revisions keep their values; missing chunks after a later crash do not
 The **WAL**, or write-ahead log, records changes used during recovery.
 A **checkpoint** saves a chunk image so recovery can discard earlier log records safely.
 Ordinary writes to several chunks are not atomic together; use [Transactions](TRANSACTIONS.md).
+A message a write or transaction publishes is stored in its WAL frame, so it has exactly the durability of that write or COMMIT: a crash keeps both or loses both; see [Messages](design/MESSAGES.md).
 
 ## Make earlier writes durable
 

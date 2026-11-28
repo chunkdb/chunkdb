@@ -13,6 +13,8 @@
 
 namespace chunkdb {
 
+struct FeedMessage;
+
 // Destructive trims preserve hard-linked snapshot readers by replacing the
 // live inode. The replacement file is synced before rename in every mode;
 // `durable` also syncs its directory. Single-link WALs retain truncation.
@@ -29,13 +31,16 @@ namespace chunkdb {
 class WalFrameBuilder {
   public:
     // `schema_version` is the version the records are laid out by; above 1
-    // it is written as the frame's SCHEMA TLV.
+    // it is written as the frame's SCHEMA TLV. A non-null `message` is
+    // written as its MESSAGE TLV; the caller has checked the table's
+    // `messages` feature.
     WalFrameBuilder(
         std::vector<std::uint8_t>* batch,
         std::uint64_t schema_version,
         const std::vector<std::uint8_t>& tag = {},
         std::optional<std::string_view> user = std::nullopt,
-        bool gc = false);
+        bool gc = false,
+        const FeedMessage* message = nullptr);
     WalFrameBuilder(std::vector<std::uint8_t>* batch, std::uint64_t schema_version,
         const std::vector<std::uint8_t>& tag, std::optional<std::string_view> user,
         bool gc, const WalGroupRef& group);

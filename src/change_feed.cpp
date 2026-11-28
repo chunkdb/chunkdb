@@ -20,6 +20,7 @@ namespace chunkdb {
 namespace {
 std::atomic<std::uint64_t> g_feed_id{0};
 thread_local std::string_view g_write_user;
+thread_local const FeedMessage* g_write_message = nullptr;
 
 template <typename Change>
 std::size_t BlockValuesBytes(const Change& block) {
@@ -43,6 +44,21 @@ bool SameValues(const std::optional<std::vector<ColumnValue>>& a,
 ScopedWriteUser::ScopedWriteUser(std::string_view user) noexcept : previous_(g_write_user) { g_write_user = user; }
 ScopedWriteUser::~ScopedWriteUser() { g_write_user = previous_; }
 std::string_view CurrentWriteUser() noexcept { return g_write_user; }
+ScopedWriteMessage::ScopedWriteMessage(const FeedMessage* message) noexcept : previous_(g_write_message) {
+    g_write_message = message;
+}
+ScopedWriteMessage::~ScopedWriteMessage() { g_write_message = previous_; }
+const FeedMessage* CurrentWriteMessage() noexcept { return g_write_message; }
+bool IsValidFeedChannel(std::string_view channel) noexcept {
+    if (channel.empty() || channel.size() > kMaxFeedChannelBytes) return false;
+    for (std::size_t i = 0; i < channel.size(); ++i) {
+        const char c = channel[i];
+        if (c == '_' || (c >= 'a' && c <= 'z')) continue;
+        if (i > 0U && ((c >= '0' && c <= '9') || c == '.')) continue;
+        return false;
+    }
+    return true;
+}
 
 ChangeFeed::Producer::~Producer() {
     while (allocated != nullptr) {
@@ -467,10 +483,18 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
         }
         before.vars = ChunkVars::Decode(raw.vars.data(), raw.vars.size(), geometry.ChunkBlockCount());
         after = before;
-        const auto frame = ReplayFeedFrame(raw.wal, geometry, &after, features_);
+        auto frame = ReplayFeedFrame(raw.wal, geometry, &after, features_);
         if (frame.revision != write.revision || (f != 0U &&
             (frame.schema_version != entry->schema_version || frame.commit_time_ms != entry->commit_time_ms))) {
             throw std::logic_error("frames of a feed change disagree");
+        }
+        if (frame.message) {
+            // One frame of a commit carries its message.
+            if (!entry->messages.empty()) throw std::logic_error("a feed change carries more than one message");
+            entry->messages.push_back(std::move(*frame.message));
+            value_bytes += entry->messages.capacity() * sizeof(FeedMessage) +
+                entry->messages.back().channel.capacity() + entry->messages.back().payload.capacity();
+            if (EntryBytes(*entry) > budget_) return nullptr;
         }
         entry->schema_version = frame.schema_version;
         entry->commit_time_ms = frame.commit_time_ms;

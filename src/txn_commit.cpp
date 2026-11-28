@@ -371,6 +371,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
+    // The message COMMIT publishes, checked before anything is touched.
+    const FeedMessage* const message = WriteMessage();
+    if (message != nullptr && writes.empty()) throw std::invalid_argument("a transaction's message needs a write");
 
     // Everything the caller passed is checked before any chunk is touched.
     if (writes.size() > query_limits_.txn_max_written_chunks) {
@@ -579,7 +582,16 @@ std::uint64_t ChunkStore::CommitTransaction(
         changes.push_back(Change{.target = &target, .write = &write});
     }
     if (changes.empty()) {
-        return 0;
+        if (message == nullptr) return 0;
+        // A transaction that publishes a message commits even when it
+        // changes nothing: its first written chunk carries the frame.
+        for (const auto& target : targets) {
+            if (target.write != kNoWrite) {
+                changes.push_back(Change{.target = &target, .write = &writes[target.write]});
+                break;
+            }
+        }
+        if (changes.empty()) throw std::logic_error("a transaction's message has no written chunk");
     }
 
     // Each WAL's size becomes a durable boundary the transaction can go back
@@ -632,7 +644,9 @@ std::uint64_t ChunkStore::CommitTransaction(
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
         feed->Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
-        WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser());
+        // The first frame carries the commit's message.
+        WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser(), false,
+            &change == &changes.front() ? message : nullptr);
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
         AppendVarDiff(&frame, chunk.vars, state.vars);

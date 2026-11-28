@@ -59,6 +59,44 @@ struct Overloaded : Fn... {
 template <typename... Fn>
 Overloaded(Fn...) -> Overloaded<Fn...>;
 
+// The message a write's PUBLISH clause publishes (docs/design/MESSAGES.md);
+// none without the clause. The table needs the `messages` feature.
+[[nodiscard]] std::optional<FeedMessage> PublishedMessage(const cql::Publish* publish, const ChunkStore& store,
+    std::span<const std::optional<std::string>> parameters) {
+    if (publish == nullptr) return std::nullopt;
+    RequireFeature(store.features(), *FindFeature("messages"));
+    FeedMessage message{.channel = publish->channel, .payload = {}};
+    if (const auto* parameter = std::get_if<cql::Parameter>(&publish->payload)) {
+        const auto& frame = parameters[parameter->index - 1U];
+        if (!frame.has_value()) throw std::invalid_argument("a message cannot be NULL");
+        message.payload = *frame;
+    } else if (const auto* text = std::get_if<cql::Text>(&publish->payload)) {
+        message.payload = text->value;
+    } else {
+        const auto& bytes = std::get<cql::Bytes>(publish->payload).value;
+        message.payload.assign(bytes.begin(), bytes.end());
+    }
+    if (message.payload.size() > kMaxFeedMessageBytes)
+        throw std::out_of_range("a message has at most " + std::to_string(kMaxFeedMessageBytes) + " bytes");
+    return message;
+}
+// A PUBLISH parameter is a message's payload frame.
+void AllowMessageParameter(CommandEngine::PayloadRequest& request, const cql::Publish* publish) {
+    if (publish == nullptr) return;
+    if (const auto* parameter = std::get_if<cql::Parameter>(&publish->payload)) {
+        auto& limit = request.parameter_limits.at(parameter->index - 1U);
+        limit = std::max(limit, kMaxFeedMessageBytes);
+        // A bound on all frames together makes room for the message.
+        if (request.parameter_bytes_limit != std::numeric_limits<std::size_t>::max())
+            request.parameter_bytes_limit += kMaxFeedMessageBytes;
+    }
+}
+// A transaction publishes at most one message, at its COMMIT; checked
+// before the statement stages its write.
+void RequireTxnMessageRoom(const SessionTransaction& txn, const std::optional<FeedMessage>& message) {
+    if (message && txn.message) throw std::invalid_argument("a transaction publishes at most one message");
+}
+
 // The most bytes a parameter of `type` holds: uN and iN 8, little-endian;
 // bool 1; f32 4; f64 8; bits(N) (N + 7) / 8, the lowest bit first; text and
 // bytes their maximum.
@@ -1388,7 +1426,11 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
                 request.parameter_limits[parameter->index - 1U] = ParameterBytes(at->type);
             }
             request.parameter_bytes_limit = kMaxStatementParameterBytes;
-        } else request.parameter_limits = {ChunkFormBytes(table->geometry(), !chunk->columns.empty())};
+        } else {
+            request.parameter_limits.assign(parsed.parameters, 0U);
+            request.parameter_limits[chunk->state.index - 1U] = ChunkFormBytes(table->geometry(), !chunk->columns.empty());
+        }
+        AllowMessageParameter(request, chunk->publish.get());
         request.plan = PayloadPlan::kParameters;
         return request;
     }
@@ -1419,7 +1461,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     }
     const auto* set = std::get_if<cql::SetBlock>(&parsed.statement);
     const auto* del = std::get_if<cql::DeleteBlock>(&parsed.statement);
-    if (set == nullptr && (del == nullptr || !del->expressions)) {
+    if (set == nullptr && (del == nullptr || (!del->expressions && !del->publish))) {
         return reject(Protocol::Error("UNKNOWN_COMMAND", "this statement is not available yet"));
     }
     const std::string& table_name = set != nullptr ? set->table : del->table;
@@ -1461,6 +1503,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     // each payload, not the sum of column maxima: small values may fit even
     // when their columns allow a much larger total.
     request.parameter_bytes_limit = kMaxStatementParameterBytes;
+    AllowMessageParameter(request, set != nullptr ? set->publish.get() : del->publish.get());
     request.plan = PayloadPlan::kParameters;
     return request;
 }
@@ -1955,15 +1998,20 @@ std::string CommandEngine::ExecuteStatement(
                                          : LiteralValue(column, assignment.value),
                         });
                     }
+                    auto message = PublishedMessage(set.publish.get(), store, parameters);
                     if (session.transaction != nullptr) {
+                        RequireTxnMessageRoom(*session.transaction, message);
                         TxnWrite(
                             *session.transaction, store, BlockCoord(store.geometry(), set.x, set.y, set.z),
                             [&](ChunkState& state) {
                                 if (set.dims == 3U) store.SetBlockInState3D(state, set.x, set.y, set.z, values);
                                 else store.SetBlockInState(state, set.x, set.y, values);
                             });
+                        if (message) session.transaction->message = std::move(message);
                         return NullReply();
                     }
+                    std::optional<ScopedWriteMessage> publishing;
+                    if (message) publishing.emplace(&*message);
                     return VersionReply(set.dims == 3U ? store.SetBlock3D(set.x, set.y, set.z, values, set.if_version)
                                                        : store.SetBlock(set.x, set.y, values, set.if_version));
                 },
@@ -1978,16 +2026,22 @@ std::string CommandEngine::ExecuteStatement(
                         const auto lease = TxnLease(session, del.table);
                         ChunkStore& store = lease.store();
                         RequireDimensions(store.geometry(), del.dims);
+                        auto message = PublishedMessage(del.publish.get(), store, parameters);
+                        RequireTxnMessageRoom(*session.transaction, message);
                         TxnWrite(
                             *session.transaction, store, BlockCoord(store.geometry(), del.x, del.y, del.z),
                             [&](ChunkState& state) {
                                 if (del.dims == 3U) store.UnsetBlockInState3D(state, del.x, del.y, del.z);
                                 else store.UnsetBlockInState(state, del.x, del.y);
                             });
+                        if (message) session.transaction->message = std::move(message);
                         return NullReply();
                     }
                     const auto lease = AcquireNamedTable(session, del.table);
                     RequireDimensions(lease.store().geometry(), del.dims);
+                    const auto message = PublishedMessage(del.publish.get(), lease.store(), parameters);
+                    std::optional<ScopedWriteMessage> publishing;
+                    if (message) publishing.emplace(&*message);
                     return VersionReply(del.dims == 3U
                         ? lease.store().UnsetBlock3D(del.x, del.y, del.z, del.if_version)
                         : lease.store().UnsetBlock(del.x, del.y, del.if_version));
@@ -2034,6 +2088,11 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& geometry = store.geometry();
                     RequireDimensions(geometry, set.dims);
                     const ChunkCoord coord{set.chunk_x, set.chunk_y, set.chunk_z};
+                    // Every write below runs under the statement's message.
+                    auto message = PublishedMessage(set.publish.get(), store, parameters);
+                    if (session.transaction != nullptr) RequireTxnMessageRoom(*session.transaction, message);
+                    std::optional<ScopedWriteMessage> publishing;
+                    if (message && session.transaction == nullptr) publishing.emplace(&*message);
                     const auto change = [&](const std::function<void(ChunkState&)>& transform) {
                         if (session.transaction == nullptr)
                             return VersionReply(store.TransformChunkState(coord, set.if_version, set.if_absent, transform));
@@ -2058,6 +2117,7 @@ std::string CommandEngine::ExecuteStatement(
                                     presence, current_vars);
                             state.written = true;
                         });
+                        if (message) session.transaction->message = std::move(message);
                         return NullReply();
                     };
                     // Metadata statements have no state parameter. Handle them
@@ -3314,9 +3374,13 @@ std::string CommandEngine::BlockWriteWithExpressions(
         return version_mismatch ? "VERSION_MISMATCH" : "CONDITION_FAILED";
     };
 
+    auto message = PublishedMessage(set != nullptr ? set->publish.get() : del->publish.get(), store, parameters);
     if (session.transaction == nullptr) {
+        std::optional<ScopedWriteMessage> publishing;
+        if (message) publishing.emplace(&*message);
         const auto result =
             store.WriteBlockDecided(x, y, z, del != nullptr, plan.block_slots, plan.reads_chunk_columns, decide);
+        publishing.reset();
         // With RETURNING, a refused write answers applied false (E4); a
         // never-written chunk has no version, as for GET BLOCK WITH VERSION.
         if (rows) {
@@ -3334,6 +3398,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
     if (plan.reads_now) throw std::invalid_argument("NOW() is not used in a transaction's writes; pass the time as a parameter");
     auto& txn = *session.transaction;
     const ChunkCoord coord = BlockCoord(geometry, x, y, z);
+    RequireTxnMessageRoom(txn, message);
     // What the statement reads of the transaction's view counts as a read of
     // the chunk (E2, E3).
     if (plan.reads_chunk) TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
@@ -3380,6 +3445,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
             store.SetBlockInState(state, x, y, assignments);
         }
     });
+    if (message) txn.message = std::move(message);
     // The chunk is the transaction's own until COMMIT: no version yet.
     if (rows) return std::move(*rows).Reply(ReturningPrefix(true, false, 0U), {}, continuation);
     return NullReply();
@@ -3430,6 +3496,9 @@ std::string CommandEngine::TxnCommit(SessionState& session) {
     for (auto& [coord, state] : txn->writes) {
         writes.push_back(TxnChunkWrite{.coord = coord, .state = std::move(state)});
     }
+    // The commit publishes the transaction's message.
+    std::optional<ScopedWriteMessage> publishing;
+    if (txn->message) publishing.emplace(&*txn->message);
     const std::uint64_t version = store.CommitTransaction(*txn->snapshot, read_set, std::move(writes));
     if (version == 0) {
         return NullReply();

@@ -46,6 +46,7 @@ DESCRIBE's schema `version` differs from its completed commit `revision`; read-o
 Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.
 Use IF with a [condition](#conditions) to test the block's own values in the same step as the write.
 Add RETURNING to SET BLOCK or DELETE BLOCK to receive the block before or after the write in the same reply; see [Blocks](reference/BLOCKS.md#returns).
+Add PUBLISH to a write to deliver an application message in its commit's change; see [Blocks](reference/BLOCKS.md#publish).
 
 ## Conditions
 

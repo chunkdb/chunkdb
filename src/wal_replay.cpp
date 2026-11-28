@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "chunkdb/change_feed.hpp"
 #include "chunkdb/crc32.hpp"
 #include "commit_group_identity.hpp"
 #include "feature_flags.hpp"
@@ -76,6 +77,8 @@ struct ParsedFrame {
     std::uint64_t commit_time_ms = 0;
     std::optional<std::string> user;
     std::optional<WalGroupRef> group;
+    // The MESSAGE TLV's value: its offset and size in the parsed bytes.
+    std::optional<std::pair<std::size_t, std::size_t>> message;
     bool gc = false;
     std::size_t size = 0;
     std::vector<PendingSpan> spans;
@@ -156,6 +159,7 @@ struct FrameShape {
     bool may_skip_unknown,
     bool slots_enabled,
     bool groups_enabled,
+    bool messages_enabled,
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end,
@@ -232,6 +236,7 @@ struct FrameShape {
     bool have_user = false;
     frame->user.reset();
     frame->group.reset();
+    frame->message.reset();
     frame->gc = (frame_flags & kWalFrameGc) != 0U;
     frame->schema_version = 1;
     for (std::size_t at = cursor + kWalFrameFixedHeaderSize; at < crc_at;) {
@@ -277,6 +282,18 @@ struct FrameShape {
                 *stop_reason = "tlv_group_invalid";
                 return false;
             }
+        } else if (type == kWalTlvMessage) {
+            // Channel length u8, the channel, then the payload.
+            const std::size_t body = at + kWalTlvHeaderSize;
+            const std::size_t channel = length == 0U ? 0U : wal[body];
+            if (!messages_enabled || frame->message || frame->gc || length == 0U || channel == 0U ||
+                length - 1U < channel || length - 1U - channel > kMaxFeedMessageBytes ||
+                !IsValidFeedChannel(std::string_view(reinterpret_cast<const char*>(wal.data() + body + 1U), channel))) {
+                *stop_reason = !messages_enabled ? "tlv_message_without_feature" :
+                    (frame->message ? "tlv_duplicate_message" : "tlv_message_invalid");
+                return false;
+            }
+            frame->message.emplace(body, length);
         } else if (!may_skip_unknown) {
             *stop_reason = "tlv_unknown_type";
             return false;
@@ -489,6 +506,15 @@ void ApplyFrameVars(
     return false;
 }
 
+// The message of a parsed frame, decoded from its TLV.
+[[nodiscard]] std::optional<FeedMessage> FrameMessage(const std::vector<std::uint8_t>& bytes, const ParsedFrame& frame) {
+    if (!frame.message) return std::nullopt;
+    const auto [body, length] = *frame.message;
+    const std::size_t channel = bytes[body];
+    const auto* text = reinterpret_cast<const char*>(bytes.data() + body + 1U);
+    return FeedMessage{.channel = std::string(text, channel), .payload = std::string(text + channel, length - 1U - channel)};
+}
+
 }  // namespace
 
 bool IsInterruptedWalCreation(const std::vector<std::uint8_t>& bytes,
@@ -505,7 +531,8 @@ FeedFrameInfo ReplayFeedFrame(
     bool intact = false;
     if (!ParseFrame(bytes, 0U, geometry, MaySkipUnknownTypes(features),
                     (features.incompat & kFeatureFeedSlots) != 0U,
-                    (features.incompat & kFeatureCommitGroups) != 0U, &frame, &reason, &reaches_end, &intact) ||
+                    (features.incompat & kFeatureCommitGroups) != 0U,
+                    (features.incompat & kFeatureMessages) != 0U, &frame, &reason, &reaches_end, &intact) ||
         frame.size != bytes.size()) {
         throw std::runtime_error("invalid captured feed frame: " + reason);
     }
@@ -548,7 +575,8 @@ FeedFrameInfo ReplayFeedFrame(
     state->version = frame.revision;
     state->commit_time_ms = frame.commit_time_ms;
     state->written = true;
-    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
+    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc,
+        FrameMessage(bytes, frame)};
 }
 
 FeedFrameInfo InspectFeedFrame(
@@ -559,12 +587,14 @@ FeedFrameInfo InspectFeedFrame(
     bool intact = false;
     if (!ParseFrame(bytes, 0U, geometry, MaySkipUnknownTypes(features),
                     (features.incompat & kFeatureFeedSlots) != 0U,
-                    (features.incompat & kFeatureCommitGroups) != 0U, &frame, &reason, &reaches_end, &intact) ||
+                    (features.incompat & kFeatureCommitGroups) != 0U,
+                    (features.incompat & kFeatureMessages) != 0U, &frame, &reason, &reaches_end, &intact) ||
         frame.size != bytes.size()) {
         throw std::runtime_error("invalid feed archive frame: " + reason);
     }
     if (frame.group) throw std::runtime_error("WAL group frame requires directory admission");
-    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
+    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc,
+        FrameMessage(bytes, frame)};
 }
 
 WalReplayResult wal_detail::ReplayFromSource(
@@ -732,6 +762,7 @@ WalReplayResult wal_detail::ReplayFromSource(
             ParseFrame(frame_bytes, window.offset, geometry, may_skip_unknown,
                        (store_features.incompat & kFeatureFeedSlots) != 0U,
                        (store_features.incompat & kFeatureCommitGroups) != 0U,
+                       (store_features.incompat & kFeatureMessages) != 0U,
                        &frame, &stop_reason, &reaches_end, &intact, source.Size() - cursor);
         if (parsed && frame.group) {
             parsed = false;

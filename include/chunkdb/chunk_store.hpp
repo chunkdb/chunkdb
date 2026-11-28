@@ -43,6 +43,7 @@ namespace chunkdb {
 
 class SnapshotGenerationMapping;
 class ChunkCoordinateIndex;
+struct FeedMessage;
 struct ChunkCoordinateNode;
 struct ChunkIndexRecord;
 
@@ -1175,6 +1176,10 @@ class ChunkStore {
 
     // WAL writers capture identity only while durable feed slots are active.
     [[nodiscard]] std::optional<std::string_view> SlotWriteUser() const noexcept;
+    // The message the current write scope publishes (ScopedWriteMessage), or
+    // null. Throws before anything is staged when the table lacks the
+    // `messages` feature.
+    [[nodiscard]] const FeedMessage* WriteMessage() const;
 
   private:
     friend class StoreResources;

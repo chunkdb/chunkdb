@@ -894,6 +894,38 @@ void TestBlockReturning() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING * IF a > 1", "expected the end of the statement, got 'IF'");
 }
 
+// PUBLISH 'channel' payload ends SET BLOCK, DELETE BLOCK and SET CHUNK
+// (docs/design/MESSAGES.md); a write without it parses as before.
+void TestPublish() {
+    assert(!Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1").publish);
+    const auto plain = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1 PUBLISH 'orders.paid' 'order 7'");
+    assert(!plain.expressions && plain.values.size() == 1U && plain.publish->channel == "orders.paid");
+    assert(std::get<cql::Text>(plain.publish->payload).value == "order 7");
+    const auto computed = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = a + 1 IF a > 0 RETURNING NEW a publish '_q' $1", 1);
+    assert(computed.expressions->condition && computed.returning && computed.publish->channel == "_q");
+    assert(std::get<cql::Parameter>(computed.publish->payload).index == 1U);
+    const auto removed = Get<cql::DeleteBlock>("DELETE BLOCK 0 0 FROM t IF VERSION 2 PUBLISH 'gone' x'00ff'");
+    assert(removed.if_version == 2U);
+    assert((std::get<cql::Bytes>(removed.publish->payload).value == std::vector<std::uint8_t>{0x00U, 0xffU}));
+    const auto chunk = Get<cql::SetChunk>("SET CHUNK 0 0 IN t $1 IF ABSENT PUBLISH 'chunks' $2", 2);
+    assert(chunk.if_absent && chunk.state.index == 1U && std::get<cql::Parameter>(chunk.publish->payload).index == 2U);
+    const auto meta = Get<cql::SetChunk>("SET CHUNK 0 0 IN t META status = 3 PUBLISH 'chunks' ''");
+    assert(meta.metadata && std::get<cql::Text>(meta.publish->payload).value.empty());
+    // A message as long as the bound parses.
+    assert(Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c' '" + std::string(chunkdb::kMaxFeedMessageBytes, 'm') + "'").publish);
+
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH orders 'x'", "expected a quoted channel name");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'Orders' 'x'", "channel names must match");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH '1st' 'x'", "channel names must match");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH '" + std::string(64, 'c') + "' 'x'", "channel names must match");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c' 1", "a message is text, bytes or a parameter");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c' NULL", "a message is text, bytes or a parameter");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c'", "expected a value");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c' '" + std::string(chunkdb::kMaxFeedMessageBytes + 1U, 'm') + "'", "a message has at most 16384 bytes");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c' 'x' RETURNING *", "expected the end of the statement, got 'RETURNING'");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 PUBLISH 'c' 'x' PUBLISH 'd' 'y'", "expected the end of the statement, got 'PUBLISH'");
+}
+
 }  // namespace
 
 void TestHelloOptions() {
@@ -935,6 +967,7 @@ int main() {
     TestBlockStatements();
     TestBlockExpressions();
     TestBlockReturning();
+    TestPublish();
     TestChunkAndAreaStatements();
     TestAggregate();
     TestLiterals();

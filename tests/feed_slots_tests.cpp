@@ -3,6 +3,7 @@
 #include <barrier>
 #include <condition_variable>
 #include <fstream>
+#include <stdexcept>
 #include <thread>
 
 #include "feed_slots.hpp"
@@ -39,6 +40,7 @@ void EqualEntry(const FeedEntry& expected, const FeedEntry& actual) {
     assert(expected.kind == actual.kind && expected.position == actual.position);
     assert(expected.commit_time_ms == actual.commit_time_ms && expected.schema_version == actual.schema_version);
     assert(expected.user == actual.user);
+    assert(expected.messages == actual.messages);
     EqualBlocks(expected.blocks, actual.blocks);
 }
 void ConditionalSlotChanges() {
@@ -220,6 +222,124 @@ void AllMutationsAndRelease() {
     table->DropFeedSlot("slow");
     table->DropFeedSlot("fast");
     assert(table->ListFeedSlots().empty());
+}
+
+bool OnlyMessage(const FeedEntry& entry, const FeedMessage& message) {
+    return entry.messages.size() == 1U && entry.messages[0] == message;
+}
+// A slot replays each message from the WAL frame its commit wrote, also after
+// a checkpoint archived that WAL and the server restarted.
+void MessagesInSlotHistory() {
+    ScopedTempDir dir("chunkdb-feed-slots-messages");
+    const auto config = SlotsConfig(dir.path());
+    const FeedMessage paid{"orders", "paid"}, cas{"orders", "cas"};
+    const FeedMessage both{"orders.moved", std::string("\0\1", 2U)}, same{"audit", ""};
+    FeedPosition start;
+    std::vector<std::shared_ptr<const FeedEntry>> live;
+    {
+        TableCatalog catalog(config);
+        auto table = feed_test::CreateDefault(catalog);
+        start = table->CreateFeedSlot("consumer").position;
+        auto feed = table->SubscribeFeed();
+        {
+            auto lease = table->Acquire();
+            auto& store = lease->store();
+            {
+                ScopedWriteMessage publishing(&paid);
+                store.SetBlockBits(0, 0, Bits(1U));
+            }
+            live.push_back(Next(*feed));
+            store.CheckpointForTests(0, 0);
+            {
+                ScopedWriteMessage publishing(&cas);
+                auto state = store.ReadChunkState(0, 0);
+                txn_test::SetCounter(&state, 2U);
+                assert(store.WriteChunkState(0, 0, std::move(state), store.GetChunkVersion(0, 0)).ok);
+            }
+            live.push_back(Next(*feed));
+            {
+                ScopedWriteMessage publishing(&both);
+                auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+                auto a = store.ReadChunkStateAt(*snapshot, 0, 0);
+                auto b = store.ReadChunkStateAt(*snapshot, 1, 0);
+                txn_test::SetCounter(&a, 3U);
+                txn_test::SetCounter(&b, 4U);
+                assert(store.CommitTransaction(*snapshot, {}, {{{0, 0}, std::move(a)}, {{1, 0}, std::move(b)}}) != 0U);
+            }
+            live.push_back(Next(*feed));
+            {
+                // An unchanged state commits only because it publishes.
+                ScopedWriteMessage publishing(&same);
+                const auto state = store.ReadChunkState(1, 0);
+                (void)store.SetChunkStateBytes(1, 0, state.payload, state.presence_bitmap);
+            }
+            live.push_back(Next(*feed));
+            store.CheckpointForTests(0, 0);
+            store.CheckpointForTests(1, 0);
+        }
+        assert(OnlyMessage(*live[0], paid) && OnlyMessage(*live[1], cas));
+        assert(OnlyMessage(*live[2], both) && live[2]->blocks.size() == 2U);
+        assert(OnlyMessage(*live[3], same) && live[3]->blocks.empty());
+        FeedSlotTestAccess::Sync(*table);
+    }
+    TableCatalog catalog(config);
+    auto table = catalog.Find("default");
+    auto reader = table->ReadFeedArchive(start);
+    for (const auto& change : live) {
+        const auto entry = reader.Next();
+        assert(entry);
+        EqualEntry(*change, *entry);
+    }
+    assert(!reader.Next());
+}
+
+void AreaReplayBudgetsOnlyDeliveredMessages() {
+    ScopedTempDir dir("chunkdb-feed-area-message-budget");
+    TableCatalog catalog(SlotsConfig(dir.path()));
+    const auto table = CreateDefault(catalog);
+    const auto start = table->CreateFeedSlot("consumer").position;
+    constexpr std::size_t budget = 512U;
+    const FeedMessage large{"audit", std::string(budget, 'm')};
+    const FeedMessage kept{"audit", "two chunks"};
+    std::uint64_t outside_revision = 0U, mixed_revision = 0U;
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        {
+            ScopedWriteMessage publishing(&large);
+            store.SetBlockBits(0, 0, Bits(1U));
+            outside_revision = store.GetChunkVersion(0, 0);
+        }
+        {
+            ScopedWriteMessage publishing(&kept);
+            auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+            auto outside = store.ReadChunkStateAt(*snapshot, 0, 0);
+            auto inside = store.ReadChunkStateAt(*snapshot, 1, 0);
+            txn_test::SetCounter(&outside, 2U);
+            txn_test::SetCounter(&inside, 3U);
+            mixed_revision = store.CommitTransaction(*snapshot, {}, {{{0, 0}, std::move(outside)}, {{1, 0}, std::move(inside)}});
+        }
+        store.CheckpointForTests(0, 0);
+        store.CheckpointForTests(1, 0);
+    }
+    FeedSlotTestAccess::Sync(*table);
+
+    auto reader = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+    FeedSlotTestAccess::Filter(reader, {.area = FeedArea{.first = {1, 0}, .last = {1, 0}, .dims = 2U}});
+    FeedSlotTestAccess::SetEntryBudget(reader, budget);
+    const auto skipped = reader.Next();
+    assert(skipped && skipped->position.revision == outside_revision && skipped->blocks.empty());
+    assert(skipped->messages.empty() && !skipped->protocol_frame);
+    const auto delivered = reader.Next();
+    assert(delivered && delivered->position.revision == mixed_revision && delivered->blocks.size() == 1U);
+    assert((delivered->blocks.front().chunk == ChunkCoord{1, 0}));
+    assert(OnlyMessage(*delivered, kept) && delivered->protocol_frame && !reader.Next());
+
+    auto unfiltered = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+    FeedSlotTestAccess::SetEntryBudget(unfiltered, budget);
+    bool refused = false;
+    try { (void)unfiltered.Next(); } catch (const std::length_error&) { refused = true; }
+    assert(refused);
 }
 
 void RestartAndPins() {
@@ -730,6 +850,8 @@ int main() {
     ConditionalLostSlot();
     AllMutationsAndRelease();
     RestartAndPins();
+    MessagesInSlotHistory();
+    AreaReplayBudgetsOnlyDeliveredMessages();
     ActivationBaseline();
     UnloadedActivation();
     AliasRecovery();

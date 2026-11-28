@@ -85,6 +85,19 @@ struct FeedChunkChange {
     std::optional<std::vector<ColumnValue>> after;
 };
 
+// An application message a write or transaction publishes in its commit
+// (docs/design/MESSAGES.md): a channel name, [a-z_][a-z0-9_.]* of 1 to 63
+// bytes, and at most kMaxFeedMessageBytes payload bytes.
+struct FeedMessage {
+    std::string channel;
+    std::string payload;
+    friend bool operator==(const FeedMessage&, const FeedMessage&) = default;
+};
+inline constexpr std::size_t kMaxFeedChannelBytes = 63U;
+inline constexpr std::size_t kMaxFeedMessageBytes = 16384U;
+// Whether `channel` is a valid channel name.
+[[nodiscard]] bool IsValidFeedChannel(std::string_view channel) noexcept;
+
 struct FeedEntry {
     enum class Kind { kChange, kChunks, kSchema, kResync, kProgress, kEnd };
     Kind kind = Kind::kChange;
@@ -102,6 +115,9 @@ struct FeedEntry {
     std::uint8_t dims = 2U;
     std::vector<Column> chunk_columns;
     std::vector<FeedChunkChange> chunk_changes;
+    // The messages the commit published, in kChange and kChunks entries; at
+    // most one today.
+    std::vector<FeedMessage> messages;
 };
 
 // A subscription has one reader. Different subscriptions are independent.
@@ -158,6 +174,20 @@ class ScopedWriteUser {
     ScopedWriteUser& operator=(const ScopedWriteUser&) = delete;
   private:
     std::string_view previous_;
+};
+
+// The message the writes of the current C++ write context publish; null for
+// none. The engine scopes a single write, or a transaction's COMMIT, to the
+// message of its statement. The message must outlive the scope; nested
+// scopes restore the caller's.
+class ScopedWriteMessage {
+  public:
+    explicit ScopedWriteMessage(const FeedMessage* message) noexcept;
+    ~ScopedWriteMessage();
+    ScopedWriteMessage(const ScopedWriteMessage&) = delete;
+    ScopedWriteMessage& operator=(const ScopedWriteMessage&) = delete;
+  private:
+    const FeedMessage* previous_;
 };
 
 }  // namespace chunkdb

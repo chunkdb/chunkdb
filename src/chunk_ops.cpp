@@ -38,8 +38,10 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
     const bool metadata_changed = chunk_columns ?
         !chunk->chunk_columns || chunk_columns->bytes != chunk->chunk_columns->bytes : chunk->chunk_columns != nullptr;
+    // A write that publishes a message commits even an unchanged state.
+    const FeedMessage* const message = WriteMessage();
     if (new_payload == chunk->payload && new_presence == chunk->presence_bitmap &&
-        var_update.empty() && !metadata_changed && (!force_write || chunk->written)) {
+        var_update.empty() && !metadata_changed && (!force_write || chunk->written) && message == nullptr) {
         return false;
     }
     RequireVarWrite(chunk->vars, var_update, chunk_columns ? chunk_columns->variable_bytes : 0U,
@@ -123,7 +125,8 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // never straddles the payload/presence boundary, so replay's shape
         // guard stays strict even when a large state splits into several
         // records. The frame keeps the whole replace atomic.
-        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser(),
+            false, message);
         // Sized once, so a large state is not copied again as the batch grows.
         frame.Reserve(
             WalFrameBuilder::SpanRecordBytes(chunk->payload.size()) +

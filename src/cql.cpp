@@ -659,7 +659,8 @@ class Parser {
         const std::set<std::size_t> before = parameters_;
         try {
             *values = Assignments();
-            if (Peek().kind == TokenKind::kEnd || IsKeyword(Peek(), "if") || IsKeyword(Peek(), "returning")) return;
+            if (Peek().kind == TokenKind::kEnd || IsKeyword(Peek(), "if") || IsKeyword(Peek(), "returning") ||
+                IsKeyword(Peek(), "publish")) return;
         } catch (const ParseError&) {
             // Not single values: read again as expressions below.
         }
@@ -711,6 +712,27 @@ class Parser {
             returning->columns.push_back(Name("a column name or *"));
         } while (AcceptToken(TokenKind::kComma));
         return returning;
+    }
+
+    // PUBLISH 'channel' (text | bytes | $n), or nothing: the message the
+    // write's commit publishes (docs/design/MESSAGES.md).
+    [[nodiscard]] std::shared_ptr<const Publish> PublishClause() {
+        if (!Accept("publish")) return nullptr;
+        auto publish = std::make_shared<Publish>();
+        const Token& channel = Peek();
+        if (channel.kind != TokenKind::kText) Fail(channel.column, "expected a quoted channel name, got " + Quote(channel));
+        if (!IsValidFeedChannel(channel.text))
+            Fail(channel.column, "channel names must match [a-z_][a-z0-9_.]* and have 1 to 63 bytes");
+        publish->channel = Take().text;
+        const std::size_t column = Peek().column;
+        publish->payload = Value(true);
+        const auto* text = std::get_if<Text>(&publish->payload);
+        const auto* bytes = std::get_if<Bytes>(&publish->payload);
+        if (text == nullptr && bytes == nullptr && !std::holds_alternative<Parameter>(publish->payload))
+            Fail(column, "a message is text, bytes or a parameter");
+        if ((text != nullptr ? text->value.size() : bytes != nullptr ? bytes->value.size() : 0U) > kMaxFeedMessageBytes)
+            Fail(column, "a message has at most " + std::to_string(kMaxFeedMessageBytes) + " bytes");
+        return publish;
     }
 
     [[nodiscard]] std::uint8_t Point(std::int64_t& x, std::int64_t& y, std::int64_t& z, bool chunk = false) {
@@ -1122,6 +1144,7 @@ class Parser {
                 BlockCondition(&set.if_version, &expressions);
                 set.expressions = std::move(expressions);
                 set.returning = ReturningClause(false);
+                set.publish = PublishClause();
                 return set;
             }
             if (Accept("chunk")) {
@@ -1147,6 +1170,7 @@ class Parser {
                         set.if_version = Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
                     }
                 }
+                set.publish = PublishClause();
                 return set;
             }
             Fail(Peek().column, "expected BLOCK or CHUNK, got " + Quote(Peek()));
@@ -1161,6 +1185,7 @@ class Parser {
             BlockCondition(&del.if_version, &expressions);
             del.expressions = std::move(expressions);
             del.returning = ReturningClause(true);
+            del.publish = PublishClause();
             return del;
         }
         if (Accept("create")) {

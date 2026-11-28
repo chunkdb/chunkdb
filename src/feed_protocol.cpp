@@ -122,6 +122,17 @@ struct CoordinateEncoding {
 };
 }
 namespace {
+// The trailing messages element of a change or chunks push, present only
+// when the commit published one: [[channel, payload], ...].
+void AppendMessages(std::string& out, const std::vector<FeedMessage>& messages) {
+    if (messages.empty()) return;
+    Protocol::AppendArrayHeader(out, messages.size());
+    for (const auto& message : messages) {
+        Protocol::AppendArrayHeader(out, 2U);
+        Protocol::AppendBulk(out, message.channel);
+        Protocol::AppendBulk(out, message.payload);
+    }
+}
 [[nodiscard]] std::pair<std::size_t, std::size_t> SectionOf(
     const ChunkLayout& layout,
     const ChunkLayout::FixedColumn& fixed) {
@@ -191,6 +202,7 @@ std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const Feed
     result->schema_version = entry->schema_version; result->commit_time_ms = entry->commit_time_ms; result->user = entry->user;
     result->dims = entry->dims;
     result->chunk_columns = entry->chunk_columns;
+    result->messages = entry->messages;
     const auto& layout = geometry.LayoutAt(entry->schema_version);
     std::vector<std::size_t> selected;
     if (ids) selected = FeedProjectionIndexes(layout.schema().columns, *ids);
@@ -255,7 +267,10 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
     if (!areas.empty()) std::erase_if(filtered->chunk_changes, [&](const auto& change) {
         return !InArea(change.chunk, entry->dims, areas);
     });
-    if (filtered->blocks.empty() && filtered->chunk_changes.empty()) return nullptr;
+    // AREA drops a change that keeps no data, with its messages; otherwise a
+    // change that carries a message is sent even without data.
+    if (filtered->blocks.empty() && filtered->chunk_changes.empty() && (!areas.empty() || entry->messages.empty()))
+        return nullptr;
     const auto project = [&](auto& row) {
         if (!row || !ids) return;
         if (row->size() != columns.size()) throw std::logic_error("feed row does not match its historical schema");
@@ -303,7 +318,7 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         return out;
     }
     if (entry.kind == FeedEntry::Kind::kChunks) {
-        out = ">9\r\n"; Protocol::AppendBulk(out, "chunks");
+        out = entry.messages.empty() ? ">9\r\n" : ">10\r\n"; Protocol::AppendBulk(out, "chunks");
         Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch)); Number(out, ':', entry.position.revision);
         Number(out, ':', entry.commit_time_ms);
         if (entry.user) Protocol::AppendBulk(out, *entry.user); else Protocol::AppendNull(out);
@@ -317,10 +332,11 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
             if (chunk.form) Protocol::AppendBulk(out, *chunk.form); else Protocol::AppendNull(out);
         }
         out += "_\r\n_\r\n";
+        AppendMessages(out, entry.messages);
         return out;
     }
     if (entry.kind != FeedEntry::Kind::kChange) throw std::logic_error("unknown feed entry kind");
-    out = ">10\r\n";
+    out = entry.messages.empty() ? ">10\r\n" : ">11\r\n";
     Protocol::AppendBulk(out, "change");
     Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
     Number(out, ':', entry.position.revision);
@@ -351,6 +367,7 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         before.Append(out, change.before);
         after.Append(out, change.after);
     }
+    AppendMessages(out, entry.messages);
     return out;
 }
 
@@ -437,6 +454,8 @@ std::size_t FeedEntryRetainedBytes(const FeedEntry& entry) {
     for (const auto& block : entry.blocks) { bytes.Add(FeedRowRetainedBytes(block.before)); bytes.Add(FeedRowRetainedBytes(block.after)); }
     bytes.Storage(entry.chunk_changes.capacity(), sizeof(FeedChunkChange));
     for (const auto& change : entry.chunk_changes) { bytes.Add(FeedRowRetainedBytes(change.before)); bytes.Add(FeedRowRetainedBytes(change.after)); }
+    bytes.Storage(entry.messages.capacity(), sizeof(FeedMessage));
+    for (const auto& message : entry.messages) { bytes.Add(message.channel.capacity()); bytes.Add(message.payload.capacity()); }
     bytes.Storage(entry.chunk_forms.capacity(), sizeof(FeedChunkForm));
     for (const auto& chunk : entry.chunk_forms) if (chunk.form) {
         bytes.Add(chunk.form->capacity()); bytes.Add(sizeof(std::string)); bytes.Add(2U * sizeof(void*));
@@ -461,11 +480,19 @@ std::size_t ChunkItemBytes(std::uint8_t dims, const FeedChunkForm& chunk) noexce
     return 4U + SignedBytes(chunk.chunk.x) + SignedBytes(chunk.chunk.y) + (dims == 3U ? SignedBytes(chunk.chunk.z) : 0U) +
         NumberBytes(chunk.version) + (chunk.form ? BulkBytes(chunk.form->size()) : 3U);
 }
+// The trailing messages element, as AppendMessages writes it.
+std::size_t MessagesBytes(const std::vector<FeedMessage>& messages) noexcept {
+    if (messages.empty()) return 0U;
+    std::size_t bytes = NumberBytes(messages.size());
+    for (const auto& message : messages) bytes += 4U + BulkBytes(message.channel.size()) + BulkBytes(message.payload.size());
+    return bytes;
+}
 // Everything but the chunk items, for a push with `count` chunks.
 std::size_t ChunksHeaderBytes(const FeedEntry& entry, std::size_t count) {
-    return 4U + BulkBytes(6U) + BulkBytes(StoreIdHex(entry.position.epoch).size()) + NumberBytes(entry.position.revision) +
+    return (entry.messages.empty() ? 4U : 5U) + BulkBytes(6U) + BulkBytes(StoreIdHex(entry.position.epoch).size()) +
+        NumberBytes(entry.position.revision) +
         NumberBytes(entry.commit_time_ms) + (entry.user ? BulkBytes(entry.user->size()) : 3U) +
-        NumberBytes(entry.schema_version) + NumberBytes(count) + 6U;
+        NumberBytes(entry.schema_version) + NumberBytes(count) + 6U + MessagesBytes(entry.messages);
 }
 }
 std::size_t FeedChunksEncodedBytes(const FeedEntry& entry) {
@@ -492,6 +519,8 @@ bool FeedChunksMerge::Add(const std::shared_ptr<const FeedEntry>& entry, std::si
     if (entry->position.epoch != newest_->position.epoch || entry->position.revision <= newest_->position.revision ||
         entry->dims != newest_->dims) throw std::logic_error("merged chunks pushes are out of order");
     if (entry->schema_version != newest_->schema_version) return false;
+    // A message belongs to its own commit, so a push that carries one is never merged.
+    if (!entry->messages.empty() || !newest_->messages.empty()) return false;
     // A push names each chunk once, so each replaced chunk is counted once.
     auto bytes = item_bytes_;
     auto count = items_.size();

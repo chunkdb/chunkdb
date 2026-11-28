@@ -6919,6 +6919,58 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     writer.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(writer)).empty());
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
+void TestPublishParameterFraming() {
+    auto config = BaseServerConfig();
+    config.feed_progress_ms = 60000;
+    ServerHarness harness("publish-parameters", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient writer("127.0.0.1", harness.port);
+    writer.Hello();
+    RawClient watch("127.0.0.1", harness.port);
+    watch.Hello();
+    watch.SendLine("WATCH default");
+    assert(!FeedStart(ReadFeedReply(watch)).empty());
+
+    const auto expect_message = [&](std::uint64_t revision, const std::string& payload) {
+        const auto change = ReadFeedReply(watch);
+        assert(change.type == '>' && change.items.size() == 11U && change.items[0].value == "change");
+        assert(change.items[2].value == std::to_string(revision));
+        const auto& messages = change.items.back();
+        assert(messages.type == '*' && messages.items.size() == 1U);
+        const auto& pair = messages.items.front();
+        assert(pair.type == '*' && pair.items.size() == 2U);
+        assert(pair.items[0].type == '$' && pair.items[0].value == "audit");
+        assert(pair.items[1].type == '$' && pair.items[1].value == payload);
+    };
+
+    constexpr std::size_t message_limit = 16384U;
+    std::string payload(message_limit, 'm');
+    payload.replace(0U, 3U, "\0\r\n", 3U);
+    const auto form = ChunkFormOf(std::string(2U, '\xff'), std::string(8U, '\x11'));
+    writer.SendBytes("SET CHUNK 0 0 IN default $1 PUBLISH 'audit' $2\r\n" + Frame(form) + Frame(payload) + "PING\r\n");
+    const auto first = ReadVersion(writer);
+    assert(writer.ReadLine() == "+PONG\r\n");
+    expect_message(first, payload);
+
+    // The server refuses the declared length without reading a body.
+    RawClient oversized("127.0.0.1", harness.port);
+    oversized.Hello();
+    oversized.SendBytes("DELETE BLOCK 0 0 FROM default PUBLISH 'audit' $1\r\n$" + std::to_string(message_limit + 1U) + "\r\n");
+    assert(oversized.ReadLine().starts_with("-ERR PROTOCOL "));
+    assert(oversized.WaitForClose(std::chrono::seconds(5)));
+    writer.SendLine("DELETE BLOCK 0 0 FROM default PUBLISH 'audit' '" + std::string(message_limit + 1U, 'm') + "'");
+    assert(writer.ReadLine().starts_with("-ERR SYNTAX "));
+    writer.SendLine("GET BLOCK 0 0 FROM default");
+    assert(writer.ReadReply() == BitsReply("\x01"));
+
+    const std::string deleted("\0\xff", 2U);
+    writer.SendBytes("DELETE BLOCK 0 0 FROM default PUBLISH 'audit' $1\r\n" + Frame(deleted));
+    const auto last = ReadVersion(writer);
+    assert(last > first);
+    expect_message(last, deleted);
+    writer.SendLine("GET BLOCK 0 0 FROM default");
+    assert(writer.ReadLine() == "_\r\n");
+}
+
 template <typename Client> void TestWatchDefaultProgress(bool tls) {
     auto config = BaseServerConfig(); config.tls_enabled = tls;
     assert(config.feed_progress_ms == 1000U);
@@ -8185,6 +8237,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
     run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
     run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestPublishParameterFraming", TestPublishParameterFraming);
     run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });

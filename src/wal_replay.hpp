@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "chunkdb/change_feed.hpp"
 
 namespace chunkdb {
 
@@ -57,6 +58,8 @@ struct FeedFrameInfo {
     std::uint64_t schema_version;
     std::optional<std::string> user{};
     bool gc = false;
+    // The frame's MESSAGE TLV.
+    std::optional<FeedMessage> message{};
 };
 // Validates the whole frame's framing and records without applying state.
 // A GROUP frame is refused: no caller admits group members yet.
