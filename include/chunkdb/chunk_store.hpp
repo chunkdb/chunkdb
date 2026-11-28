@@ -1776,6 +1776,8 @@ class ChunkStore {
     // proves that this store previously exposed deterministic version tokens.
     void InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error);
     void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
+    // Reserve space for a replicated revision without advancing the live clock.
+    void ReserveReplicatedRevision(std::uint64_t revision);
     // Moves the clock past a persisted chunk revision seen at load time, so
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.

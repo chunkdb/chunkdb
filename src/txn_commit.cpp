@@ -661,7 +661,7 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
         // frontier stays below the revision until this commit is published.
         if (replicated->revision < version_clock_.load(std::memory_order_seq_cst))
             throw std::invalid_argument("the push's revision is not above the follower's revision");
-        RaiseVersionClockAbove(replicated->revision);
+        ReserveReplicatedRevision(replicated->revision);
         version = replicated->revision;
     } else {
         version = NextChunkVersion();
@@ -675,8 +675,9 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
             commit_time_ms = NextCommitTimeMs(*change.target->chunk);
         }
     }
-    // Loaded after the version was taken, as a plain write does.
-    const bool keep_states = txn_history_->OpenCount() > 0U;
+    // Replication keeps the clock at its old position until the commit point.
+    // A snapshot can still open at that position, so reserve its history now.
+    bool keep_states = replicated != nullptr || txn_history_->OpenCount() > 0U;
 
     // Everything that allocates happens before the intent.
     TxnIntent intent{.state = TxnIntentState::kRollback, .version = version, .entries = {}};
@@ -873,6 +874,14 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
     // follows is either non-throwing or contained, as after an ordinary
     // write's commit point (FinishOrdinaryMutationLocked).
 
+    if (replicated != nullptr) {
+        // APPLY serializes writes on a follower and still holds the producer
+        // bound. A snapshot opening after this store sees the new revision;
+        // an older one counted itself before reading the clock.
+        version_clock_.store(version + 1U, std::memory_order_seq_cst);
+        keep_states = txn_history_->OpenCount() > 0U;
+    }
+
     // Memory takes the new states; the replaced ones go to the history (into
     // nodes made before the intent) for older snapshots. Moves only.
     for (auto& change : changes) {
@@ -897,7 +906,7 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
         change.keep.coordinate.Publish(chunk.present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk.chunk_columns.get()), version);
         chunk.pending_updates += 1;
         chunk.wal_bytes += change.bytes.size();
-        if (!change.keep.node.empty()) {
+        if (keep_states) {
             TxnHistory::Fill(change.keep.node, std::move(previous));
             txn_history_->Publish(change.keep.node);
         }

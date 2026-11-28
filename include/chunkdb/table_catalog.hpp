@@ -719,10 +719,16 @@ class TableCatalog {
         // nullptr for a table that never served.
         std::shared_ptr<Table> table;
         const char* reason = nullptr;
+        // The epoch on disk under this name, which can differ from table
+        // after a swap. A rename can leave a fence with no directory.
+        std::optional<StoreId> epoch{};
     };
     using FenceNode = std::map<std::string, Fenced, std::less<>>::node_type;
     // Made before the step that may fail, so that fencing does not allocate.
-    [[nodiscard]] static FenceNode PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason);
+    [[nodiscard]] static FenceNode PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason,
+        std::optional<StoreId> epoch = std::nullopt);
+    // Called under catalog operations admission, before publishing a table.
+    void RequireUnusedEpoch(const StoreId& epoch, std::string_view except = {}) const;
     // RetireTable, with the table's name fenced until RecoverTable.
     void FenceTable(Table& table, const TableOptions& options, FenceNode fence);
     void ThrowIfFenced(std::string_view name) const;

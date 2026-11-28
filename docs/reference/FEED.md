@@ -210,9 +210,10 @@ Only UNWATCH is accepted while streaming.
 
 ## APPLY
 
-`APPLY $1` writes one replication push into the follower table whose epoch the push names, so the follower keeps the primary's epoch, revision, chunk versions, commit times and users.
-It needs REPLICATION, and is refused inside a transaction and on a `--read-only` server.
-`$1` is the push as the server sent it, its RESP3 bytes, at most `--feed-buffer-bytes` and 1048576 values.
+`APPLY $1` writes one replication push into the follower table whose epoch the push names, keeping the supplied epoch, revision, chunk versions and commit time.
+The live WATCH event carries the user supplied in the push.
+APPLY needs REPLICATION and is refused inside a transaction and on a `--read-only` server.
+`$1` contains the RESP3 bytes of a `replication` or `progress` push, up to `--feed-buffer-bytes` and 1048576 values.
 A `replication` push is `[replication, epoch, revision, commit_time_ms, user, schema_version, chunks, null, null]`; each chunk is `[cx, cy(, cz), version, kind, data]` with `version` equal to `revision`.
 Kind `form` carries the chunk's form after the commit, or null when the commit left it empty; kind `rows` carries `[blocks, chunk_row]`, each block `[x, y(, z), row]` with the row's values in column order as bulk strings in their [parameter encoding](../PROTOCOL.md#parameters), null for NULL, or null for a deleted block, and `chunk_row` the chunk columns the same way, or null when unchanged.
 A `progress` push, `[progress, epoch, revision]`, raises the follower's revision.
@@ -223,8 +224,11 @@ A commit applies whatever the follower's `--txn-max-written-chunks`; the followe
 A follower's checkpoints do not collect its empty chunks.
 
 A follower is made with `CREATE TABLE f (...) WITH follower = 'epoch'`, the primary table's epoch, for a primary table without commits or schema changes.
-It refuses SET BLOCK, DELETE BLOCK, SET CHUNK, ALTER TABLE column and check changes, COMPACT TOMBSTONES, CREATE SLOT and MIGRATE with `INVALID_ARGUMENT reason=follower`; reads, WATCH, DROP TABLE, RENAME TO and ALTER TABLE SET of options work.
-A data directory holds one table per epoch, so a follower and its primary are on different servers; a second table of an epoch is refused with `INVALID_ARGUMENT reason=epoch_in_use`.
+It refuses SET BLOCK, DELETE BLOCK, SET CHUNK, ALTER TABLE column and check changes, COMPACT TOMBSTONES and CREATE SLOT with `INVALID_ARGUMENT reason=follower`.
+MIGRATE also refuses ALTER TABLE and CREATE SLOT steps on a follower.
+Reads, WATCH, DROP TABLE, RENAME TO and ALTER TABLE SET of options work.
+A data directory holds one table per epoch, so a follower and its primary are on different servers.
+A second table of an epoch is refused with `INVALID_ARGUMENT reason=epoch_in_use` even while the existing table is fenced.
 
 | Error | When |
 | --- | --- |
@@ -236,6 +240,8 @@ A data directory holds one table per epoch, so a follower and its primary are on
 | PERMISSION_DENIED | You lack REPLICATION. |
 
 A refused push changes nothing.
+Retry a commit after a confirmed rollback using the same push.
+After OUTCOME_UNKNOWN, recover the table or restart before retrying.
 
 ## Limits
 

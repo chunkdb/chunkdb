@@ -324,6 +324,14 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
     version_clock_ceiling_.store(new_ceiling, std::memory_order_release);
 }
 
+void ChunkStore::ReserveReplicatedRevision(std::uint64_t revision) {
+    const auto next = revision + 1U;
+    if (next < version_clock_ceiling_.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(version_clock_mutex_);
+    if (next >= version_clock_ceiling_.load(std::memory_order_acquire))
+        ExtendVersionClockCeilingLocked(next);
+}
+
 std::uint64_t ChunkStore::NextChunkVersion() {
     if (access_mode_ == AccessMode::kReadOnly) {
         return NewChunkVersionToken();

@@ -1182,6 +1182,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_replication_apply_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_replication_apply_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME replication_apply COMMAND chunkdb_replication_apply_test)
+    add_test(NAME replication_apply_crash COMMAND chunkdb_replication_apply_test --crash)
 
     # Documentation checks (scripts/test/docker-quickstart.sh and the CI docs job).
     add_library(chunkdb_docs_check_lib STATIC tests/docs_check.cpp)
@@ -1533,6 +1534,7 @@ if(CHUNKDB_BUILD_TESTS)
         durability_crash_hardening
         snapshot_generation_linger
         txn_crash
+        replication_apply_crash
         chunk_coordinate_index_crash
         table_tombstones_crash
         commit_owner_artifact_io_crash

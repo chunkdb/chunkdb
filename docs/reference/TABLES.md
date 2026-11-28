@@ -168,7 +168,7 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
 | INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE, SWAP TABLES or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
-| INVALID_ARGUMENT `reason=follower` | A write, a column or check change, COMPACT TOMBSTONES, CREATE SLOT or MIGRATE on a follower table. | Change the primary; the follower follows through [APPLY](FEED.md#apply). |
+| INVALID_ARGUMENT `reason=follower` | A write, a column or check change, COMPACT TOMBSTONES, CREATE SLOT, or a migration that alters the follower or creates a slot on it. | Change the primary and apply its data changes through [APPLY](FEED.md#apply). |
 | INVALID_ARGUMENT `reason=epoch_in_use` | CREATE TABLE ... WITH follower names the epoch of a table of this server. | Create the follower on another server. |
 | INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
 | INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |

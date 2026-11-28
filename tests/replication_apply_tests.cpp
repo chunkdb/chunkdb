@@ -66,16 +66,19 @@ std::unique_ptr<SessionState> Greeted(CommandEngine& engine) {
 struct Server {
     test::ScopedTempDir dir;
     std::filesystem::path backups;
+    std::size_t written_chunk_limit = kMaxTxnWrittenChunks;
     std::shared_ptr<TableCatalog> catalog;
     std::unique_ptr<CommandEngine> engine;
     std::unique_ptr<SessionState> session;
 
-    explicit Server(const std::string& prefix, std::filesystem::path backup_dir = {})
-        : dir(prefix), backups(std::move(backup_dir)) { Open(); }
+    explicit Server(const std::string& prefix, std::filesystem::path backup_dir = {},
+                    std::size_t chunk_limit = kMaxTxnWrittenChunks)
+        : dir(prefix), backups(std::move(backup_dir)), written_chunk_limit(chunk_limit) { Open(); }
 
     void Open() {
         CatalogConfig config;
         config.data_dir = dir.path();
+        config.query_limits.txn_max_written_chunks = written_chunk_limit;
         catalog = std::make_shared<TableCatalog>(config);
         engine = std::make_unique<CommandEngine>(EngineConfig{.require_auth = false, .backup_dir = backups}, catalog);
         session = Greeted(*engine);
@@ -192,8 +195,8 @@ struct Pair {
     Server primary;
     Server follower;
     std::string epoch;
-    explicit Pair(const std::filesystem::path& backups = {})
-        : primary("chunkdb-apply-primary"), follower("chunkdb-apply-follower", backups) {
+    explicit Pair(const std::filesystem::path& backups = {}, std::size_t follower_chunk_limit = kMaxTxnWrittenChunks)
+        : primary("chunkdb-apply-primary"), follower("chunkdb-apply-follower", backups, follower_chunk_limit) {
         assert(primary.Run(std::string("CREATE TABLE t ") + kColumns) == "+OK\r\n");
         epoch = DescribeField(primary.Run("DESCRIBE t"), "epoch");
         assert(epoch.size() == 32U);
@@ -263,6 +266,39 @@ void TestFollowerTable() {
     follower.Restart();
     ExpectError(follower.Run("SET BLOCK 0 0 IN f n = 1"), "INVALID_ARGUMENT reason=follower ");
     assert(DescribeField(follower.Run("DESCRIBE f"), "epoch") == pair.epoch);
+}
+
+void TestFencedFollowerReservesEpoch() {
+    Server server("chunkdb-apply-fenced");
+    const auto option = " WITH follower = '" + std::string(32U, 'a') + "'";
+    {
+        ScopedEnv sync("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE", "1");
+        ScopedEnv undo("CHUNKDB_FAILPOINT_TABLE_CREATE_UNDO_FAIL_ONCE", "1");
+        ExpectError(server.Run(std::string("CREATE TABLE f ") + kColumns + option), "INTERNAL ");
+    }
+    assert(server.catalog->Fence("f"));
+    const auto duplicate = std::string("CREATE TABLE g ") + kColumns + option;
+    ExpectError(server.Run(duplicate), "INVALID_ARGUMENT reason=epoch_in_use ");
+    assert(server.Run("RECOVER TABLE f") == "+OK\r\n");
+    ExpectError(server.Run(duplicate), "INVALID_ARGUMENT reason=epoch_in_use ");
+    assert(server.Run("DROP TABLE f") == "+OK\r\n");
+    assert(server.Run(duplicate) == "+OK\r\n");
+}
+
+void TestDuplicateEpochRefusesStartup() {
+    Pair pair;
+    Server copy("chunkdb-apply-duplicate");
+    assert(copy.Run(std::string("CREATE TABLE g ") + kColumns + " WITH follower = '" + pair.epoch + "'") == "+OK\r\n");
+    copy.Close();
+    pair.follower.Close();
+    std::filesystem::rename(copy.dir.path() / "tables" / "g", pair.follower.dir.path() / "tables" / "g");
+    bool refused = false;
+    try {
+        pair.follower.Open();
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).starts_with("duplicate table epoch ");
+    }
+    assert(refused);
 }
 
 void TestApplyForms() {
@@ -501,6 +537,16 @@ void ExpectWholeOrNothing(Pair& pair, const std::string& push, bool committed) {
     pair.ExpectSameRevision();
 }
 
+void TestApplyRollbackCanRetry() {
+    Pair pair;
+    const auto push = TwoChunkCommit(pair);
+    {
+        ScopedEnv fail("CHUNKDB_FAILPOINT_TXN_APPEND_FAIL_AT", "1");
+        ExpectError(pair.follower.Apply(push), "INTERNAL ");
+    }
+    ExpectWholeOrNothing(pair, push, false);
+}
+
 // A commit record that cannot be made durable answers OUTCOME_UNKNOWN; after
 // a restart the push is skipped, since the commit stands.
 void TestOutcomeUnknownResend() {
@@ -516,6 +562,7 @@ void TestOutcomeUnknownResend() {
 }
 
 constexpr int kCrashExit = 86;
+constexpr std::size_t kCrashFollowerChunkLimit = 1U;
 
 int RunChild(const std::string& executable, const std::vector<std::string>& args) {
     std::string command = "\"" + executable + "\"";
@@ -537,6 +584,7 @@ int RunApplyCrashChild(const std::filesystem::path& dir, const std::filesystem::
     const std::string push{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     CatalogConfig config;
     config.data_dir = dir;
+    config.query_limits.txn_max_written_chunks = kCrashFollowerChunkLimit;
     auto catalog = std::make_shared<TableCatalog>(config);
     CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
     auto session = Greeted(engine);
@@ -548,7 +596,7 @@ int RunApplyCrashChild(const std::filesystem::path& dir, const std::filesystem::
 
 // A process that crashes at each step of a two-chunk APPLY leaves the
 // follower with the whole commit or none of it.
-void TestCrashDuringApply(const std::string& executable) {
+void TestCrashDuringApply(const std::string& executable, DurabilityMode mode) {
     struct Case {
         const char* failpoint;
         const char* value;
@@ -562,7 +610,9 @@ void TestCrashDuringApply(const std::string& executable) {
              {"CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_COMMIT_PUBLISH_ONCE", "1", false},
              {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_COMMIT_PUBLISH_ONCE", "1", true},
              {"CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_INTENT_UNLINK_ONCE", "1", true}}) {
-        Pair pair;
+        Pair pair({}, kCrashFollowerChunkLimit);
+        assert(pair.follower.Run(std::string("ALTER TABLE f SET durability_mode = '") +
+            DurabilityModeName(mode) + "'") == "+OK\r\n");
         const auto push = TwoChunkCommit(pair);
         test::ScopedTempDir files("chunkdb-apply-push");
         const auto push_file = files.path() / "push";
@@ -574,7 +624,7 @@ void TestCrashDuringApply(const std::string& executable) {
         const int code = RunChild(executable,
             {"--apply-crash-child", pair.follower.dir.path().string(), push_file.string(), item.failpoint, item.value});
         if (code != kCrashExit) {
-            std::fprintf(stderr, "child for %s=%s exited with %d\n", item.failpoint, item.value, code);
+            std::fprintf(stderr, "%s child for %s=%s exited with %d\n", DurabilityModeName(mode), item.failpoint, item.value, code);
             assert(false);
         }
         pair.follower.Open();
@@ -649,17 +699,24 @@ int main(int argc, char** argv) {
     if (argc == 6 && std::string(argv[1]) == "--apply-crash-child")
         return RunApplyCrashChild(argv[2], argv[3], argv[4], argv[5]);
     assert(argc >= 1);
+    if (argc == 2 && std::string_view(argv[1]) == "--crash") {
+        for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint})
+            TestCrashDuringApply(argv[0], mode);
+        return 0;
+    }
     TestManifestFollower();
     TestDecoder();
     TestFollowerTable();
+    TestFencedFollowerReservesEpoch();
+    TestDuplicateEpochRefusesStartup();
     TestApplyForms();
     TestApplyRows();
     TestApplyRefusals();
     TestProgressAndRestart();
     TestDdlRacingReopen();
     TestFollowerCheckpoint();
+    TestApplyRollbackCanRetry();
     TestOutcomeUnknownResend();
-    TestCrashDuringApply(argv[0]);
     TestRestoreFollowerWritable();
     return 0;
 }
