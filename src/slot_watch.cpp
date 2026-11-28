@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "feed_protocol.hpp"
+#include "feed_slot_logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/logging.hpp"
 
@@ -472,9 +473,21 @@ bool SlotWatch::Work() {
             if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
             const auto opening = std::chrono::steady_clock::now();
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
-            if (const auto opened = std::chrono::steady_clock::now(); opened - opening >= std::chrono::seconds(1))
-                LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot archive reader was slow to open",
-                    {{"slot", claim_->name}, {"ms", std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(opened - opening).count())}});
+            auto elapsed = std::chrono::steady_clock::now() - opening;
+            if (const auto* hook = hook_.load(std::memory_order_acquire)) elapsed = hook->ArchiveOpenElapsed(elapsed);
+            if (std::exchange(archive_after_live_resync_, false)) {
+                LogFeedSlotDiagnostic([&] {
+                    LogMessage(LogLevel::kInfo, LogComponent::kServer, "slot watch reads the archive",
+                        {{"slot", claim_->name}, {"cursor", std::to_string(cursor_.revision)},
+                         {"live", std::to_string(join_)}, {"durable", std::to_string(archive_->through().revision)}});
+                });
+            }
+            if (elapsed >= kSlowFeedSlotOperation) {
+                LogFeedSlotDiagnostic([&] {
+                    LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot archive reader was slow to open",
+                        {{"slot", claim_->name}, {"ms", std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count())}});
+                });
+            }
             // The reader keeps only what this watch sends, so its budget
             // counts the frames this watch sends.
             if (Filtered()) archive_->Filter({SlotArea(), options_.column_ids, options_.no_before, options_.chunks});
@@ -496,12 +509,9 @@ bool SlotWatch::Work() {
     if (!pending_) return Progress(slot) || changed;
     if (pending_->kind == FeedEntry::Kind::kEnd) throw TableNotFoundError("watched table was dropped");
     if (pending_->kind == FeedEntry::Kind::kResync) {
-        // The live feed no longer holds this watch's position: it catches up from the archive.
-        LogMessage(LogLevel::kInfo, LogComponent::kServer, "slot watch reads the archive",
-            {{"slot", claim_->name}, {"cursor", std::to_string(cursor_.revision)},
-             {"live", std::to_string(pending_->position.revision)}, {"durable", std::to_string(slot.durable_watermark)}});
         join_ = pending_->position.revision;
         joined_ = false;
+        archive_after_live_resync_ = true;
         pending_.reset();
         return true;
     }

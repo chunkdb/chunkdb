@@ -37,6 +37,8 @@ struct FeedDeliveryTestHook {
         kBeforeIoPoll }; // kBeforeIoPoll passes the number of watch sockets polled.
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
+    // Only the archive open diagnostic uses this duration.
+    virtual std::chrono::steady_clock::duration ArchiveOpenElapsed(std::chrono::steady_clock::duration elapsed) const noexcept { return elapsed; }
 };
 struct FeedDeliveryTestAccess {
     static std::size_t FillActiveClientSendQueue(ChunkServer& server, int bytes);
@@ -236,6 +238,7 @@ class SlotWatch {
     bool cancelled_ = false, unwatch_ = false, finished_ = false, active_ = false;
     // Worker-only fields.
     bool resync_, joined_ = false;
+    bool archive_after_live_resync_ = false;
     FeedPosition cursor_;
     std::uint64_t join_ = 0, schema_ = 0;
     std::unique_ptr<FeedSubscription> live_;
