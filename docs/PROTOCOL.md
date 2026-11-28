@@ -173,6 +173,7 @@ In a selected scan this cursor can lie outside the selection because the limit a
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
+A SCAN CHUNKS with SINCE requires WITH DATA when it uses WHERE or BLOCKS.
 AGGREGATE returns a map from each function's lowercase name, such as `count(*)` or `sum(a)`, to its result, in statement order.
 With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block that matches WHERE, in coordinate order.
 COUNT(*) is an integer; SUM, MIN and MAX of integer columns are integers or big numbers; AVG and float SUM are doubles; float MIN and MAX are doubles that keep the column value, so an f32 prints at f32 precision; a function over no value is null.

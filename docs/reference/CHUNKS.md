@@ -142,7 +142,7 @@ selection:
 | VERSION_MISMATCH | The destination changed. | Read it again and recompute. |
 | INVALID_ARGUMENT | The geometry, values, or arguments are invalid. | Check the table and syntax. |
 | INVALID_ARGUMENT | You run SET CHUNK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
-| SYNTAX | SCAN CHUNKS has WHERE with SINCE but without WITH DATA, or a condition that does not parse. | Add WITH DATA and check the [condition rules](../CQL.md#conditions). |
+| SYNTAX | SCAN CHUNKS uses SINCE with WHERE or BLOCKS and omits WITH DATA, or has a condition that does not parse. | Add WITH DATA and check the [condition rules](../CQL.md#conditions). |
 | INVALID_ARGUMENT | WHERE names an unknown column, mixes types, has a parameter with no column to take its type from or of the wrong size, or divides an integer by zero. | Check DESCRIBE and the condition. |
 | INVALID_ARGUMENT | SCALE does not divide every chunk side, or a column type does not accept the reduction. | Choose another factor, reduction or COLUMNS. |
 | OUT_OF_RANGE | The area or response exceeds a limit. | Read a smaller area. |
@@ -244,7 +244,8 @@ position = 3
 retained_deletion_floor = 0
 ```
 
-A scan with WHERE and SINCE requires WITH DATA.
+A scan with SINCE requires WITH DATA when it uses WHERE or BLOCKS.
+A scan with AREA or AREA AROUND can use SINCE without WITH DATA when it omits WHERE.
 A scan with SINCE and WITH DATA lists each identity in the scan region changed after the given revision and returns a form of the matching blocks, or null when no block matches or the chunk was deleted.
 A consumer that replaces each listed chunk with that form, or drops the chunk on null, holds exactly the matching blocks.
 

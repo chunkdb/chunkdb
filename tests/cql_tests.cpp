@@ -138,6 +138,11 @@ void TestChunkModelScan() {
     assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").where);
     assert(Get<cql::ScanChunks>("SCAN CHUNKS FROM t AFTER 1 2 WHERE pos_x < 4").after_z == 0);
     ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1", "WHERE with SINCE requires WITH DATA");
+    ExpectError("SCAN CHUNKS FROM t BLOCKS 0 0 TO 1 1 SINCE 0", "BLOCKS with SINCE requires WITH DATA");
+    const auto area = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA 0 0 TO 1 1 SINCE 0");
+    assert(area.selection && !area.selection->blocks && !area.selection->around && area.since == 0U && !area.with_data);
+    const auto around = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1 SINCE 0");
+    assert(around.selection && around.selection->around && around.since == 0U && !around.with_data);
     ExpectError("SCAN CHUNKS FROM t WHERE n = 1 WHERE n = 2", "column 32: WHERE is given twice");
     ExpectError("SCAN CHUNKS FROM t WHERE", "column 25: expected a value, got the end of the statement");
     ExpectError("SCAN CHUNKS FROM t WHERE n = $2", "parameters must be numbered $1 to $2 without gaps");

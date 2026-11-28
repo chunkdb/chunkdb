@@ -1585,6 +1585,8 @@ class Parser {
                 Fail(1, "the AFTER cursor and the selection have different dimensions");
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
             if (scan.where && scan.since && !scan.with_data) Fail(1, "WHERE with SINCE requires WITH DATA");
+            if (scan.selection && scan.selection->blocks && scan.since && !scan.with_data)
+                Fail(1, "BLOCKS with SINCE requires WITH DATA");
             return scan;
         }
         throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +
