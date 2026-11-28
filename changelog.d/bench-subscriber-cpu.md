@@ -1,0 +1,1 @@
+- `chunkdb_server_bench --report-cpu` adds to each result the CPU seconds of the bench process in the timed window (`cpu_s`), of the measured clients (`client_cpu_s`) and of the watch readers (`watch_cpu_s`), and the process's context switches, so runs with feed subscribers show how much of the cost lands in the server (#140).
