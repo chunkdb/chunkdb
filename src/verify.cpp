@@ -35,6 +35,7 @@
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "populated_index_format.hpp"
+#include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "archive_base_format.hpp"
 #include "txn_intent_format.hpp"
@@ -1249,7 +1250,8 @@ chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(
 
 chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& root, const Geometry& geometry,
     const StoreId& epoch, FeatureFlags features, const ChunkCoord& coord,
-    const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut, bool check_wal, std::optional<std::uint64_t> wal_bytes) {
+    const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut, bool check_wal,
+    std::optional<std::uint64_t> wal_bytes, const std::function<void()>& read_checkpoint) {
     ChunkFileCheck result;
     const auto report = [&result](bool error, std::string code, const std::filesystem::path& path, std::string detail) {
         result.findings.push_back({error, std::move(code), path, std::move(detail)});
@@ -1291,7 +1293,7 @@ chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& ro
             if (admitted > measured) throw std::runtime_error("rollback WAL shortened before verification");
             if (admitted != 0U || !wal_cut) {
                 const auto replay = ReplayWalStream(input, admitted, geometry, coord, epoch, features,
-                    revision, schema, &payload, &presence, &vars, nullptr, &columns, {}, time, retained ?
+                    revision, schema, &payload, &presence, &vars, nullptr, &columns, read_checkpoint, time, retained ?
                         std::optional{WalKnownIdentity{retained->revision, retained->commit_time_ms}} : std::nullopt);
                 if (replay.torn_creation) {
                     report(wal_cut.has_value(), wal_cut ? "wal_damaged" : "wal_torn_creation",
@@ -1322,6 +1324,10 @@ chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& ro
         result.revision = revision;
         result.commit_time_ms = time;
         result.populated = ChunkPopulated(geometry, presence, columns.get());
+    } catch (const StatementStoppedError&) {
+        throw;
+    } catch (const CheckTableShutdownError&) {
+        throw;
     } catch (const std::exception& error) {
         report(true, "chunk_state_invalid", wal_path, error.what());
     }

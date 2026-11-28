@@ -277,7 +277,7 @@ QuarantinedChunk QuarantineChunk(const std::filesystem::path& data_dir, const st
                 continue;
             }
             const auto record = ParseQuarantineRecord(LoadFile(record_path));
-            if (record.table_epoch != manifest->store_id || record.coord != coord) continue;
+            if (record.table_epoch != manifest->store_id || record.dims != dims || record.coord != coord) continue;
             // Interrupted after its record: every remaining file is in it.
             const bool holds_all = std::all_of(present.begin(), present.end(), [&](const std::filesystem::path& path) {
                 const auto sum = Sum(path);
@@ -286,9 +286,19 @@ QuarantinedChunk QuarantineChunk(const std::filesystem::path& data_dir, const st
                 });
             });
             if (holds_all && !result.resumed) {
+                // The record authorizes removal only while the saved files
+                // still exist and match it, including a WAL already removed.
+                for (const auto& file : record.files) {
+                    const auto saved = candidate.path() / file.name;
+                    if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(saved)))
+                        throw std::runtime_error("quarantined copy is missing or not a regular file: " + saved.string());
+                    const auto sum = Sum(saved);
+                    if (sum.size != file.size || sum.crc32 != file.crc32)
+                        throw std::runtime_error("quarantined copy differs from its record: " + saved.string());
+                    result.files.push_back(file.name);
+                }
                 entry = candidate.path();
                 result.resumed = true;
-                for (const auto& file : record.files) result.files.push_back(file.name);
             }
         }
     }

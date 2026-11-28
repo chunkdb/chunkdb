@@ -943,9 +943,11 @@ class ChunkStore {
     // so statements on that chunk wait for the check; a chunk that is not
     // cached is read without locks and read again when a load or an eviction
     // races the read. After repeated races it is loaded, checked and evicted
-    // again; when that load fails, the damage the last read found is returned. Returns the first damage, or nothing for sound files or a
-    // chunk without files. A stopped statement throws StatementStoppedError.
-    [[nodiscard]] std::optional<ChunkFileDamage> CheckChunkFiles(const ChunkCoord& coord);
+    // again; when that load fails, the damage the last read found is returned.
+    // Returns the first damage, or nothing for sound files or a chunk without
+    // files. The checkpoint can stop a long WAL replay.
+    [[nodiscard]] std::optional<ChunkFileDamage> CheckChunkFiles(const ChunkCoord& coord,
+        const std::function<void()>& read_checkpoint = {});
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
@@ -1643,7 +1645,9 @@ class ChunkStore {
 
     [[nodiscard]] std::shared_ptr<LargeChunk> GetOrCreateLargeChunk(const LargeChunkCoord& large_coord);
     void RetireEmptyLargeChunk(const LargeChunkCoord& coord, const std::shared_ptr<LargeChunk>& expected);
-    [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord);
+    inline static const std::function<void()> kNoChunkLoadCheckpoint{};
+    [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord,
+        const std::function<void()>& read_checkpoint = kNoChunkLoadCheckpoint);
     // Loads a read-only store's cached chunk again when the table changed
     // since it was read (chunk_cache.cpp).
     void RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChunk& chunk);
@@ -1682,7 +1686,8 @@ class ChunkStore {
     void RequireVarWrite(const ChunkVars& current, const VarUpdate& update,
         std::size_t chunk_variable_bytes = 0U, std::size_t previous_chunk_variable_bytes = 0U) const;
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false,
-        const std::shared_ptr<ChunkCoordinateIndex>& recovery_index = {});
+        const std::shared_ptr<ChunkCoordinateIndex>& recovery_index = {},
+        const std::function<void()>& read_checkpoint = kNoChunkLoadCheckpoint);
     [[nodiscard]] std::vector<ChunkCoord> AdmitCoordinateArtifacts(ChunkCoordinateIndex& index);
     bool AdmitCoordinateArtifact(const std::filesystem::path& path, const ChunkCoord& coord);
     void PrepareCoordinateIndex();

@@ -149,6 +149,10 @@ void CompleteBackup(const std::filesystem::path& root, const BackupRecord& recor
 void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled = {});
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase);
 void RestoreBackup(const std::filesystem::path& backup, const std::filesystem::path& target);
+struct TableRestoreRequest;
+struct TableRestoreResult;
+[[nodiscard]] TableRestoreResult RestoreTableOffline(const std::filesystem::path& data_dir,
+    const TableRestoreRequest& request);
 
 // The completed backup a RESTORE TABLE statement names, resolved under the
 // configured --backup-dir with the BACKUP TO path rules.

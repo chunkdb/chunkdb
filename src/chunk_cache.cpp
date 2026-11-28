@@ -157,7 +157,8 @@ std::shared_ptr<const void> ChunkStore::TakeChunkFromCacheForTests(std::int64_t 
     return chunk;
 }
 
-std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord) {
+std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord,
+    const std::function<void()>& read_checkpoint) {
     const LargeChunkCoord large_coord = geometry_.ChunkToLarge(chunk_coord);
 
     bool inserted = false;
@@ -196,7 +197,8 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
                 read_only_load = LoadChunkPayload(chunk_coord, true);
                 continue;
             }
-            auto loaded = read_only_load.has_value() ? std::move(*read_only_load) : LoadChunkPayload(chunk_coord, true);
+            auto loaded = read_only_load.has_value() ? std::move(*read_only_load)
+                : LoadChunkPayload(chunk_coord, true, {}, read_checkpoint);
             // An image without a WAL may be of an earlier schema version.
             BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
@@ -333,7 +335,7 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
 }
 
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix,
-    const std::shared_ptr<ChunkCoordinateIndex>& recovery_index) {
+    const std::shared_ptr<ChunkCoordinateIndex>& recovery_index, const std::function<void()>& read_checkpoint) {
     std::vector<WalFrameBoundary> boundaries;
     // A read-only store archives nothing, so it keeps no WAL prefixes.
     const bool track_prefix =
@@ -608,7 +610,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.presence_bitmap,
             &loaded.vars,
             track_prefix ? &boundaries : nullptr,
-            &loaded.chunk_columns, {}, loaded.commit_time_ms, retained_boundary ?
+            &loaded.chunk_columns, read_checkpoint, loaded.commit_time_ms, retained_boundary ?
                 std::optional{WalKnownIdentity{retained_boundary->revision, retained_boundary->commit_time_ms}} : std::nullopt);
         wal_input.close();
         if (loaded.revision != 0U || replay.applied_frames != 0U)

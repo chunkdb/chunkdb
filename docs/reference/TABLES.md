@@ -239,7 +239,8 @@ CHECK TABLE runs the `chunkdb_verify` checks on the image and WAL of each chunk 
 Statements on other chunks do not wait; a statement on a cached chunk waits while that chunk is checked.
 It checks the files, not memory: changes not yet written to the WAL are checked once they are.
 A WAL tail left by a crash is repaired when the chunk loads and is not damage.
-CANCEL, KILL CONNECTION, a statement timeout or server shutdown stops it without a result; SHOW CONNECTIONS shows the chunks checked as `files_done` of `files_total`.
+CANCEL, KILL CONNECTION, a statement timeout or server shutdown stops the check without a result, including during file listing or WAL replay.
+SHOW CONNECTIONS shows the chunks checked as `files_done` of `files_total`.
 A table replaced during the check, by SWAP TABLES or by DROP and CREATE, stops it with INTERNAL.
 To repair damaged chunks, see [Backup and restore](../BACKUP.md#repair-damaged-chunks).
 

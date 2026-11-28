@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -2499,6 +2500,11 @@ std::string CommandEngine::ExecuteStatement(
                     // Before any listing: a read-only server leaves file checks to chunkdb_verify.
                     if (catalog_->access_mode() == AccessMode::kReadOnly)
                         throw std::invalid_argument("CHECK TABLE needs a server started without --read-only; use chunkdb_verify");
+                    const auto stop = [&] {
+                        if (session.backup_cancelled.stop_requested()) throw CheckTableShutdownError();
+                        CheckStatementCancellation();
+                    };
+                    const std::function<void()> checkpoint = std::cref(stop);
                     StoreId epoch{};
                     std::filesystem::path dir;
                     std::optional<Geometry> geometry;
@@ -2517,19 +2523,21 @@ std::string CommandEngine::ExecuteStatement(
                     // Listed and checked one chunk per lease: a lease held for the
                     // whole table would make DDL, and every statement queued
                     // behind it, wait for the check.
-                    auto coordinates = ChunkFileCoordinates(dir, *geometry);
-                    if (area) std::erase_if(coordinates, [&](const ChunkCoord& coord) { return !area->Contains(coord); });
+                    auto coordinates = ChunkFileCoordinates(dir, *geometry, checkpoint);
+                    if (area) std::erase_if(coordinates, [&](const ChunkCoord& coord) {
+                        stop();
+                        return !area->Contains(coord);
+                    });
                     std::vector<std::pair<ChunkCoord, ChunkStore::ChunkFileDamage>> damaged;
                     std::uint64_t checked = 0U;
                     for (const auto& coord : coordinates) {
-                        if (session.backup_cancelled.stop_requested())
-                            throw std::runtime_error("CHECK TABLE stopped: the server is shutting down");
-                        CheckStatementCancellation();
+                        stop();
                         ReportStatementProgress({.files_done = checked, .files_total = coordinates.size()});
                         const auto lease = AcquireNamedTable(session, check.table);
                         if (lease.store().store_id() != epoch)
                             throw std::runtime_error("table '" + check.table + "' was replaced during CHECK TABLE; run it again");
-                        if (auto damage = lease.store().CheckChunkFiles(coord)) damaged.emplace_back(coord, std::move(*damage));
+                        if (auto damage = lease.store().CheckChunkFiles(coord, checkpoint))
+                            damaged.emplace_back(coord, std::move(*damage));
                         ++checked;
                     }
                     const auto dims = geometry->dims();
@@ -2540,6 +2548,7 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendBulk(reply, "damaged");
                     Protocol::AppendArrayHeader(reply, damaged.size());
                     for (const auto& [coord, damage] : damaged) {
+                        stop();
                         Protocol::AppendMapHeader(reply, 4U);
                         Protocol::AppendBulk(reply, "chunk");
                         Protocol::AppendArrayHeader(reply, dims);
@@ -2553,6 +2562,7 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "detail");
                         Protocol::AppendBulk(reply, damage.detail);
                     }
+                    stop();
                     return reply;
                 },
                 [&](const cql::ShowTables&) {

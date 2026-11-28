@@ -91,39 +91,13 @@ int RestoreTable(const Arguments& arguments) {
     };
     if (inside(data_dir, backup) || inside(backup, data_dir))
         throw std::invalid_argument("the data directory and the backup must not contain each other");
-    // A directory this restore makes a data directory is left as it was
-    // when the restore fails.
-    std::error_code status;
-    const bool absent = !std::filesystem::exists(data_dir, status) && !status;
-    const bool fresh = absent || (std::filesystem::is_directory(data_dir) && std::filesystem::is_empty(data_dir));
-    chunkdb::TableRestoreResult result;
-    try {
-        chunkdb::CatalogConfig config;
-        config.data_dir = data_dir;
-        chunkdb::TableCatalog catalog(config);
-        chunkdb::TableRestoreRequest request;
-        request.backup = backup;
-        request.table = arguments.table;
-        request.name = arguments.name;
-        request.area = arguments.area;
-        request.allow_split = arguments.allow_split;
-        result = catalog.RestoreTable(request);
-    } catch (const std::exception& error) {
-        if (fresh) {
-            std::error_code cleanup;
-            if (absent) std::filesystem::remove_all(data_dir, cleanup);
-            else {
-                std::vector<std::filesystem::path> made;
-                for (const auto& entry : std::filesystem::directory_iterator(data_dir, cleanup)) made.push_back(entry.path());
-                for (const auto& path : made)
-                    if (!cleanup) std::filesystem::remove_all(path, cleanup);
-            }
-            if (cleanup)
-                throw std::runtime_error(std::string(error.what()) + "; could not remove the new data directory " +
-                    data_dir.string() + ": " + cleanup.message());
-        }
-        throw;
-    }
+    chunkdb::TableRestoreRequest request;
+    request.backup = backup;
+    request.table = arguments.table;
+    request.name = arguments.name;
+    request.area = arguments.area;
+    request.allow_split = arguments.allow_split;
+    const auto result = chunkdb::RestoreTableOffline(data_dir, request);
     std::cout << "restored table " << arguments.table << " as " << result.name << ": epoch "
               << chunkdb::StoreIdHex(result.epoch) << ", parent epoch " << chunkdb::StoreIdHex(result.parent_epoch)
               << " at revision " << result.fork_revision << ", " << result.files << " files";

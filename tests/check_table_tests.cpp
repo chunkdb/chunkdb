@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "chunk_check.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -188,6 +189,43 @@ void RightsAndCancellation() {
     Error(engine.Execute(owner, "CHECK TABLE t\r\n"), "CANCELLED");
 }
 
+void CancelsDuringListingAndWalReplay() {
+    Fixture f;
+    Reply(f.Run("CREATE TABLE t (a u8 DEFAULT 0) CHUNK 2 x 2"), "+OK\r\n");
+    assert(f.Run("SET BLOCK 0 0 IN t a = 1").starts_with(":"));
+    Reply(f.Run("FLUSH WAL"), "+OK\r\n");
+    f.Open();
+    assert(std::filesystem::exists(f.File(0, 0, true)));
+    {
+        auto lease = f.catalog->Require("t")->Acquire();
+        auto& store = lease->store();
+        const auto cancels = [](const auto& operation) {
+            StatementControl control(StatementControl::Clock::now(), 0U);
+            assert(control.Start());
+            ScopedStatementControl context(&control);
+            unsigned checkpoints = 0U;
+            const auto check = [&] {
+                if (++checkpoints == 2U) assert(control.RequestStop(StatementStopReason::kCancelled));
+                CheckStatementCancellation();
+            };
+            try {
+                operation(check);
+                assert(false && "expected check to stop");
+            } catch (const StatementStoppedError& stopped) {
+                assert(stopped.reason() == StatementStopReason::kCancelled && checkpoints == 2U);
+            }
+        };
+        cancels([&](const auto& check) { (void)ChunkFileCoordinates(store.data_dir(), store.geometry(), check); });
+        cancels([&](const auto& check) { (void)store.CheckChunkFiles({0, 0}, check); });
+    }
+    Reply(f.Run("CHECK TABLE t"), "%2\r\n$6\r\nchunks\r\n:1\r\n$7\r\ndamaged\r\n*0\r\n");
+    Reply(f.Run("CREATE TABLE idle (a u8 DEFAULT 0) CHUNK 2 x 2"), "+OK\r\n");
+    std::stop_source shutdown;
+    assert(shutdown.request_stop());
+    f.session.backup_cancelled = shutdown.get_token();
+    Error(f.Run("CHECK TABLE idle"), "INTERNAL");
+}
+
 // Evictions that race every read of a chunk outside the cache: the check
 // loads the chunk, checks it there and evicts it again; when the load
 // refuses damaged files, the damage the last read found is the report.
@@ -254,6 +292,7 @@ int main() {
     DamagedCachedChunk();
     CrashTailIsNotDamage();
     RightsAndCancellation();
+    CancelsDuringListingAndWalReplay();
     RacedReadsUseTheCache();
     ReadOnlyRefuses();
     std::cout << "check_table tests passed\n";

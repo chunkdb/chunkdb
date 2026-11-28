@@ -2,6 +2,7 @@
 // table serves.
 
 #include <algorithm>
+#include <exception>
 #include <set>
 #include <system_error>
 
@@ -18,15 +19,19 @@ namespace {
 constexpr int kCheckReadAttempts = 3;
 }  // namespace
 
-std::vector<ChunkCoord> ChunkFileCoordinates(const std::filesystem::path& table_dir, const Geometry& geometry) {
+std::vector<ChunkCoord> ChunkFileCoordinates(const std::filesystem::path& table_dir, const Geometry& geometry,
+    const std::function<void()>& checkpoint) {
     std::set<ChunkCoord> coordinates;
+    checkpoint();
     std::error_code error;
     for (std::filesystem::directory_iterator large(table_dir, error), end; !error && large != end; large.increment(error)) {
+        checkpoint();
         LargeChunkCoord large_coord;
         if (!ParseLargeChunkName(large->path().filename().string(), geometry.dims(), &large_coord)) continue;
         std::error_code inner;
         for (std::filesystem::directory_iterator file(large->path(), inner), file_end; !inner && file != file_end;
              file.increment(inner)) {
+            checkpoint();
             const auto extension = file->path().extension();
             if (extension != ".chk" && extension != ".wal") continue;
             ChunkCoord coord;
@@ -41,11 +46,12 @@ std::vector<ChunkCoord> ChunkFileCoordinates(const std::filesystem::path& table_
     return {coordinates.begin(), coordinates.end()};
 }
 
-std::optional<ChunkStore::ChunkFileDamage> ChunkStore::CheckChunkFiles(const ChunkCoord& coord) {
+std::optional<ChunkStore::ChunkFileDamage> ChunkStore::CheckChunkFiles(const ChunkCoord& coord,
+    const std::function<void()>& read_checkpoint) {
     if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("CHECK TABLE needs a writer");
     const auto check = [&] {
         return ::chunkdb::CheckChunkFiles(data_dir_, geometry_, store_id_, features_, coord,
-            coordinate_index_->EmptyBoundary(coord));
+            coordinate_index_->EmptyBoundary(coord), std::nullopt, true, std::nullopt, read_checkpoint);
     };
     const auto damage = [&](const ChunkFileCheck& result) -> std::optional<ChunkFileDamage> {
         const auto* found = result.damage();
@@ -79,16 +85,27 @@ std::optional<ChunkStore::ChunkFileDamage> ChunkStore::CheckChunkFiles(const Chu
     // Evictions of any chunk kept racing the reads: check this one in the
     // cache. A load refuses damaged files; the damage the last read found is
     // then the report.
+    if (read_checkpoint) read_checkpoint();
     std::shared_ptr<RegularChunk> loaded;
     try {
-        loaded = GetOrLoadRegularChunk(coord);
+        loaded = GetOrLoadRegularChunk(coord, read_checkpoint);
     } catch (const StatementStoppedError&) {
+        throw;
+    } catch (const CheckTableShutdownError&) {
         throw;
     } catch (const std::exception&) {
         if (last) return last;
         throw;
     }
-    const auto found = check_cached(loaded);
+    std::optional<ChunkFileDamage> found;
+    std::exception_ptr stopped;
+    try {
+        found = check_cached(loaded);
+    } catch (const StatementStoppedError&) {
+        stopped = std::current_exception();
+    } catch (const CheckTableShutdownError&) {
+        stopped = std::current_exception();
+    }
     // Loaded only to read its files: evict it again unless a statement holds
     // it by now.
     loaded.reset();
@@ -96,6 +113,7 @@ std::optional<ChunkStore::ChunkFileDamage> ChunkStore::CheckChunkFiles(const Chu
     std::vector<LargeChunkCoord> maybe_empty;
     (void)TryEvictCandidate({geometry_.ChunkToLarge(coord), coord, 0U}, false, &removed, &maybe_empty);
     FinishEvictedChunks(removed, std::move(maybe_empty));
+    if (stopped) std::rethrow_exception(stopped);
     return found;
 }
 

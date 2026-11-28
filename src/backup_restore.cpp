@@ -13,6 +13,7 @@
 #include "checkpoint.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
@@ -52,6 +53,37 @@ void ExclusiveMove(const std::filesystem::path& from, const std::filesystem::pat
 #else
     (void)from; (void)to;
     throw std::runtime_error("restore requires atomic exclusive directory rename support");
+#endif
+}
+
+void PublishFreshTableRestore(const std::filesystem::path& from, const std::filesystem::path& to, bool was_empty) {
+    if (!was_empty) {
+        ExclusiveMove(from, to);
+        return;
+    }
+#ifdef _WIN32
+    // Windows cannot replace a directory in a rename. RemoveDirectoryW can
+    // remove only an empty directory, so a competing writer's files stay put.
+    const bool removed = RemoveDirectoryW(to.c_str()) != 0;
+    if (!removed) {
+        const auto error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+            throw std::system_error(static_cast<int>(error), std::system_category(), "cannot replace empty restore destination");
+    }
+    try {
+        ExclusiveMove(from, to);
+    } catch (const std::system_error& failure) {
+        if (removed) {
+            std::error_code recreate;
+            (void)std::filesystem::create_directory(to, recreate);
+            if (recreate) throw std::runtime_error(std::string(failure.what()) +
+                "; could not recreate the empty destination: " + recreate.message());
+        }
+        throw;
+    }
+#else
+    // A directory rename can replace only another directory that is empty.
+    std::filesystem::rename(from, to);
 #endif
 }
 ChunkCoord Coordinate(const std::filesystem::path& path, const Geometry& geometry) {
@@ -355,6 +387,47 @@ RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const Ba
     }, true, true);
     return result;
 }
+
+TableRestoreResult RestoreTableOffline(const std::filesystem::path& data_dir, const TableRestoreRequest& request) {
+    const auto status = std::filesystem::symlink_status(data_dir);
+    const bool absent = status.type() == std::filesystem::file_type::not_found;
+    const bool empty = std::filesystem::is_directory(status) && std::filesystem::is_empty(data_dir);
+    CatalogConfig config;
+    if (!absent && !empty) {
+        config.data_dir = data_dir;
+        TableCatalog catalog(config);
+        return catalog.RestoreTable(request);
+    }
+
+    const auto parent = data_dir.parent_path();
+    EnsureDirectoryPathExists(parent, true);
+    const auto staging = parent / (".chunkdb.restore-table." + StoreIdHex(NewStoreId()));
+    if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("table restore temporary directory already exists");
+    struct StagingCleanup {
+        const std::filesystem::path& path;
+        bool published = false;
+        ~StagingCleanup() { if (!published) RemoveBackupStaging(path); }
+    } cleanup{staging};
+    TableRestoreResult result;
+    config.data_dir = staging;
+    {
+        TableCatalog catalog(config);
+        result = catalog.RestoreTable(request);
+    }
+    // Close the stores and release the lock, including Windows' exclusive
+    // handle, before syncing and moving the private tree.
+    SyncBackupTree(staging, request.cancelled);
+    if (request.cancelled.stop_requested()) throw std::runtime_error("table restore cancelled before publication");
+    PublishFreshTableRestore(staging, data_dir, empty);
+    cleanup.published = true;
+    try {
+        SyncDirectoryPath(parent);
+    } catch (const std::system_error& failure) {
+        throw BackupPublicationUnknownError(std::string("table restore publication outcome is unknown: ") + failure.what());
+    }
+    return result;
+}
+
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
     RequireBackupTarget(source, destination);
 #ifdef _WIN32

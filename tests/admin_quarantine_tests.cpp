@@ -221,6 +221,29 @@ void Crashes(const std::string& admin) {
     }
 }
 
+void RefusesResumeWithoutSavedFile(const std::string& admin) {
+    Fixture f(admin);
+    const auto live_wal = f.File(0, 0, true);
+    const auto live_image = f.File(0, 0, false);
+    Damage(live_wal);
+    std::string output;
+    constexpr auto command = "quarantine --table t --chunk 0 0";
+    {
+        txn_test::ScopedEnv crash("CHUNKDB_FAILPOINT_CRASH_QUARANTINE_AFTER_RECORD_ONCE", "1");
+        assert(f.Run(command, &output) == 86);
+    }
+    const auto entries = f.Entries();
+    assert(entries.size() == 1U);
+    const auto saved_wal = entries.front() / live_wal.filename();
+    assert(std::filesystem::remove(saved_wal));
+    assert(f.Run(command, &output) == 1 && Contains(output, "quarantined copy is missing"));
+    assert(std::filesystem::exists(live_wal) && std::filesystem::exists(live_image));
+    assert(std::filesystem::copy_file(live_wal, saved_wal));
+    Damage(saved_wal);
+    assert(f.Run(command, &output) == 1 && Contains(output, "quarantined copy differs from its record"));
+    assert(std::filesystem::exists(live_wal) && std::filesystem::exists(live_image));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -232,6 +255,7 @@ int main(int argc, char** argv) {
     QuarantinesDamagedImage(admin);
     Refusals(admin);
     Crashes(admin);
+    RefusesResumeWithoutSavedFile(admin);
     std::cout << "admin_quarantine tests passed\n";
     return 0;
 }

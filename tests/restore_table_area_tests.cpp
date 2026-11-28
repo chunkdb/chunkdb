@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #endif
 
+#include "backup.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "test_utils.hpp"
@@ -186,17 +187,66 @@ void Usage(const Fixture& f) {
     assert(!std::filesystem::exists(target));
 }
 
-// A crash after the area is selected leaves no table; the next run restores it.
+void CompetingDestination(const Fixture& f) {
+    for (const bool empty : {false, true}) {
+        const auto target = f.root / (empty ? "competing-empty" : "competing-absent");
+        if (empty) assert(std::filesystem::create_directory(target));
+        std::unique_ptr<TableCatalog> competing;
+        TableRestoreRequest request{.backup = f.backup, .table = "t", .name = "restored"};
+        request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) {
+            if (competing) return;
+            CatalogConfig config;
+            config.data_dir = target;
+            competing = std::make_unique<TableCatalog>(config);
+            GeometryConfig geometry;
+            geometry.chunk_width_blocks = 2U;
+            geometry.chunk_height_blocks = 2U;
+            geometry.block_bits = 8U;
+            auto table = competing->Create("existing", geometry, competing->default_options());
+            table->Acquire()->store().SetBlockBits(0, 0, "00000111");
+            table->Acquire()->store().WalBarrier();
+        };
+        bool refused = false;
+        try {
+            (void)RestoreTableOffline(target, request);
+        } catch (const std::system_error&) {
+            refused = true;
+        }
+        assert(refused && competing);
+        competing.reset();
+        CatalogConfig config;
+        config.data_dir = target;
+        TableCatalog catalog(config);
+        assert(catalog.TableCount() == 1U && !catalog.Find("restored"));
+        assert(catalog.Require("existing")->Acquire()->store().GetBlockBits(0, 0) == "00000111");
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(f.root))
+        assert(!entry.path().filename().string().starts_with(".chunkdb.restore-table."));
+}
+
+// An interruption before publication leaves the destination as it was. For
+// an existing catalog a crash after the rename leaves the complete table.
 void Crash(const Fixture& f) {
     std::string output;
-    const auto target = f.root / "crash";
-    {
-        txn_test::ScopedEnv crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_AREA_ONCE", "1");
-        assert(f.Run(f.Args("--table t --area 0 0 TO 3 0", target), &output) == 86);
+    constexpr auto area = "--table t --area 0 0 TO 3 0";
+    for (const bool empty : {false, true}) {
+        const auto target = f.root / (empty ? "crash-empty" : "crash-absent");
+        if (empty) assert(std::filesystem::create_directory(target));
+        {
+            txn_test::ScopedEnv crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_AREA_ONCE", "1");
+            assert(f.Run(f.Args(area, target), &output) == 86);
+        }
+        if (empty) assert(std::filesystem::is_empty(target));
+        else assert(!std::filesystem::exists(target));
+        assert(f.Run(f.Args(area, target), &output) == 0);
+        Reply(Query(target, "GET BLOCK 0 0 FROM t"), "*1\r\n:1\r\n");
     }
-    Reply(Query(target, "SHOW TABLES"), "*0\r\n");
-    assert(f.Run(f.Args("--table t --area 0 0 TO 3 0", target), &output) == 0);
-    Reply(Query(target, "GET BLOCK 0 0 FROM t"), "*1\r\n:1\r\n");
+    const auto existing = f.root / "crash-absent";
+    {
+        txn_test::ScopedEnv crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_PUBLISH_ONCE", "1");
+        assert(f.Run(f.Args(std::string(area) + " --as published", existing), &output) == 86);
+    }
+    Reply(Query(existing, "GET BLOCK 0 0 FROM published"), "*1\r\n:1\r\n");
 }
 
 }  // namespace
@@ -210,6 +260,7 @@ int main(int argc, char** argv) {
     WholeTable(f);
     Areas(f);
     Usage(f);
+    CompetingDestination(f);
     Crash(f);
     std::cout << "restore_table_area tests passed\n";
     return 0;

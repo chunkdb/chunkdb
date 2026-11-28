@@ -102,11 +102,14 @@ With the server stopped, `chunkdb_restore --table` adds one table of a backup to
 chunkdb_restore --table world --as world_restored /backups/snapshot /var/lib/chunkdb
 ```
 
-The data directory may exist already; an absent or empty one becomes a new data directory that holds only this table and no users.
-As with RESTORE TABLE, the table gets a new epoch with the backed-up epoch and cut as its lineage, needs the features this directory gives its tables, and appears only once complete; an interrupted restore leaves nothing, and the next start removes its staging.
+The destination may be an existing data directory or an absent or empty directory that will hold only this table and no users.
+As with RESTORE TABLE, the table gets a new epoch with the backed-up epoch and cut as its lineage, requires the destination's table features, and appears only once complete.
+If the restore stops before publication in an existing data directory, the next writer start removes the staged table.
+For an absent or empty destination, restore prepares the data directory in a private sibling and publishes it only when complete.
+After a crash before publication, the destination has no restored table, and you can remove the unused `.chunkdb.restore-table.*` sibling once the restore has stopped.
+After a crash during or after publication, the destination may contain the complete restored table.
 Users, grants and migration records of the backup are not restored; the table falls under the grants that match its name.
 Opening the data directory opens each of its tables, so a table that does not open, such as one with a damaged chunk, stops the restore; quarantine that chunk first.
-A failed restore into an absent or empty directory leaves it absent or empty.
 
 `--area cx0 cy0 TO cx1 cy1` restores only the chunks in that range, with a third coordinate on each side for a three-dimensional table.
 The restored table has no data, tombstones or other chunk identities outside the area.
@@ -150,6 +153,7 @@ Each slot of the table starts its next watch with resync.
 It refuses a chunk that passes the checks unless you add `--force`.
 It also refuses a chunk whose WAL a pending recovery needs, or whose deletion the coordinate inventory does not list yet, because opening the table needs its files; restore the table from a backup then.
 If it stops partway, run it again before starting the server; until then `chunkdb_verify` warns `quarantine_interrupted`.
+If a saved file is missing or differs from its quarantine record, the rerun refuses to remove any remaining live files.
 A run after a finished one reports the chunk as already quarantined.
 The moved files stay for inspection; `chunkdb_verify` lists them as `chunk_quarantined`, and you delete the entry when you no longer need it.
 

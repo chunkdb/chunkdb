@@ -2,7 +2,9 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -11,6 +13,11 @@
 #include "populated_index_format.hpp"
 
 namespace chunkdb {
+
+class CheckTableShutdownError : public std::runtime_error {
+  public:
+    CheckTableShutdownError() : std::runtime_error("CHECK TABLE stopped: the server is shutting down") {}
+};
 
 // One finding about a chunk's files, with chunkdb_verify's codes.
 struct ChunkFileFinding {
@@ -48,14 +55,17 @@ struct ChunkFileCheck {
 // coordinate index. `wal_cut` is the committed WAL length a pending rollback
 // intent names. `wal_bytes` bounds the WAL to a pinned prefix with the same
 // crash-tail rules as the whole file. Without `check_wal`, only the image is
-// checked. Never throws for damage; it reports a finding.
+// checked. Never throws for damage; it reports a finding. A WAL read
+// checkpoint may throw StatementStoppedError or CheckTableShutdownError.
 [[nodiscard]] ChunkFileCheck CheckChunkFiles(const std::filesystem::path& table_dir, const Geometry& geometry,
     const StoreId& epoch, FeatureFlags features, const ChunkCoord& coord,
     const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut = std::nullopt,
-    bool check_wal = true, std::optional<std::uint64_t> wal_bytes = std::nullopt);
+    bool check_wal = true, std::optional<std::uint64_t> wal_bytes = std::nullopt,
+    const std::function<void()>& read_checkpoint = {});
 
 // The coordinates of the chunks with an image or a WAL in the table
 // directory `table_dir`, in ascending order. Listing takes no lock.
-[[nodiscard]] std::vector<ChunkCoord> ChunkFileCoordinates(const std::filesystem::path& table_dir, const Geometry& geometry);
+[[nodiscard]] std::vector<ChunkCoord> ChunkFileCoordinates(const std::filesystem::path& table_dir, const Geometry& geometry,
+    const std::function<void()>& checkpoint);
 
 }  // namespace chunkdb
