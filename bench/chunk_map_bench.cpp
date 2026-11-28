@@ -22,11 +22,11 @@
 // Sequences come from mt19937_64 with a fixed seed. Every timed window
 // follows an untimed pass of the same sequence and is timed in segments of
 // kSegmentOps operations; its figure is the median segment's ns/op, which
-// leaves out rare stalls such as the version-clock reservation (a durable
-// write every 16384 versions). Writes keep their WAL frames in each chunk's
+// limits the effect of rare stalls such as running out of version tokens before the
+// next range is durable. Writes keep their WAL frames in each chunk's
 // in-memory batch: group commit and checkpoint thresholds are above anything
 // a run writes, and the untimed pass, drained by WalBarrier, has already
-// grown each batch's capacity, so a timed write does no file I/O and no WAL
+// grown each batch's capacity, so a timed write does no WAL I/O or WAL
 // allocation. Runs alternate which side goes first.
 
 #include <algorithm>

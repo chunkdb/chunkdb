@@ -152,7 +152,8 @@ void AtomicWriteImpl(
     bool* out_replaced,
     const char* after_rename_failpoint,
     bool enable_generic_failpoints,
-    void (*before_replace)()) {
+    void (*before_replace)(),
+    const char* after_replace_crash_failpoint) {
     if (out_replaced != nullptr) {
         *out_replaced = false;
     }
@@ -211,6 +212,10 @@ void AtomicWriteImpl(
     if (out_replaced != nullptr) {
         *out_replaced = true;
     }
+    if (kFailpointsCompiled && after_replace_crash_failpoint != nullptr &&
+        ConsumeFailpointEnv(after_replace_crash_failpoint)) {
+        ExitAbruptly(86);
+    }
 
     if (fsync_directory) {
         const bool generic_failure =
@@ -232,16 +237,16 @@ void AtomicWriteImpl(
 
 void AtomicWrite(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
     bool fsync_file, bool fsync_directory, bool* out_replaced, const char* after_rename_failpoint,
-    bool enable_generic_failpoints, void (*before_replace)()) {
+    bool enable_generic_failpoints, void (*before_replace)(), const char* after_replace_crash_failpoint) {
     AtomicWriteImpl(path, bytes, fsync_file, fsync_directory, out_replaced,
-        after_rename_failpoint, enable_generic_failpoints, before_replace);
+        after_rename_failpoint, enable_generic_failpoints, before_replace, after_replace_crash_failpoint);
 }
 
 void AtomicWriteStream(const std::filesystem::path& path, const AtomicFileProducer& produce,
     bool fsync_file, bool fsync_directory, bool* out_replaced, const char* after_rename_failpoint,
     bool enable_generic_failpoints) {
     AtomicWriteImpl(path, produce, fsync_file, fsync_directory, out_replaced,
-        after_rename_failpoint, enable_generic_failpoints, nullptr);
+        after_rename_failpoint, enable_generic_failpoints, nullptr, nullptr);
 }
 
 bool PublishNewFile(
