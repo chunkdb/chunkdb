@@ -22,7 +22,7 @@ void ParameterFrameDecoder::FinishFrame() {
     phase_ = Phase::kHeader;
 }
 
-bool ParameterFrameDecoder::Consume(PendingLineBuffer& pending, std::size_t max_line_bytes) {
+bool ParameterFrameDecoder::Consume(PendingLineBuffer& pending, std::size_t max_line_bytes, std::size_t charged) {
     while (!complete()) {
         if (phase_ == Phase::kHeader) {
             std::string header;
@@ -55,9 +55,11 @@ bool ParameterFrameDecoder::Consume(PendingLineBuffer& pending, std::size_t max_
             }
             total_ += *length;
             remaining_ = *length;
+            if (!opaque_) kept_ += *length;
             phase_ = Phase::kBody;
         }
         if (phase_ == Phase::kBody) {
+            if (!opaque_ && charged < kept_) return false;
             // Memory follows the bytes that arrived, doubling up to the length
             // the header gave, so a header alone holds no body buffer.
             if (!opaque_) {
