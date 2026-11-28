@@ -11,6 +11,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "change_feed.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "chunkdb/bit_codec.hpp"
@@ -298,6 +299,8 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
 }
 
 void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive) {
+    ThrowIfDurabilityPoisoned();
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     // Called under version_clock_mutex_. Persists a new ceiling above
     // minimum_exclusive before it is used, so a crash can never leave issued
     // tokens above the durable ceiling.
@@ -389,6 +392,7 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     if (version_clock_.load(std::memory_order_relaxed) > revision) {
         return;
     }
+    if (durability_poisoned_.load(std::memory_order_acquire)) return;
     std::lock_guard lock(version_clock_mutex_);
     if (version_clock_.load(std::memory_order_relaxed) > revision) {
         return;

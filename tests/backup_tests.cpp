@@ -489,30 +489,17 @@ void CompletionAndPoison() {
     auto state = store.ReadChunkStateAt(*snapshot, 0, 0); txn_test::SetCounter(&state, 2);
     std::vector<TxnChunkWrite> writes{{.coord = {0, 0}, .state = std::move(state)}};
     store.ArmTxnPauseForTests(TxnPausePoint::kBeforePostCommitOutcome);
-    ScopedEnv rename_failure("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-    ScopedEnv failure("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE", "1");
+    ScopedEnv failure("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
     auto transaction = std::async(std::launch::async, [&] { return Error([&] { (void)store.CommitTransaction(*snapshot, {}, std::move(writes)); }); });
     assert(store.WaitForTxnPauseForTests(TxnPausePoint::kBeforePostCommitOutcome));
-    // Chunk locks are released, but completion (and poisoning) has not happened.
+    // The sync failure fences the table before the transaction returns its
+    // unknown outcome and before a backup can wait for or copy that cut.
     assert(ReadCounter(store, {0, 0}) == 2U);
-    Pause pause(BackupTestHook::Point::kWaitingForCompletion); catalog.SetBackupHookForTests(&pause);
-    std::stop_source cancel;
-    auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = cancel.get_token()}); }); });
-    pause.Wait(); pause.Release(); cancel.request_stop();
-    assert(backup.wait_for(10s) == std::future_status::ready);
-    assert(backup.get().find("cancelled") != std::string::npos);
-    catalog.SetBackupHookForTests(nullptr);
-    Pause waited(BackupTestHook::Point::kWaitingForCompletion); catalog.SetBackupHookForTests(&waited);
-    auto refused = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "poisoned", {}); }); });
-    const auto cut = waited.Wait();
-    auto later = std::async(std::launch::async, [&] { WriteCounter(store, {1, 0}, 99); });
-    assert(later.wait_for(10s) == std::future_status::ready); later.get();
-    assert(store.GetChunkVersion(1, 0) > cut);
-    waited.Release();
+    assert(Error([&] { WriteCounter(store, {1, 0}, 99); }).find("fail-closed") != std::string::npos);
+    assert(Error([&] { (void)catalog.BackupTo(root / "poisoned", {}); }).find("fail-closed") != std::string::npos);
+    assert(std::filesystem::exists(root / "poisoned" / kBackupIncompleteName));
     store.ResumeTxnForTests(TxnPausePoint::kBeforePostCommitOutcome);
-    assert(!transaction.get().empty());
-    assert(refused.get().find("fail-closed") != std::string::npos);
-    catalog.SetBackupHookForTests(nullptr);
+    assert(transaction.get().find("may or may not be applied") != std::string::npos);
     assert(!std::filesystem::exists(root / "poisoned" / kBackupMarkerName));
 }
 // A commit held after its outcome is settled, with its committed intent still on

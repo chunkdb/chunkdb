@@ -458,6 +458,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
             store->HandOverUnsyncedOnClose(unsynced);
             store.reset();
+            if (unsynced->durability_failed_on_close)
+                throw std::runtime_error("a participating table failed a durability step while closing for migration");
         }
         CompleteMigrationJournal(config_.data_dir, journal);
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));

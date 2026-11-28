@@ -7,6 +7,7 @@
 
 #include "change_feed.hpp"
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -309,6 +310,8 @@ void FeedSlots::Run() {
     }
 }
 void FeedSlots::Persist(FeedSlotRecords next) {
+    store_.ThrowIfDurabilityPoisoned();
+    const ScopedDurabilitySync sync_scope(&store_.durability_poisoned_);
     next.filter_format = next.filter_format || std::any_of(next.slots.begin(), next.slots.end(),
         [](const auto& slot) { return !slot.filters.empty() || slot.schema_filter_lost; });
     bool published = false;
@@ -556,8 +559,9 @@ void FeedSlots::Sync(std::uint64_t completed) {
     if (advanced && feed_) feed_->NotifyDurableWatermark();
 }
 bool FeedSlots::SyncImpl(std::uint64_t completed) {
-    store_.ThrowIfDurabilityPoisoned();
     std::unique_lock barrier_lock(store_.wal_barrier_mutex_);
+    store_.ThrowIfDurabilityPoisoned();
+    const ScopedDurabilitySync sync_scope(&store_.durability_poisoned_);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeFlush, completed);
     std::vector<std::shared_ptr<ChunkStore::LargeChunk>> large_chunks;
     {
@@ -618,7 +622,8 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
         if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kAfterDrain, completed);
         store_.SyncUnsynced(drained);
     } catch (const std::exception&) {
-        store_.RestoreUnsynced(std::move(drained));
+        if (!store_.durability_poisoned_.load(std::memory_order_acquire))
+            store_.RestoreUnsynced(std::move(drained));
         throw;
     }
     synced_ = true;
@@ -633,6 +638,7 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
 }
 void FeedSlots::Retain() {
     store_.ThrowIfDurabilityPoisoned();
+    const ScopedDurabilitySync sync_scope(&store_.durability_poisoned_);
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     std::lock_guard lock(mutex_);
     auto next = records_;

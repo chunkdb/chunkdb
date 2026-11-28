@@ -12,6 +12,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "statement_control.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
@@ -421,7 +422,7 @@ std::filesystem::path ChunkStore::WriteConditionalRollbackIntent(
             /*fsync_directory=*/true,
             &published);
     } catch (...) {
-        if (published) {
+        if (published && !durability_poisoned_.load(std::memory_order_acquire)) {
             // The WAL has not been touched. The visible but not yet
             // directory-synced intent must be removed durably before another
             // operation can append to this WAL.
@@ -473,26 +474,9 @@ bool ChunkStore::PublishConditionalCommitIntent(
         if (!replaced) {
             throw;
         }
-        // The committed state is visible. Complete the known missing
-        // directory durability step without repeating the replace.
-        try {
-            if (ConsumeFailpointEnv(
-                    "CHUNKDB_FAILPOINT_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE")) {
-                throw std::runtime_error(
-                    "injected commit-intent completion sync failure");
-            }
-            SyncDirectoryPath(intent_path.parent_path());
-        } catch (const std::exception& sync_error) {
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kRecovery,
-                "commit intent is visible but requires a later directory sync",
-                {
-                    {"path", intent_path.string()},
-                    {"error", sync_error.what()},
-                });
-            return false;
-        }
+        // The decision is visible, but another sync cannot confirm it.
+        ScopedDurabilitySync::Fail();
+        return false;
     }
     PauseConditionalMutationForTests(
         ConditionalMutationPausePoint::kAfterCommitIntentPublish);
@@ -526,6 +510,7 @@ void ChunkStore::ClearCommittedConditionalIntent(
         ConditionalMutationPausePoint::kAfterCommitIntentUnlink);
     if (ConsumeFailpointEnv(
             "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_AFTER_UNLINK_BEFORE_DIR_SYNC_ONCE")) {
+        ScopedDurabilitySync::Fail();
         throw std::runtime_error(
             "injected conditional intent cleanup failure after unlink before "
             "directory sync: " +
@@ -560,7 +545,7 @@ void ChunkStore::ThrowIfDurabilityPoisoned() const {
     }
     throw std::runtime_error(
         "store is fail-closed after an unrecoverable durability error: " +
-        (reason.empty() ? std::string("durability rollback could not be completed")
+        (reason.empty() ? std::string("a required sync or durability rollback failed")
                         : reason) +
         "; reopen the store (RECOVER TABLE or a restart) to run crash recovery");
 }

@@ -1195,6 +1195,7 @@ class ChunkStore {
         std::unordered_set<std::string> dirs;
         std::unordered_set<std::string> swept_dirs;
         bool overflow = false;
+        bool durability_failed_on_close = false;
     };
     // TABLESET and a failed TABLEDROP replace a table's store with a new one
     // and must carry over what the old one owed: its group-commit batches,
@@ -1799,7 +1800,7 @@ class ChunkStore {
     void NoteUnsyncedDir(const std::filesystem::path& path);
     // Keeps the unsynced set within unsynced_limit_. Requires unsynced_mutex_.
     void LimitUnsyncedLocked();
-    // Puts a failed barrier's drained artifacts back into the unsynced set;
+    // Puts artifacts from an interrupted drain back into the unsynced set;
     // out of memory, it sets the overflow flag instead.
     void RestoreUnsynced(UnsyncedArtifacts drained);
 
@@ -1853,8 +1854,8 @@ class ChunkStore {
         const std::vector<std::filesystem::path>& files,
         const std::vector<std::filesystem::path>& dirs);
     // Ends the caller's own sync of `forgotten`: they are no longer in
-    // flight and, unless `synced`, are tracked again.
-    void FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool synced);
+    // flight and, if `restore` is set, are tracked again.
+    void FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool restore);
     // Adds `artifacts` to the unsynced set. Requires unsynced_mutex_.
     void InsertUnsyncedLocked(const UnsyncedArtifacts& artifacts);
     [[nodiscard]] std::uint64_t CurrentWalFileSize(

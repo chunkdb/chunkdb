@@ -581,7 +581,6 @@ void SlotRecordsStartupAndTemporaryCleanup() {
     assert(txn_test::Throws([&] { TableCatalog catalog(config); }));
 }
 
-#if defined(__APPLE__)
 void SyncFailureFreezesFrontier() {
     ScopedTempDir directory("chunkdb-feed-slots-sync-failure");
     TableCatalog catalog(Configuration(directory.path()));
@@ -599,7 +598,6 @@ void SyncFailureFreezesFrontier() {
     { auto lease = table->Acquire();
       assert(txn_test::Throws([&] { lease->store().SetBlockBits(0, 0, Bits(2U)); })); }
 }
-#endif
 }  // namespace
 
 int main() {
@@ -614,7 +612,5 @@ int main() {
     LimitLossKeepsFastSlotAndSurvivesRestart();
     SlotRecordSyncFailureFreezesFrontier();
     SlotRecordsStartupAndTemporaryCleanup();
-#if defined(__APPLE__)
     SyncFailureFreezesFrontier();
-#endif
 }

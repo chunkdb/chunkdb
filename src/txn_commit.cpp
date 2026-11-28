@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "statement_control.hpp"
 #include "block_checks.hpp"
 #include "chunk_store_internal.hpp"
@@ -582,6 +584,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         return 0;
     }
 
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     // Each WAL's size becomes a durable boundary the transaction can go back
     // to.
     for (std::size_t i = 0; i < changes.size(); ++i) {
@@ -669,7 +672,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         AtomicWrite(intent_path, rollback_record, /*fsync_file=*/true, /*fsync_directory=*/true, &intent_visible);
     } catch (...) {
         bool cleaned = true;
-        if (intent_visible) {
+        if (intent_visible && !durability_poisoned_.load(std::memory_order_acquire)) {
             // Published but not synced: no WAL changed yet, so the intent
             // just has to go, durably, before any of them takes a write.
             try {
@@ -738,22 +741,14 @@ std::uint64_t ChunkStore::CommitTransaction(
             if (!replaced) {
                 throw;
             }
-            // The commit form is visible: never go back from here. Complete
-            // the directory sync it is missing.
+            // The visible commit form may survive a crash. Keep it for
+            // recovery without confirming it with a second directory sync.
+            ScopedDurabilitySync::Fail();
+            commit_durable = false;
             try {
-                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE")) {
-                    throw std::runtime_error("injected transaction commit-intent completion sync failure");
-                }
-                SyncDirectoryPath(intent_dir);
-            } catch (...) {
-                // Nothing here may throw into the rollback below: the commit
-                // form is visible.
-                commit_durable = false;
-                try {
-                    commit_sync_error = CurrentExceptionMessage();
-                } catch (...) {
-                    commit_sync_error.clear();
-                }
+                commit_sync_error = CurrentExceptionMessage();
+            } catch (const std::bad_alloc&) {
+                commit_sync_error.clear();
             }
         }
     } catch (...) {
@@ -761,6 +756,14 @@ std::uint64_t ChunkStore::CommitTransaction(
         // Nothing is committed: the WALs go back to their boundaries, then
         // the intent goes. While the intent stays, the next start truncates
         // every WAL it lists, so none of them may take another write.
+        if (durability_poisoned_.load(std::memory_order_acquire)) {
+            // The durable rollback intent still owns these boundaries.
+            // Keep the generation open and let recovery neutralize the WALs.
+            for (const auto& change : changes) change.target->chunk->wal_repair_failed = true;
+            throw std::runtime_error(
+                "the transaction was not applied: " + error +
+                "; the store is fail-closed until RECOVER TABLE or a restart");
+        }
         std::string repair_error;
         for (auto& change : changes) {
             if (!change.append_started) {

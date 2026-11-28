@@ -42,7 +42,7 @@ FLUSH WAL is a barrier: writes acknowledged after it starts may need another bar
 Changing a table's durability mode first flushes pending writes.
 A later checkpoint cannot discard state protected by a successful barrier.
 
-Clean shutdown attempts pending barrier work and logs failure.
+Clean shutdown attempts pending barrier work for tables that are still writable and logs failure.
 It does not replace receiving a successful explicit FLUSH WAL.
 After a crash, a new barrier cannot recover writes already lost.
 
@@ -65,9 +65,15 @@ An unknown outcome means the durable decision could not be confirmed.
 Run RECOVER TABLE on that table, or restart the writer, for recovery before retrying application work.
 A failed rollback also requires that recovery before durability-changing operations resume.
 
+A required sync can fail after the kernel has cleared dirty pages. A subsequent sync may succeed even though the failed writeback never reached storage.
+A failed sync of a live WAL, image, metadata record or directory fences its table for writes, barriers and feed-slot advancement until RECOVER TABLE or a writer restart. Reads can continue where the table still has a coherent state.
+An unpublished temporary file can be discarded and written again to a fresh file. If a users-file replacement was visible when publication failed, the next users change first writes a fresh copy of the in-memory record.
+If a conditional or transaction commit marker becomes visible before its directory sync fails, the operation reports an unknown outcome and leaves the marker for recovery.
+If the decision was already durable when an intent cleanup or checkpoint sync failed, the operation still reports the committed result. The failure fences subsequent writes.
+
 Named migrations use a durable decision containing their metadata change and completion record.
 After an unknown migration outcome, restart and retry the same name and text.
-Checkpoint or collection failures do not silently weaken synced durability.
+A failed backup or restore sync fails the operation. Retrying a copy requires fresh files. A restore that still has its incomplete guard is treated as interrupted.
 Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 
 Keep `chunkdb.version` and `.chunkdb.initialized` with every table's artifacts.

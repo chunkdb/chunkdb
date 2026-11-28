@@ -72,6 +72,7 @@ The rename commits the drop; deletion can finish at startup.
 Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
 RECOVER TABLE repeats the last two steps for one table: it removes that table's entries of `.chunkdb.staging/` and `.chunkdb.dropped/`, then opens `tables/<name>/` when it exists.
 It never completes a decided migration; a pending decision fences the catalog until writer startup.
+A failed sync of a live artifact or its directory fences the open table. A temporary file whose sync fails before publication is discarded. A visible commit intent whose directory sync failed is left in place for the next writer recovery.
 A fresh catalog has no tables.
 
 Chunks load lazily; opening the catalog does not load every chunk.

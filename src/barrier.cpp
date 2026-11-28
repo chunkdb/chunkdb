@@ -18,6 +18,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
+#include "durability_io.hpp"
 #include "store_manifest.hpp"
 #include "wal_writer.hpp"
 
@@ -51,7 +52,9 @@ void SyncEach(const std::vector<std::filesystem::path>& paths, const Sync& sync)
     std::atomic<bool> failed{false};
     std::mutex failure_mutex;
     std::exception_ptr failure;
+    auto* const sync_fence = ScopedDurabilitySync::Current();
     const auto work = [&]() noexcept {
+        const ScopedDurabilitySync sync_scope(sync_fence);
         while (!failed.load(std::memory_order_acquire)) {
             const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
             if (index >= paths.size()) {
@@ -100,6 +103,7 @@ void SyncFilesIfPresent(const std::vector<std::filesystem::path>& files) {
         ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE")};
     SyncEach(files, [&inject_failure](const std::filesystem::path& path) {
         if (inject_failure.exchange(false, std::memory_order_relaxed)) {
+            ScopedDurabilitySync::Fail();
             throw std::runtime_error("injected barrier file sync failure: " + path.string());
         }
         (void)SyncFilePathIfPresent(path);
@@ -776,11 +780,10 @@ void ChunkStore::WalBarrier() {
     if (access_mode_ == AccessMode::kReadOnly) {
         return;
     }
-    ThrowIfDurabilityPoisoned();
-
     // Serialize barriers so each caller's success covers everything
     // acknowledged before its own call began.
     std::lock_guard barrier_lock(wal_barrier_mutex_);
+    ThrowIfDurabilityPoisoned();
 
     // Step 1: write every loaded chunk's pending in-memory WAL batch. Any
     // failure aborts the barrier and reaches the caller. A batch is written
@@ -845,8 +848,8 @@ void ChunkStore::WalBarrier() {
     // artifacts out of the set to sync them itself, holding only the chunk.
     // Until its syncs end they are in flight, and the drain includes them, so
     // this barrier syncs them as well and never relies on a sync it does not
-    // wait for; a boundary that ended before the drain made them durable or
-    // put them back.
+    // wait for; a boundary that ended before the drain made them durable,
+    // put them back before any sync failure, or fenced the store.
     // Appends after the drain only add bytes behind the ones this barrier
     // must make durable, and a sync covers them whenever it runs. Setting the
     // floor before the syncs succeed only makes later checkpoints stricter.
@@ -906,18 +909,18 @@ void ChunkStore::WalBarrier() {
     }
 
     try {
-        // Deterministic fault hook for barrier durability tests: fail after the
-        // bookkeeping has been drained so the retry-retention path is exercised
-        // without needing a real filesystem fault.
+        const ScopedDurabilitySync sync_scope(&durability_poisoned_);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
+            ScopedDurabilitySync::Fail();
             throw std::runtime_error("injected barrier sync failure");
         }
         SyncUnsynced(drained);
+        ThrowIfDurabilityPoisoned();
         if (drained.overflow) stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
-    } catch (...) {
-        // Restore the drained bookkeeping so a retried barrier still covers
-        // the artifacts this one failed to sync.
-        RestoreUnsynced(std::move(drained));
+    } catch (const std::exception&) {
+        // A failure before I/O, such as allocation, can be retried. A failed
+        // sync can leave dirty pages clean even though their writeback failed.
+        if (!durability_poisoned_.load(std::memory_order_acquire)) RestoreUnsynced(std::move(drained));
         throw;
     }
 

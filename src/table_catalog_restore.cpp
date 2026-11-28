@@ -1,6 +1,7 @@
 #include "chunkdb/table_catalog.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 
@@ -322,11 +323,17 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     // consumer must resync. The marks are durable before the exchange, so no
     // crash loses them; a crash before it leaves only an extra resync.
     std::array<std::optional<FeedSlotRecords>, 2U> slot_records;
+    std::array<std::atomic<bool>, 2U> slot_sync_failed{};
     std::error_code exchanged;
     std::exception_ptr failure;
     try {
-        for (std::size_t i = 0; i < dirs.size(); ++i)
+        for (const auto& pending : unsynced)
+            if (pending->durability_failed_on_close)
+                throw std::runtime_error("table durability failed during SWAP TABLES; run RECOVER TABLE or restart");
+        for (std::size_t i = 0; i < dirs.size(); ++i) {
+            const ScopedDurabilitySync sync_scope(&slot_sync_failed[i]);
             slot_records[i] = RequireSlotResync(dirs[i], tables[i]->store_id(), tables[i]->geometry().dims());
+        }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"))
             throw std::runtime_error("injected failure marking swapped slots");
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE");
@@ -336,16 +343,28 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         failure = std::current_exception();
     }
     if (exchanged || failure) {
-        // Nothing moved: both tables serve again as they were.
+        // Nothing moved. A slot record whose sync failed still needs
+        // explicit recovery before its table can serve.
         for (std::size_t i = 0; i < stores.size(); ++i) {
+            if (unsynced[i]->durability_failed_on_close) {
+                fences[i].mapped().reason = "its store failed a durability step while closing for swap";
+                FenceTable(*tables[i], options[i], std::move(fences[i]));
+                continue;
+            }
             if (slot_records[i]) {
                 try {
+                    const ScopedDurabilitySync sync_scope(&slot_sync_failed[i]);
                     WriteFeedSlotRecords(dirs[i], *slot_records[i]);
                 } catch (const std::exception& error) {
                     LogMessage(LogLevel::kWarn, LogComponent::kStore,
                         "slots of a table whose swap failed could not be restored; their next watch resyncs",
                         {{"table", names[i]}, {"error", error.what()}});
                 }
+            }
+            if (slot_sync_failed[i].load(std::memory_order_acquire)) {
+                fences[i].mapped().reason = "its slot records could not be synced before swapping";
+                FenceTable(*tables[i], options[i], std::move(fences[i]));
+                continue;
             }
             try {
                 auto store = OpenStore(names[i], dirs[i], tables[i]->geometry().config(), 0U, options[i]);
@@ -490,6 +509,12 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     serving.Dismiss();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
+    if (unsynced->durability_failed_on_close) {
+        old_fence.mapped().reason = "its store failed a durability step while closing for rename";
+        FenceTable(*table, options, std::move(old_fence));
+        if (users) take_back_grants();
+        throw std::runtime_error("table durability failed during ALTER TABLE RENAME TO; run RECOVER TABLE or restart");
+    }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE");
     const auto moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
         ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);

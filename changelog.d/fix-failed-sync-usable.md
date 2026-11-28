@@ -1,0 +1,1 @@
+- Fence affected tables after a failed durability sync until recovery. Retried FLUSH WAL reports the fence, and pending commit intents remain available for recovery. (#282)

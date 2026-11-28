@@ -1,6 +1,7 @@
 #include "chunkdb/chunk_store.hpp"
 
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "chunk_store_internal.hpp"
 #include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
@@ -623,7 +624,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     {"chunk_y", std::to_string(chunk_coord.y)},
                     {"bytes", std::to_string(wal_bytes)},
                 });
-            if (writable) {
+            if (writable && !durability_poisoned_.load(std::memory_order_acquire)) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
             finish();
@@ -674,7 +675,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.commit_time_ms = replay.commit_time_ms;
         }
         if (writable) {
-            if (replay.tail_truncated_or_corrupt) {
+            if (replay.tail_truncated_or_corrupt && !durability_poisoned_.load(std::memory_order_acquire)) {
                 // Publish the fully validated prefix before trim invalidates
                 // a concurrent cold seed. Catch-up must not see an unknown
                 // entry between repair and this load's return.
@@ -694,6 +695,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
 }
 
 void ChunkStore::TrimWalForAppend(const ChunkCoord& chunk_coord, const std::filesystem::path& wal_path, std::size_t keep_bytes) {
+    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
     SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     std::lock_guard publish_lock(checkpoint_publish_mutex_);
     const bool strict =

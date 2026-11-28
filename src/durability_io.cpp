@@ -1,6 +1,7 @@
 #include "checkpoint.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -11,6 +12,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <unordered_set>
@@ -40,6 +42,76 @@
 #endif
 
 namespace chunkdb {
+
+namespace {
+thread_local std::atomic<bool>* current_sync_fence = nullptr;
+
+// A live chunk and its feed archive links have the same file name prefix
+// (before the first dot). Use that prefix for files so a sync through a link
+// or renamed WAL also observes a failed sync through the live name.
+std::array<std::mutex, 64> sync_stripes;
+
+std::size_t SyncStripe(const std::filesystem::path& path, bool directory) {
+    std::size_t hash;
+    if (directory) {
+        hash = std::filesystem::hash_value(path);
+    } else {
+        using Char = std::filesystem::path::value_type;
+        const std::basic_string_view<Char> native(path.native());
+        auto separator = native.find_last_of(static_cast<Char>('/'));
+#ifdef _WIN32
+        const auto backslash = native.find_last_of(static_cast<Char>('\\'));
+        if (backslash != native.npos && (separator == native.npos || backslash > separator)) separator = backslash;
+#endif
+        auto leaf = native.substr(separator == native.npos ? 0U : separator + 1U);
+        if (!leaf.empty() && leaf.front() != static_cast<Char>('.'))
+            leaf = leaf.substr(0U, leaf.find(static_cast<Char>('.')));
+        hash = std::hash<std::basic_string_view<Char>>{}(leaf);
+    }
+    return (hash ^ std::hash<const void*>{}(current_sync_fence)) % sync_stripes.size();
+}
+
+template <class Sync>
+bool SyncWithFence(const std::filesystem::path& path, bool missing_ok, bool directory, Sync sync) {
+    std::unique_lock<std::mutex> lock;
+    if (current_sync_fence) lock = std::unique_lock(sync_stripes[SyncStripe(path, directory)]);
+    ScopedDurabilitySync::Check();
+    try {
+#ifdef CHUNKDB_FAILPOINTS
+        if (directory && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE"))
+            throw std::runtime_error("injected directory sync failure: " + path.string());
+#ifndef __APPLE__
+        if (!directory && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE"))
+            throw std::runtime_error("injected file sync failure: " + path.string());
+#endif
+#endif
+        return sync(path, missing_ok);
+    } catch (const std::exception&) {
+        ScopedDurabilitySync::Fail();
+        throw;
+    }
+}
+}  // namespace
+
+ScopedDurabilitySync::ScopedDurabilitySync(std::atomic<bool>* fence) noexcept
+    : previous_(std::exchange(current_sync_fence, fence)) {}
+
+ScopedDurabilitySync::~ScopedDurabilitySync() {
+    current_sync_fence = previous_;
+}
+
+std::atomic<bool>* ScopedDurabilitySync::Current() noexcept {
+    return current_sync_fence;
+}
+
+void ScopedDurabilitySync::Check() {
+    if (current_sync_fence && current_sync_fence->load(std::memory_order_acquire))
+        throw std::runtime_error("store is fail-closed after a durability failure; run RECOVER TABLE or restart");
+}
+
+void ScopedDurabilitySync::Fail() noexcept {
+    if (current_sync_fence) current_sync_fence->store(true, std::memory_order_release);
+}
 
 void WriteAtomicTempFile(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
     bool durable_sync, bool enable_generic_failpoints) {
@@ -375,7 +447,6 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
     if (closed == 0) {
         throw BuildWin32Error("failed to close synced file", path, close_error);
     }
-    NoteFileSynced(path);
     return true;
 }
 
@@ -430,7 +501,6 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
         }
         throw;
     }
-    NoteDirectorySynced(path);
     return true;
 }
 }  // namespace
@@ -700,7 +770,6 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
         }
         throw;
     }
-    NoteFileSynced(path);
     return true;
 }
 
@@ -717,9 +786,6 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
 #if defined(__APPLE__)
         // As for files: a directory entry is durable only once the drive's
         // cache is flushed too.
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
-            throw BuildErrnoError("failed to F_FULLFSYNC directory", path, EIO);
-        }
         if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
             const int fullsync_error = errno;
             if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
@@ -741,7 +807,6 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
         }
         throw;
     }
-    NoteDirectorySynced(path);
     return true;
 }
 }  // namespace
@@ -789,19 +854,23 @@ void SyncOwnerDirectoryDescriptor(int fd, const std::filesystem::path& label) {
 #endif
 
 void SyncFilePath(const std::filesystem::path& path) {
-    (void)SyncFileAt(path, false);
+    if (SyncWithFence(path, false, false, SyncFileAt)) NoteFileSynced(path);
 }
 
 bool SyncFilePathIfPresent(const std::filesystem::path& path) {
-    return SyncFileAt(path, true);
+    if (!SyncWithFence(path, true, false, SyncFileAt)) return false;
+    NoteFileSynced(path);
+    return true;
 }
 
 void SyncDirectoryPath(const std::filesystem::path& path) {
-    (void)SyncDirectoryAt(path, false);
+    if (SyncWithFence(path, false, true, SyncDirectoryAt)) NoteDirectorySynced(path);
 }
 
 bool SyncDirectoryPathIfPresent(const std::filesystem::path& path) {
-    return SyncDirectoryAt(path, true);
+    if (!SyncWithFence(path, true, true, SyncDirectoryAt)) return false;
+    NoteDirectorySynced(path);
+    return true;
 }
 
 void SyncParentDirectory(const std::filesystem::path& path) {

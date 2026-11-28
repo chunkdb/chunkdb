@@ -38,8 +38,9 @@ A publication before the drain left its unsynced artifacts in the drained set.
 A later one sees the floor and syncs its replacement before removing or replacing a WAL.
 A conditional write or transaction that syncs its chunk's files itself leaves them in every drain until its syncs end.
 Writes acknowledged after it started may require the next barrier.
-Sync failure is returned and retained work remains eligible for a later barrier.
-A clean shutdown also attempts the barrier work and logs failure; it is not a substitute for receiving a successful explicit barrier.
+A failed sync fences the table. The barrier's drained tracking set is eligible for retry only if an error interrupted the work without a sync failure.
+File and directory path syncs serialize overlapping attempts on the same artifact so later attempts observe the fence. The barrier still syncs independent files in parallel.
+A clean shutdown attempts barrier work on writable tables and logs failure.
 After a crash, a new process's barrier cannot recover acknowledged writes already lost by that crash.
 
 ## Commit decisions and failures
@@ -51,6 +52,7 @@ Metadata and projected SET CHUNK always take this path; a whole-state SET CHUNK 
 Transaction COMMIT records all changed chunks' durable boundaries as CKTB, appends and syncs one frame per changed chunk, then publishes synced CKTC before exposing the new states.
 Startup rolls back CKRB/CKTB boundaries and preserves CKRC/CKTC frames.
 Cleanup failure after a durable commit is logged rather than reported as a rejected mutation.
+If that failure is a sync error, the current acknowledgement stands and later writes are refused.
 
 An ordinary data-mutation error means the mutation was not applied, except an explicit `OUTCOME_UNKNOWN stage=...` outcome.
 A decision that became visible but could not be made durable has an unknown outcome and fences the store until RECOVER TABLE or a restart.
