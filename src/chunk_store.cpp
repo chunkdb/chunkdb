@@ -531,7 +531,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         });
 
     resources_->RegisterStore(this);
-    if (background_maintenance_ && access_mode_ != AccessMode::kReadOnly) {
+    if ((background_maintenance_ || resources_->max_cache_bytes() != 0U) && access_mode_ != AccessMode::kReadOnly) {
         try {
             StartMaintenanceThread();
         } catch (...) {
@@ -658,6 +658,7 @@ void ChunkStore::RequireStoreStillOnDisk() const {
 }
 
 ChunkStore::~ChunkStore() {
+    maintenance_stop_.store(true, std::memory_order_release);
     if (feed_slots_) feed_slots_->Stop();
     // First, so no eviction pass of another store works on this one while it
     // shuts down. Its chunks leave the shared cache with it.

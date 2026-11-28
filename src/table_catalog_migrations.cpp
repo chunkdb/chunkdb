@@ -505,7 +505,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 try {
                     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_MIGRATION_RESUME_FAIL_ONCE"))
                         throw std::runtime_error("injected migration preparation resume failure");
-                    if (maintenance_stopped && store->background_maintenance_) store->StartMaintenanceThread();
+                    if (maintenance_stopped) store->StartMaintenanceThread();
                     table->EndExclusive(std::move(store), previous);
                 } catch (const std::exception& restore_error) {
                     migration_health_->failed.store(true, std::memory_order_release);

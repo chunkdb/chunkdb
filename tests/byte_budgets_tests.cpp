@@ -25,6 +25,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
+#include "maintenance_pool.hpp"
 #include "store_manifest.hpp"
 #include "txn_test_utils.hpp"
 
@@ -136,6 +137,69 @@ void OffCacheCheckpointsLeaveCacheBytes() {
     assert(f.Run("GET BLOCK 40 0 FROM t") == "*1\r\n:1\r\n");
 }
 
+struct CheckpointEvictionTurns {
+    std::promise<void> parked;
+    std::shared_future<void> release;
+    std::promise<void> completed;
+    unsigned turns = 0U;
+};
+
+CheckpointEvictionTurns* checkpoint_eviction_turns = nullptr;
+
+void ObserveCheckpointEvictionTurn() {
+    auto& turns = *checkpoint_eviction_turns;
+    if (++turns.turns == 1U) {
+        turns.parked.set_value();
+        turns.release.wait();
+    } else if (turns.turns == 2U) {
+        turns.completed.set_value();
+    }
+}
+
+void CheckpointGrowthQueuesEviction(bool fence_before_eviction) {
+    std::promise<void> release;
+    CheckpointEvictionTurns turns{.parked = {}, .release = release.get_future().share(), .completed = {}};
+    auto worker_parked = turns.parked.get_future();
+    auto eviction_finished = turns.completed.get_future();
+    Fixture f;
+    f.config.maintenance_workers = 1U;
+    f.config.byte_limits.cache_max_bytes = 8192U;
+    f.config.default_options.checkpoint_update_interval = 2U;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u8, note text(32768)) CHUNK 4 x 4") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN t n=1, note='small'"), ":");
+    const auto& resources = *f.catalog->resources();
+    assert(resources.CacheBytes() < resources.max_cache_bytes());
+
+    // Park the only worker after FLUSH WAL, so the inline checkpoint can
+    // finish and release the chunk before the queued pass picks its victims.
+    checkpoint_eviction_turns = &turns;
+    MaintenancePool::SetTurnEndHookForTests(&ObserveCheckpointEvictionTurn);
+    assert(f.Run("FLUSH WAL") == "+OK\r\n");
+    assert(worker_parked.wait_for(5s) == std::future_status::ready);
+    Expect(f.Run("SET BLOCK 0 0 IN t note='" + std::string(16384U, 'x') + "'"), ":");
+    assert(resources.CacheBytes() > resources.max_cache_bytes());
+    const auto table = f.catalog->Require("t");
+    assert(table->Acquire()->store().RuntimeStats().checkpoints == 1U);
+    if (fence_before_eviction) {
+        // Run this barrier directly while the pool worker is still parked.
+        txn_test::ScopedEnv failed("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");
+        bool unknown = false;
+        try { table->Acquire()->store().WalBarrier(); }
+        catch (const WriteOutcomeUnknownError&) { unknown = true; }
+        assert(unknown && f.catalog->Fence("t"));
+    }
+    release.set_value();
+    assert(eviction_finished.wait_for(5s) == std::future_status::ready);
+    MaintenancePool::SetTurnEndHookForTests(nullptr);
+    const auto stats = table->Acquire()->store().RuntimeStats();
+    if (fence_before_eviction) {
+        assert(resources.CacheBytes() > resources.max_cache_bytes() && stats.evictions == 0U);
+    } else {
+        assert(resources.CacheBytes() <= resources.max_cache_bytes() && stats.evictions == 1U);
+    }
+}
+
 // A failed sync in FLUSH WAL leaves the table fail-closed: a retried sync
 // could succeed after the system dropped the data it was to write.
 void BarrierSyncFailureFailsClosed() {
@@ -209,6 +273,41 @@ void BarrierBatchSyncFailureFailsClosed() {
     }
     Expect(f.Run("FLUSH WAL"), "-ERR INTERNAL ");
     Expect(f.Run("SET BLOCK 2 0 IN t n=3"), "-ERR INTERNAL ");
+}
+
+void MultiTableBarrierFailures(std::string_view statement, bool sync_first) {
+    Fixture f;
+    f.config.maintenance_workers = 1U;
+    f.Open();
+    const std::string definite = sync_first ? "beta" : "alpha";
+    const std::string unknown = sync_first ? "alpha" : "beta";
+    assert(f.Run("CREATE TABLE " + definite + " (n u32) CHUNK 4 x 4 WITH wal_group_commit_updates = 2") == "+OK\r\n");
+    assert(f.Run("CREATE TABLE " + unknown + " (n u32) CHUNK 4 x 4 WITH wal_group_commit_updates = 1") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN " + definite + " n=1"), ":");
+    Expect(f.Run("SET BLOCK 0 0 IN " + unknown + " n=1"), ":");
+    const bool runs_all = statement == "FLUSH WAL";
+    const bool expect_unknown = runs_all || sync_first;
+    {
+        // The definite table still has a batch. Its append fails before it
+        // can consume the sync failpoint, which the other table reaches.
+        txn_test::ScopedEnv full("CHUNKDB_FAILPOINT_WAL_APPEND_ENOSPC_ONCE", "1");
+        txn_test::ScopedEnv sync("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");
+        if (expect_unknown) {
+            Expect(f.Run(statement), "-ERR OUTCOME_UNKNOWN stage=barrier_sync table=" + unknown + " ");
+        } else {
+            Expect(f.Run(statement), "-ERR DISK_FULL reason=disk_full ");
+        }
+        const auto* append_left = std::getenv("CHUNKDB_FAILPOINT_WAL_APPEND_ENOSPC_ONCE");
+        const bool append_consumed = append_left == nullptr || append_left[0] == '\0';
+        assert(append_consumed == (runs_all || !sync_first));
+    }
+    assert(f.catalog->Fence(unknown).has_value() == expect_unknown && !f.catalog->Fence(definite));
+    if (expect_unknown) {
+        Expect(f.Run("SET BLOCK 1 0 IN " + unknown + " n=2"), "-ERR INTERNAL ");
+        assert(f.Run("RECOVER TABLE " + unknown) == "+OK\r\n");
+    }
+    Expect(f.Run("SET BLOCK 1 0 IN " + definite + " n=2"), ":");
+    assert(f.Run("FLUSH WAL") == "+OK\r\n");
 }
 
 void EvictionOpenStreamRepairFailureIsInternal() {
@@ -562,9 +661,17 @@ void TxnCommitNoSpace(DurabilityMode mode, const char* failpoint) {
 int main() {
     CacheBytesBoundAllTables();
     OffCacheCheckpointsLeaveCacheBytes();
+    CheckpointGrowthQueuesEviction(false);
+    CheckpointGrowthQueuesEviction(true);
     BarrierSyncFailureFailsClosed();
     QueuedBarrierObservesSyncFailure();
     BarrierBatchSyncFailureFailsClosed();
+    MultiTableBarrierFailures("FLUSH WAL", false);
+    MultiTableBarrierFailures("FLUSH WAL", true);
+#ifndef _WIN32
+    MultiTableBarrierFailures("SWAP TABLES alpha, beta", false);
+    MultiTableBarrierFailures("SWAP TABLES alpha, beta", true);
+#endif
     EvictionOpenStreamRepairFailureIsInternal();
     TxnHistoryTotal();
     FeedTotal();

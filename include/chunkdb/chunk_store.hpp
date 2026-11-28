@@ -584,6 +584,9 @@ class WriteOutcomeUnknownError : public std::runtime_error {
     enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation, kBarrierSync };
     explicit WriteOutcomeUnknownError(std::string message, Stage stage = Stage::kPublication)
         : std::runtime_error(std::move(message)), stage_(stage) {}
+    WriteOutcomeUnknownError(const WriteOutcomeUnknownError& error, std::shared_ptr<const std::string> table) noexcept
+        : std::runtime_error(error), stage_(error.stage_), table_(std::move(table)) {}
+    [[nodiscard]] std::string_view table() const noexcept { return table_ ? std::string_view(*table_) : std::string_view{}; }
     [[nodiscard]] std::string_view stage() const noexcept {
         switch (stage_) {
             case Stage::kConditionalCommitSync: return "conditional_commit_sync";
@@ -598,6 +601,8 @@ class WriteOutcomeUnknownError : public std::runtime_error {
     }
   private:
     Stage stage_;
+    // Copies of a prepared outcome error after publication must never allocate.
+    std::shared_ptr<const std::string> table_{};
 };
 
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
@@ -1587,7 +1592,8 @@ class ChunkStore {
     std::vector<ChunkCoord> maintenance_checkpoint_queue_;
     std::unordered_set<ChunkCoord, ChunkCoordHash> maintenance_checkpoint_queued_keys_;
     bool maintenance_eviction_requested_ = false;
-    bool maintenance_stop_ = false;
+    // Also sampled by a worker choosing victims across stores.
+    std::atomic<bool> maintenance_stop_{false};
     std::shared_ptr<MaintenancePool> maintenance_pool_;
     std::shared_ptr<MaintenanceTask> maintenance_task_;
     // Notified when a background checkpoint stops owning a chunk's files.
@@ -1742,6 +1748,7 @@ class ChunkStore {
     [[nodiscard]] bool TryEvictCandidate(
         const EvictionCandidate& candidate,
         bool respect_recency,
+        bool background,
         std::size_t* removed,
         std::vector<LargeChunkCoord>* maybe_empty_large_chunks);
     // Recorded tick of the next eviction candidate of this store, refilling
@@ -1756,7 +1763,7 @@ class ChunkStore {
         std::vector<LargeChunkCoord> maybe_empty_large_chunks);
     // Brings the cache shared through resources_ back under its budget by
     // evicting the coldest chunks of any store sharing it.
-    void MaybeEvictChunks();
+    void MaybeEvictChunks(bool background = false);
     void RequestEviction();
 
     [[nodiscard]] std::shared_ptr<RegularChunk> TryGetLoadedChunk(const ChunkCoord& chunk_coord) const;
@@ -1855,6 +1862,8 @@ class ChunkStore {
     void StartMaintenanceThread();
     void StopMaintenanceThread() noexcept;
     bool MaintenanceStep();
+    [[nodiscard]] bool CanRunBackgroundEviction() const;
+    [[nodiscard]] bool EnqueueBackgroundEviction(bool defer_while_stopped = false);
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
     // Waits, releasing `lock`, while a background checkpoint owns the
@@ -2209,6 +2218,8 @@ class StoreResources {
     const std::size_t maintenance_workers_;
     std::mutex maintenance_pool_mutex_;
     std::shared_ptr<MaintenancePool> maintenance_pool_;
+    // Set before any catalog stores register. Standalone stores have no catalog fence.
+    std::shared_ptr<const std::atomic<bool>> catalog_fenced_{};
 
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;

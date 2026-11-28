@@ -97,7 +97,8 @@ A COMMIT answers INTERNAL and is unapplied because recovery removes its records.
 A statement whose eviction of a chunk from its own table could not cut back the WAL answers INTERNAL and is also unapplied.
 A failed file or directory sync during FLUSH WAL leaves the table refusing changes until RECOVER TABLE or a restart, since a retried sync can succeed after the system dropped the unwritten data.
 The table's error is `OUTCOME_UNKNOWN stage=barrier_sync`, or `OUTCOME_UNKNOWN stage=wal_append_repair` if the WAL cutback also fails.
-FLUSH WAL waits for barriers on all serving tables and reports one error if several tables fail.
+FLUSH WAL waits for barriers on all serving tables, even after a failure, and reports an unknown outcome with its `table` name before any definite error.
+SWAP TABLES stops at its first failed barrier before exchanging the names and reports `table` if that barrier's outcome is unknown.
 
 Set `--min-free-disk-bytes` to refuse writes before the disk fills, and the table option `max_disk_bytes` to bound one table; see [Server flags](SERVER_FLAGS.md#disk-space).
 

@@ -198,7 +198,17 @@ bool ChunkStore::CheckpointChunk(
     }
     // Writes change a chunk's memory without measuring it; each checkpoint
     // measures it again for the cache byte limit.
+    const auto previous_charge = chunk->cache_charge;
     RechargeCacheLocked(*chunk);
+    struct RequestEvictionOnExit {
+        ChunkStore& store;
+        bool needed = false;
+        ~RequestEvictionOnExit() {
+            // Submit after releasing the checkpoint's publication locks. A
+            // worker runs the same bounded pass as on a miss.
+            if (needed) (void)store.EnqueueBackgroundEviction(/*defer_while_stopped=*/true);
+        }
+    } eviction{*this, chunk->cache_charge > previous_charge && CacheBytesOverLimit()};
     std::shared_lock maintenance_lock(backup_maintenance_mutex_, std::try_to_lock);
     if (!maintenance_lock.owns_lock()) {
         chunk->checkpoint_due_armed = true;

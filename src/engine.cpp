@@ -919,10 +919,12 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             LogComponent::kStore,
             "command execution error; outcome unknown",
             {{"error", error.what()}});
-        return Protocol::Error(
-            "OUTCOME_UNKNOWN",
+        constexpr std::string_view message =
             "write outcome unknown: it may or may not be applied; the table is fail-closed until "
-            "RECOVER TABLE or a server restart", {{"stage", outcome->stage()}});
+            "RECOVER TABLE or a server restart";
+        if (!outcome->table().empty())
+            return Protocol::Error("OUTCOME_UNKNOWN", message, {{"stage", outcome->stage()}, {"table", outcome->table()}});
+        return Protocol::Error("OUTCOME_UNKNOWN", message, {{"stage", outcome->stage()}});
     }
     if (const auto* io = dynamic_cast<const std::system_error*>(&error);
         io != nullptr && io->code() == std::errc::no_space_on_device)

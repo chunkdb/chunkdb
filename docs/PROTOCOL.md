@@ -336,6 +336,9 @@ Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are 
 VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
+An unknown barrier outcome from FLUSH WAL or SWAP TABLES also includes the affected `table`.
+FLUSH WAL waits for all serving tables' barriers and reports an unknown outcome if any occurred, otherwise it reports the first definite error.
+SWAP TABLES stops at its first failed barrier.
 INTERNAL reports other operational failures without exposing internal diagnostics.
 
 ```text

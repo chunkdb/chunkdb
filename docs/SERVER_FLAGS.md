@@ -142,7 +142,7 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 `--cache-max-bytes` counts each cached chunk's values, presence bits, variable values, chunk columns and pending WAL batch.
 A chunk is measured when it loads and at each of its checkpoints, so writes that grow variable values between checkpoints are counted late.
 A cache miss above the byte limit starts eviction of the coldest chunks across all tables, aiming to reduce measured use to roughly fifteen sixteenths of the limit.
-Growth measured at a checkpoint can leave the cache above its limit until a later miss.
+Checkpoint growth queues a bounded eviction pass on the maintenance pool even when background checkpoints are off, and overshoot has no fixed byte or time bound if eviction falls behind or a pass cannot free enough eligible chunks.
 Chunks in use and chunks with an unrepaired WAL are skipped during eviction.
 
 ## Disk space

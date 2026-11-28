@@ -406,7 +406,12 @@ void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<Ch
                 name_.c_str(), failure.what(), log_error.what());
         }
     };
-    feed_cleanup_failed_.store(true, std::memory_order_release);
+    if (store) store->maintenance_stop_.store(true, std::memory_order_release);
+    {
+        std::lock_guard lock(mutex_);
+        if (store_) store_->maintenance_stop_.store(true, std::memory_order_release);
+        feed_cleanup_failed_.store(true, std::memory_order_release);
+    }
     ended_.store(kWatchFenced, std::memory_order_release);
     cv_.notify_all();
     if (admitted) {
@@ -610,7 +615,6 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes(), store->resources_->feed_budget());
     store->StopMaintenanceThread();
     ScopeExit maintenance([&] {
-        if (!store->background_maintenance_) return;
         try { store->StartMaintenanceThread(); }
         catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
     });
@@ -918,7 +922,6 @@ FeedArchiveReader Table::ReadFeedArchive(FeedPosition after) {
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     store->StopMaintenanceThread();
     ScopeExit maintenance([&] {
-        if (!store->background_maintenance_ || store->access_mode_ != AccessMode::kReadWrite) return;
         try { store->StartMaintenanceThread(); }
         catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
     });
@@ -1110,6 +1113,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
     }
     if (store && (feed_cleanup_failed_.load(std::memory_order_acquire) ||
         migration_health_->failed.load(std::memory_order_acquire))) {
+        store->maintenance_stop_.store(true, std::memory_order_release);
         store->feed_.store(nullptr, std::memory_order_seq_cst);
         store->feed_watchers_active_.store(false, std::memory_order_release);
         store->feed_slots_->Stop();
@@ -1174,6 +1178,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams, config_.maintenance_workers, config_.byte_limits);
+    resources_->catalog_fenced_ = std::shared_ptr<const std::atomic<bool>>(migration_health_, &migration_health_->failed);
 
     const bool writable = config_.access_mode == AccessMode::kReadWrite;
     if (writable) {
@@ -2528,9 +2533,20 @@ void TableCatalog::WalBarrier() {
         auto failure = pool->Wait(barriers[i]);
         if (!failures[i]) failures[i] = failure;
     }
-    for (const auto& failure : failures) {
-        if (failure) std::rethrow_exception(failure);
+    // Clients must see an ambiguous outcome before deciding whether it is
+    // safe to retry. Keep table order for failures of the same priority.
+    std::exception_ptr definite_failure;
+    for (std::size_t i = 0U; i < failures.size(); ++i) {
+        if (!failures[i]) continue;
+        try {
+            std::rethrow_exception(failures[i]);
+        } catch (const WriteOutcomeUnknownError& error) {
+            throw WriteOutcomeUnknownError(error, {tables[i], &tables[i]->name()});
+        } catch (const std::exception&) {
+            if (!definite_failure) definite_failure = failures[i];
+        }
     }
+    if (definite_failure) std::rethrow_exception(definite_failure);
 }
 
 TableOptionsUpdate TableOptionsUpdate::From(const TableOptions& options) {
@@ -2610,7 +2626,7 @@ bool TableCatalog::EnableFeature(std::string_view name) {
     // already-admitted slot/DDL operation may need that mutex to finish.
     ScopeExit resume([&] {
         for (auto& participant : participants) {
-            if (participant.store->background_maintenance_ && !migration_health_->failed.load(std::memory_order_acquire)) {
+            if (!migration_health_->failed.load(std::memory_order_acquire)) {
                 try { participant.store->StartMaintenanceThread(); }
                 catch (const std::exception& error) { participant.store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
             }

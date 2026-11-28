@@ -233,6 +233,7 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
 bool ChunkStore::TryEvictCandidate(
     const EvictionCandidate& candidate,
     bool respect_recency,
+    bool background,
     std::size_t* removed,
     std::vector<LargeChunkCoord>* maybe_empty_large_chunks) {
     std::shared_ptr<LargeChunk> large_chunk;
@@ -270,6 +271,7 @@ bool ChunkStore::TryEvictCandidate(
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
         AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
+        if (background && !CanRunBackgroundEviction()) return false;
         // Its WAL past the last good point is not committed state, so memory
         // is the only right copy until a restart repairs the WAL.
         if (regular_chunk->wal_repair_failed) {
@@ -319,6 +321,7 @@ bool ChunkStore::TryEvictCandidate(
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
         AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
+        if (background && !CanRunBackgroundEviction()) return false;
         if (regular_chunk->wal_repair_failed || !regular_chunk->wal_batch.empty()) {
             return false;
         }
@@ -410,7 +413,7 @@ void ChunkStore::FinishEvictedChunks(
     }
 }
 
-void ChunkStore::MaybeEvictChunks() {
+void ChunkStore::MaybeEvictChunks(bool background) {
     StoreResources& resources = *resources_;
     const auto loaded_hint = resources.loaded_chunks_.load(std::memory_order_relaxed);
     // The count limit uses the count this caller saw, as without a byte limit.
@@ -453,9 +456,13 @@ void ChunkStore::MaybeEvictChunks() {
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
     std::shared_lock stores_lock(resources.stores_mutex_);
+    // The registry keeps all victims alive until the pass exits. A worker
+    // that was waiting for it may have lost admission in the meantime.
+    if (background && !CanRunBackgroundEviction()) return;
     std::vector<Victim> victims;
     victims.reserve(resources.stores_.size());
     for (ChunkStore* store : resources.stores_) {
+        if (background && !store->CanRunBackgroundEviction()) continue;
         if (store != this &&
             store->eviction_skip_until_ms_.load(std::memory_order_relaxed) > now_ms) {
             continue;
@@ -477,6 +484,7 @@ void ChunkStore::MaybeEvictChunks() {
             victim.exhausted = false;
         }
         while ((removed < required || bytes_over()) && probes < probe_budget && own_failure == nullptr) {
+            if (background && !CanRunBackgroundEviction()) break;
             Victim* coldest = nullptr;
             std::uint64_t coldest_tick = 0;
             for (auto& victim : victims) {
@@ -506,6 +514,7 @@ void ChunkStore::MaybeEvictChunks() {
                 (void)coldest->store->TryEvictCandidate(
                     candidate,
                     respect_recency,
+                    background,
                     &coldest->removed,
                     &coldest->maybe_empty_large_chunks);
             } catch (const std::exception& e) {
@@ -564,9 +573,8 @@ void ChunkStore::RequestEviction() {
         return;
     }
 
-    // Backpressure: while background maintenance catches up, the cache may
-    // exceed the configured bound by at most one hysteresis band. Beyond
-    // that, the loading thread evicts inline to preserve the hard bound.
+    // Above one hysteresis band the loading thread applies backpressure
+    // inline. Pinned or failed chunks can still prevent reaching the target.
     const std::size_t max_loaded_chunks = resources_->max_loaded_chunks_;
     const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks);
     const std::size_t hysteresis = max_loaded_chunks - std::min(lower_watermark, max_loaded_chunks);
@@ -580,15 +588,7 @@ void ChunkStore::RequestEviction() {
         return;
     }
 
-    {
-        std::lock_guard lock(maintenance_mutex_);
-        if (!maintenance_stop_ && maintenance_task_) {
-            maintenance_eviction_requested_ = true;
-            if (maintenance_pool_->Notify(maintenance_task_)) return;
-            maintenance_eviction_requested_ = false;
-        }
-    }
-    MaybeEvictChunks();
+    if (!EnqueueBackgroundEviction()) MaybeEvictChunks();
 }
 
 }  // namespace chunkdb
