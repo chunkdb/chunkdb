@@ -28,6 +28,7 @@
 #include "feed_archive.hpp"
 #include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
+#include "table_swap_guard.hpp"
 #include "store_manifest.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
@@ -1100,6 +1101,14 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         } catch (const std::exception& error) {
             Report(counters, true, "migration_pending_invalid", data_dir / chunkdb::kMigrationPendingFileName, error.what());
         }
+        ++counters->checked;
+        try {
+            if (chunkdb::ValidatePendingTableSwap(data_dir))
+                Report(counters, false, "swap_recovery_pending", data_dir / chunkdb::kTableSwapPendingFileName,
+                    "table swap requires a read-write start to finish");
+        } catch (const std::exception& error) {
+            Report(counters, true, "swap_pending_invalid", data_dir / chunkdb::kTableSwapPendingFileName, error.what());
+        }
     }
 
     std::uint32_t pending_feature = 0U;
@@ -1119,6 +1128,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         const auto name = entry.path().filename().string();
         if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
             name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName || name == chunkdb::kFeaturePendingFileName ||
+            name == chunkdb::kTableSwapPendingFileName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }

@@ -1,0 +1,1 @@
+- SWAP TABLES works on Windows and recovers an interrupted swap when the writer starts again. (#145)

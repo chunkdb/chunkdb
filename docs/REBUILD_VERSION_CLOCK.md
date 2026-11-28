@@ -39,6 +39,7 @@ The next write of a rebuilt table gets a revision at or above its printed next r
 - It runs the `chunkdb_verify` checks on every table and writes their findings to standard error.
 - It reads the highest revision of chunk images, WALs, archived WALs and their bases, coordinate files, transaction intents, slot positions and the restore lineage.
 - Damage other than a missing or malformed clock or initialized marker refuses the whole directory, and no file changes.
+- A pending Windows swap must be finished by a writer start before rebuilding clocks.
 - It refuses a directory or table that uses a feature this build can only read, as the server does.
 - A table whose clock is readable and above every revision on disk keeps it and prints `kept`.
 - Any other table gets a clock 2^32 revisions above its highest revision on disk, or above the directory's version floor when that is higher, and prints `rebuilt`.

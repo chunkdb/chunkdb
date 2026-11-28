@@ -491,11 +491,9 @@ void TestRenameAndSwap() {
     assert(fixture.Run(*session, "ALTER TABLE a RENAME TO c") == "+OK\r\n");
     const auto renamed = CatalogPush(NextBytes(*watcher->catalog_watch));
     assert(renamed.events.size() == 2U && HasEvent(renamed, "table", "drop", "a") && HasEvent(renamed, "table", "create", "c"));
-#ifndef _WIN32
     assert(fixture.Run(*session, "SWAP TABLES b, c") == "+OK\r\n");
     const auto swapped = CatalogPush(NextBytes(*watcher->catalog_watch));
     assert(swapped.events.size() == 2U && HasEvent(swapped, "table", "alter", "b") && HasEvent(swapped, "table", "alter", "c"));
-#endif
 }
 
 void TestResyncWithSmallBudget() {

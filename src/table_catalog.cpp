@@ -29,6 +29,7 @@
 #include "snapshot_generation.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
+#include "table_swap_guard.hpp"
 #include "migrations_records.hpp"
 #include "user_registry.hpp"
 #include "maintenance_pool.hpp"
@@ -1200,6 +1201,9 @@ TableCatalog::TableCatalog(CatalogConfig config)
     process_lock_ = AcquireWriterLock(
         config_.data_dir, config_.access_mode, config_.allow_multiple_processes);
 
+    if (!process_lock_ && TableSwapPending(config_.data_dir))
+        throw std::runtime_error("pending swap recovery requires the exclusive writer lock: " +
+            (config_.data_dir / kTableSwapPendingFileName).string());
     if (config_.allow_multiple_processes && std::filesystem::exists(config_.data_dir / kMigrationPendingFileName))
         throw MigrationRecoveryRequiredError("pending migration recovery requires the exclusive writer lock");
     OpenDataDirManifest();
@@ -1210,6 +1214,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (activation) ValidateFeatureActivationJournal(config_.data_dir, *activation);
     RecoverFeatureActivation(config_.data_dir, config_.access_mode);
     RecoverMigrations(config_.data_dir, config_.access_mode);
+    if (process_lock_) RecoverPendingTableSwap(config_.data_dir);
     version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
     if (writable) {
         EnsureDirectoryPathExists(TablesDir(), /*durable_sync=*/true);
@@ -1714,11 +1719,13 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         if (reason == nullptr) throw not_fenced();
     }
     const auto dir = TablesDir() / table_name;
+    const bool recovering_swap = reason == kFenceSwapPending;
     // Refuse what opening would refuse while a fail-closed store still
     // serves reads.
-    if (IsDirectory(dir)) RequireRecoverableOptions(table_name, ReadOpenableManifest(dir));
+    if (!recovering_swap && IsDirectory(dir)) RequireRecoverableOptions(table_name, ReadOpenableManifest(dir));
     // Made now, so that neither fencing again nor publishing allocates.
-    auto fence = PrepareFence(table, table_name, kFenceRecovery);
+    const auto recovery_reason = recovering_swap ? kFenceSwapPending : kFenceRecovery;
+    auto fence = PrepareFence(table, table_name, recovery_reason);
     auto entry = PrepareServed(table_name);
     EnterStatementDecision();
     serving.Dismiss();
@@ -1732,8 +1739,9 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         // What opening the catalog does, for this table only. A pending
         // migration decision cannot be left at this point: it fences the
         // catalog until the restart that completes it.
+        if (recovering_swap) RecoverFencedTableSwap(config_.data_dir, name);
         RemoveInterruptedOperations(table_name);
-        if (IsDirectory(dir)) {
+        if (recovering_swap || IsDirectory(dir)) {
             auto found = ReadTableToOpen(table_name, dir);
             RequireRecoverableOptions(table_name, found.manifest);
             PublishDroppedPending(found);
@@ -1743,7 +1751,7 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         if (table) FenceTable(*table, options, std::move(fence));
         else {
             std::unique_lock lock(tables_mutex_);
-            if (const auto it = fenced_.find(name); it != fenced_.end()) it->second.reason = kFenceRecovery;
+            if (const auto it = fenced_.find(name); it != fenced_.end()) it->second.reason = recovery_reason;
         }
         LogMessage(
             LogLevel::kError,

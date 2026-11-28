@@ -12,6 +12,7 @@
 #include "process_lock.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
+#include "table_swap_guard.hpp"
 #include "user_registry.hpp"
 #include "verify.hpp"
 
@@ -77,6 +78,8 @@ std::vector<RebuiltVersionClock> RebuildVersionClock(const std::filesystem::path
         throw std::invalid_argument("the directory " + data_dir.string() + " is not a chunkdb data directory");
     }
     const auto lock = AcquireWriterLock(data_dir, AccessMode::kReadWrite, /*allow_multiple_processes=*/false);
+    // The revision survey would miss a table parked by a pending swap.
+    RequireNoPendingTableSwap(data_dir);
     const auto survey = SurveyRevisions(data_dir, findings);
     if (survey.damage != 0U) {
         throw std::runtime_error("the checks found " + std::to_string(survey.damage) +

@@ -407,12 +407,6 @@ void SwapStatement() {
     (void)admin->Command("SET BLOCK 0 0 IN t n = 8");
     const auto restored = Field(admin->Command("RESTORE TABLE t FROM 'snap' AS t_restored"), "epoch").value;
     const auto live = StoreIdHex(harness.catalog->Find("t")->store_id());
-#ifdef _WIN32
-    // Windows has no atomic directory exchange; both tables keep their names.
-    Error(admin->Command("SWAP TABLES t, t_restored"), "INTERNAL");
-    assert(Field(admin->Command("DESCRIBE t"), "epoch").value == live);
-    return;
-#endif
     // The live table's slot is consumed and acknowledged under its own name.
     auto watcher = harness.Connect();
     (void)Start(watcher->Command("WATCH t SLOT 'consumer'"));
@@ -477,6 +471,15 @@ void SwapStatement() {
     admin->Ok("GRANT ADMIN ON t_restored TO operator");
     user.Ok("SWAP TABLES t_restored, t");
     assert(Field(admin->Command("DESCRIBE t"), "epoch").value == live);
+
+    // A separate reader's grant stays on its name as the data moves again.
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client reader(harness.port, false); reader.Login("reader", "pw");
+    assert(Number(reader.Command("GET BLOCK 0 0 FROM t").items.at(0)) == 8U);
+    user.Ok("SWAP TABLES t, t_restored");
+    assert(Number(reader.Command("GET BLOCK 0 0 FROM t").items.at(0)) == 7U);
+    Error(reader.Command("GET BLOCK 0 0 FROM t_restored"), "NO_TABLE");
 }
 // ALTER TABLE ... RENAME TO keeps the epoch and the slot position under the
 // new name; open transactions end with CONFLICT and the old name is gone.

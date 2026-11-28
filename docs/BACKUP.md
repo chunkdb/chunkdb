@@ -90,7 +90,7 @@ RESTORE TABLE copies one table of a completed backup under `--backup-dir` into a
 The new table gets a new epoch with the backed-up epoch and cut as its lineage, and appears only once it is complete; a failure or crash before then leaves nothing behind.
 Server shutdown, CANCEL, KILL CONNECTION or a statement timeout cancels a running restore before it publishes the table; a client disconnect does not, and the server log reports each tenth of the copied bytes.
 The backed-up table must have `table_lineage`, the table features this directory gives its tables, and options the server's option flags allow.
-SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the replaced data now under the other name.
+SWAP TABLES then exchanges the names as one durable operation, and DROP TABLE removes the replaced data now under the other name.
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 See [Tables](reference/TABLES.md) for SWAP TABLES.
 

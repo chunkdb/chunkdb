@@ -37,6 +37,8 @@ data_dir/
   chunkdb.groups.owner                commit group owner root (inactive; no path creates it)
   chunkdb.groups.objects/             commit group owner objects (inactive)
   chunkdb.groups.journal/             commit group journal generations (inactive)
+  chunkdb.swap.pending                interrupted guarded swap decision, when present
+  tables/.chunkdb.swap.<16 hex>/      parked table during a guarded swap
   tables/<name>/
     table.manifest                    identity, geometry, options, schema history
     chunkdb.version                   reserved revision ceiling
@@ -65,16 +67,40 @@ Entries in `tables/` with invalid names are ignored; a table directory with a va
 
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
 RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
-SWAP TABLES syncs both tables' WALs, closes them, marks their slots to resync, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
+SWAP TABLES syncs both tables' WALs, closes them, and marks their slots to resync.
+Linux and macOS exchange the directories atomically and sync `tables/`. Windows uses the [swap guard](#swap-guard).
 RENAME TO syncs the table's WAL, closes it, renames `tables/<a>/` to `tables/<b>/` without replacing an entry and syncs `tables/`; a crash leaves the table under one name, with its files unchanged.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
 The rename commits the drop; deletion can finish at startup.
-Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
-RECOVER TABLE repeats the last two steps for one table: it removes that table's entries of `.chunkdb.staging/` and `.chunkdb.dropped/`, then opens `tables/<name>/` when it exists.
+Writer startup recovers decided migrations and then a pending swap before interrupted-table cleanup and table opening.
+RECOVER TABLE finishes a pending swap that names the table, removes that table's entries of `.chunkdb.staging/` and `.chunkdb.dropped/`, then opens `tables/<name>/` when it exists.
 It never completes a decided migration; a pending decision fences the catalog until writer startup.
 A fresh catalog has no tables.
 
 Chunks load lazily; opening the catalog does not load every chunk.
+
+### Swap guard
+
+`data_dir/chunkdb.swap.pending` is an owner-only decision record with the following fields in order. Integers are little-endian.
+
+| Field | Encoding |
+| --- | --- |
+| Header | `CKSW`, version `u16` = 1, reserved `u16` = 0 |
+| Data directory | 16-byte directory identity |
+| First table | Name length `u8`, name bytes, 16-byte table identity |
+| Second table | Name length `u8`, name bytes, 16-byte table identity |
+| Parked suffix | 8 bytes, rendered in byte order as 16 lowercase hex digits |
+| Checksum | CRC32 `u32` over all preceding bytes |
+
+Table names follow the directory name rules above and appear in strictly increasing order.
+All identities are nonzero, and the two table identities differ.
+Publication syncs the temporary file, moves it to the pending name without replacement, and syncs the data directory.
+Windows moves the first table to `tables/.chunkdb.swap.<suffix>/`, the second to the first name, and the parked table to the second name. Each move refuses an existing destination.
+After syncing `tables/`, it removes the guard and syncs the data directory again.
+Writer recovery validates the directory identity and both table manifests, determines the next move from the identities found at the three paths, and finishes the remaining steps.
+If the guard is absent on exclusive writer startup, recovery syncs the data directory before a later operation can reuse either name.
+An invalid record or layout refuses writer startup and leaves the record in place.
+Read-only and multi-process startup refuse a pending swap. Windows, Linux and macOS builds recognize the record, which uses no feature bit.
 
 ## Feature flags and manifests
 

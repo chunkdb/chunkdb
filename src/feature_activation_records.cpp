@@ -15,6 +15,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
+#include "table_swap_guard.hpp"
 
 namespace chunkdb {
 namespace {
@@ -85,6 +86,7 @@ Participants ValidateParticipants(const std::filesystem::path& root, const Featu
         throw std::filesystem::filesystem_error("cannot inspect migration decision", root, pending_error);
     if (!pending_error && migration.type() != std::filesystem::file_type::not_found)
         Bad("migration and feature activation decisions conflict");
+    RequireNoPendingTableSwap(root);
     const auto tables_dir = root / "tables";
     const auto directory_status = std::filesystem::symlink_status(tables_dir);
     if (directory_status.type() != std::filesystem::file_type::directory) Bad("tables directory is not a directory");

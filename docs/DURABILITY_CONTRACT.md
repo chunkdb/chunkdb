@@ -82,9 +82,14 @@ Read-only inspection remains available and reports an unknown completed revision
 - macOS requests F_FULLFSYNC and falls back to fsync for unsupported operations.
 - Windows requires FlushFileBuffers and the directory-sync capability used by publication and snapshot bookkeeping.
 - Required atomic publication or sync failures return errors, including required Windows bookkeeping in relaxed mode.
-- SWAP TABLES needs an atomic directory exchange (Linux `renameat2`, macOS `renamex_np`); Windows and file systems without one refuse it.
+- On Linux and macOS, SWAP TABLES requires an atomic directory exchange and syncs `tables/` before acknowledging success.
+- On Windows, SWAP TABLES requires the exclusive writer lock. It syncs a guard record before moving either table, syncs the completed moves, then removes the record and syncs its removal before acknowledging success.
 - Replication and durability across machines are unavailable.
 
-`chunkdb_verify` inspects files without modifying them; the server always opens its data directory for writing.
+On Windows, a crash before guard publication leaves both names as they were. A guard that survives a crash tells the next writer to finish the swap by table identity before it opens any tables.
+An error before publication or a failed first move whose guard was durably removed leaves the tables under their old names. A failure that leaves the outcome unresolved fences both names. RECOVER TABLE on either name finishes a retained guard and opens that name. Restarting opens both.
+Read-only and multi-process starts refuse a pending guard, and `chunkdb_verify` reports it as recovery pending or damaged.
+
+`chunkdb_verify` inspects files without modifying them. A writer start performs recovery.
 See [Storage format](STORAGE_FORMAT.md), [Backup and restore](BACKUP.md), and [Limitations](KNOWN_LIMITATIONS.md).
 Implementation details are in [Persistence design](design/PERSISTENCE.md).
