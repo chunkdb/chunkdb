@@ -1466,6 +1466,22 @@ void ChunkForms(bool tls) {
 // repeats, SHOW SLOTS lists them, WATCH SLOT accepts the same set in any order,
 // and live delivery and the replay after a reconnect keep only their chunks.
 void SeveralAreaSlot(bool tls) {
+    struct CloseObserver final : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool closed = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterSlotSocketClose) return;
+            { std::lock_guard lock(mutex); closed = true; }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            test::FeedPhaseWatchdog::Phase("disconnected slot socket close");
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("server did not close the disconnected slot socket");
+        }
+    } observer; // Outlives the harness and its callbacks.
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect();
     writer->Ok("CREATE TABLE t (n u8) CHUNK 4 x 4");
@@ -1481,16 +1497,23 @@ void SeveralAreaSlot(bool tls) {
     auto watch = harness.Connect();
     const auto one = watch->Command("WATCH t SLOT 'several' AREA 0 0 TO 0 0");
     Error(one, "INVALID_ARGUMENT"); assert(one.value.find("reason=slot_filters") != std::string::npos);
-    (void)Start(watch->Command("WATCH t SLOT 'several' AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 2 2 TO 2 2"));
+    const auto initial = Start(watch->Command("WATCH t SLOT 'several' AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 2 2 TO 2 2"));
     (void)Number(writer->Command("SET BLOCK 4 4 IN t n = 1")); // Chunk 1 1 is outside both areas.
     const auto low = Number(writer->Command("SET BLOCK 0 0 IN t n = 2"));
     const auto high = Number(writer->Command("SET BLOCK 8 8 IN t n = 3"));
     FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
     assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
-    Unwatch(*watch); // No ACK: the next watch replays both and still skips chunk 1 1.
-    (void)Start(watch->Command("WATCH t SLOT 'several'"));
-    assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
-    Unwatch(*watch);
+    {
+        FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+        Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+        watch->Close(); // Disconnect with both revisions unacknowledged.
+        observer.WaitClosed();
+    }
+    auto replacement = harness.Connect();
+    const auto resumed = Start(replacement->Command("WATCH t SLOT 'several'"));
+    assert(resumed == initial);
+    assert(Change(NextChange(*replacement)) == low && Change(NextChange(*replacement)) == high);
+    Unwatch(*replacement);
 }
 
 void PersistentFilterDelivery(bool tls) {
