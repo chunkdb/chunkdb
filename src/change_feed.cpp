@@ -5,7 +5,6 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -37,15 +36,6 @@ bool SameValues(const std::optional<std::vector<ColumnValue>>& a,
     if (!a) return true;
     return SameFeedValues(*a, *b);
 }
-// Overlapping or repeated areas keep the same chunks; one order shares one projection.
-void SortAreas(std::vector<FeedArea>& areas) {
-    std::sort(areas.begin(), areas.end(), [](const FeedArea& a, const FeedArea& b) {
-        return std::tie(a.first.x, a.first.y, a.first.z, a.last.x, a.last.y, a.last.z) <
-            std::tie(b.first.x, b.first.y, b.first.z, b.last.x, b.last.y, b.last.z);
-    });
-    areas.erase(std::unique(areas.begin(), areas.end()), areas.end());
-}
-
 }  // namespace
 
 ScopedWriteUser::ScopedWriteUser(std::string_view user) noexcept : previous_(g_write_user) { g_write_user = user; }
@@ -813,7 +803,7 @@ std::string FeedSubscription::ResyncFrame() {
 
 FeedSubscription::FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_ptr<Table> table, const FeedOptions& options)
     : feed_(std::move(feed)), table_(std::move(table)), areas_(options.areas), column_ids_(options.column_ids), no_before_(options.no_before) {
-    SortAreas(areas_);
+    SortFeedAreas(areas_);
 }
 void FeedSubscription::Track(std::uint64_t revision) {
     if (group_) group_->Move(group_position_, revision);
@@ -907,7 +897,7 @@ FeedPosition FeedSubscription::SetAreas(std::vector<FeedArea> areas) {
                 throw std::invalid_argument("feed area bounds are reversed");
         }
     }
-    SortAreas(areas);
+    SortFeedAreas(areas);
     // Leave, as in the destructor and Track's Move, runs outside the ring
     // mutex: it frees the items it pruned after releasing the group's own
     // mutex, which serializes it with other readers' Find, Add and Trim.

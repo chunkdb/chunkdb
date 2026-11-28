@@ -7182,14 +7182,24 @@ void TestWatchCatalog() {
     assert(FeedMap(FeedMap(*table, "data"), "version").value == "2");
     assert(CatalogEvent(ReadFeedReply(mon), "table", "cat_t") != nullptr);
 
-    admin.SendLine("CREATE SLOT 'sub' ON cat_t"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("CREATE SLOT 'sub' ON cat_t AREA 2 3 TO 4 5, AREA -4 -3 TO -2 -1, AREA -4 -3 TO -2 -1");
+    assert(admin.ReadLine() == "+OK\r\n");
     const auto slot_full = ReadFeedReply(full);
     const auto* slot = CatalogEvent(slot_full, "slot", "sub");
     assert(slot != nullptr && FeedMap(*slot, "action").value == "create" && FeedMap(*slot, "table").value == "cat_t");
-    assert(FeedMap(FeedMap(*slot, "data"), "owner").value == kAdminUser);
+    const auto& slot_data = FeedMap(*slot, "data");
+    assert(FeedMap(slot_data, "owner").value == kAdminUser);
+    const auto& filters = FeedMap(slot_data, "filters");
+    const FeedReply expected_areas{'*', "2", {
+        {'*', "4", {{':', "-4", {}}, {':', "-3", {}}, {':', "-2", {}}, {':', "-1", {}}}},
+        {'*', "4", {{':', "2", {}}, {':', "3", {}}, {':', "4", {}}, {':', "5", {}}}},
+    }};
+    assert(FeedMap(filters, "area").type == '_' && FeedMap(filters, "areas") == expected_areas);
     const auto slot_push = ReadFeedReply(mon);
     slot = CatalogEvent(slot_push, "slot", "sub");
-    assert(slot != nullptr && FeedMap(FeedMap(*slot, "data"), "owner").type == '_');
+    assert(slot != nullptr);
+    const auto& monitor_slot = FeedMap(*slot, "data");
+    assert(FeedMap(monitor_slot, "owner").type == '_' && FeedMap(monitor_slot, "filters") == filters);
 
     // WATCH CATALOG reserves the name for new tables.
     admin.SendLine("CREATE TABLE catalog (n u8) CHUNK 4 x 4"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);

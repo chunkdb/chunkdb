@@ -2,6 +2,9 @@
 // over the present blocks of a chunk, area or ball, with BY CHUNK, NULL and
 // float rules, exact integer sums, bounds and transaction snapshots.
 
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -289,6 +292,109 @@ void Cancellation() {
     assert(stopped && aggregator.blocks() == 3U);
 }
 
+// Values are read in place as DecodeColumnValue reads them: widths that cross
+// byte boundaries, sign extension, 33 and 64 bits, f32 and f64, NULL skipped.
+void ValuesInPlace() {
+    const auto column = [](std::uint32_t id, std::string name, ColumnKind kind, std::uint32_t width, bool nullable) {
+        return Column{.id = id, .name = std::move(name), .type = {kind, width}, .nullable = nullable, .default_value = {}};
+    };
+    TableSchema schema;
+    schema.columns = {column(1U, "a", ColumnKind::kUnsigned, 5U, true), column(2U, "b", ColumnKind::kSigned, 7U, false),
+        column(3U, "c", ColumnKind::kSigned, 3U, true), column(4U, "d", ColumnKind::kUnsigned, 64U, false),
+        column(5U, "e", ColumnKind::kSigned, 64U, false), column(6U, "g", ColumnKind::kSigned, 33U, false),
+        column(7U, "h", ColumnKind::kFloat32, 32U, true), column(8U, "k", ColumnKind::kFloat64, 64U, false)};
+    schema.next_column_id = 9U;
+    constexpr std::size_t kBlocks = 13U;
+    const ChunkLayout layout(schema, kBlocks, 4096U);
+    std::vector<std::uint8_t> payload(layout.payload_bytes(), 0U);
+    std::vector<std::uint8_t> presence((kBlocks + 7U) / 8U, 0U);
+    std::uint64_t seed = 0x9E3779B97F4A7C15ULL;
+    for (std::size_t block = 0U; block < kBlocks; ++block) {
+        if (block == 6U) continue;
+        presence[block / 8U] |= static_cast<std::uint8_t>(1U << (block % 8U));
+        for (const auto& fixed : layout.fixed_columns()) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            auto raw = seed;
+            const auto kind = schema.columns[fixed.column].type.kind;
+            if (kind == ColumnKind::kFloat32)
+                raw = std::bit_cast<std::uint32_t>(static_cast<float>(static_cast<std::int64_t>(seed >> 40U) - 8000) / 7.0F);
+            if (kind == ColumnKind::kFloat64)
+                raw = std::bit_cast<std::uint64_t>(static_cast<double>(static_cast<std::int64_t>(seed >> 20U)) / -3.0);
+            std::array<std::uint8_t, 8U> bytes{};
+            for (std::size_t i = 0U; i < bytes.size(); ++i) bytes[i] = static_cast<std::uint8_t>(raw >> (8U * i));
+            WriteValueBits(payload.data() + fixed.values, block * fixed.width, bytes.data(), fixed.width);
+            if (fixed.validity != ChunkLayout::kNoValidity && block % 4U != 1U)
+                payload[fixed.validity + block / 8U] |= static_cast<std::uint8_t>(1U << (block % 8U));
+        }
+    }
+    using Kind = cql::AggregateFunction::Kind;
+    std::vector<cql::AggregateFunction> functions;
+    std::string expected;
+    for (const auto& fixed : layout.fixed_columns()) {
+        const auto& schema_column = schema.columns[fixed.column];
+        const auto kind = schema_column.type.kind;
+        const bool floating = kind == ColumnKind::kFloat32 || kind == ColumnKind::kFloat64;
+        __int128 low = 0, high = 0, sum = 0;
+        double low_number = 0.0, high_number = 0.0;
+        bool first = true;
+        for (std::size_t block = 0U; block < kBlocks; ++block) {
+            if ((presence[block / 8U] & (1U << (block % 8U))) == 0U) continue;
+            if (fixed.validity != ChunkLayout::kNoValidity && (payload[fixed.validity + block / 8U] & (1U << (block % 8U))) == 0U)
+                continue;
+            std::array<std::uint8_t, 8U> bytes{};
+            ReadValueBits(payload.data(), fixed.values * 8U + block * fixed.width, bytes.data(), fixed.width);
+            const auto value = DecodeColumnValue(schema_column, bytes.data());
+            if (floating) {
+                const double number = kind == ColumnKind::kFloat32 ? static_cast<double>(std::get<float>(value)) : std::get<double>(value);
+                low_number = first ? number : std::min(low_number, number);
+                high_number = first ? number : std::max(high_number, number);
+            } else {
+                const __int128 integer = kind == ColumnKind::kUnsigned ? static_cast<__int128>(std::get<std::uint64_t>(value))
+                                                                       : static_cast<__int128>(std::get<std::int64_t>(value));
+                low = first ? integer : std::min(low, integer);
+                high = first ? integer : std::max(high, integer);
+                sum += integer;
+            }
+            first = false;
+        }
+        functions.push_back({Kind::kMin, schema_column.name});
+        functions.push_back({Kind::kMax, schema_column.name});
+        if (floating && kind == ColumnKind::kFloat32) {
+            Protocol::AppendFloat(expected, static_cast<float>(low_number));
+            Protocol::AppendFloat(expected, static_cast<float>(high_number));
+        } else if (floating) {
+            Protocol::AppendDouble(expected, low_number);
+            Protocol::AppendDouble(expected, high_number);
+        } else if (kind == ColumnKind::kUnsigned) {
+            Protocol::AppendInteger(expected, static_cast<std::uint64_t>(low));
+            Protocol::AppendInteger(expected, static_cast<std::uint64_t>(high));
+        } else {
+            Protocol::AppendInteger(expected, static_cast<std::int64_t>(low));
+            Protocol::AppendInteger(expected, static_cast<std::int64_t>(high));
+        }
+        // Sums of the narrow integer columns stay in the i64 range.
+        if (!floating && fixed.width <= 33U) {
+            functions.push_back({Kind::kSum, schema_column.name});
+            Protocol::AppendInteger(expected, static_cast<std::int64_t>(sum));
+        }
+    }
+    Aggregator aggregator(layout, functions);
+    aggregator.Add(payload, presence);
+    assert(aggregator.blocks() == kBlocks - 1U);
+    std::string out;
+    aggregator.AppendResults(out);
+    Same(out, expected);
+}
+
+void ValueSpansNineBytes() {
+    Fixture f;
+    f.Ok("CREATE TABLE t (v u63) CHUNK 2 x 2");
+    // Block 1 starts at bit 63, so bit 62 of its value is in the ninth byte read.
+    constexpr std::uint64_t kValue = std::uint64_t{1} << 62U;
+    f.Ok("SET BLOCK 1 0 IN t v = " + std::to_string(kValue));
+    Same(f.Run("AGGREGATE CHUNK 0 0 FROM t MAX(v)"), Map({{"max(v)", UInt(kValue)}}));
+}
+
 std::string U64Frame(std::uint64_t value) {
     std::string frame(8U, '\0');
     for (std::size_t i = 0U; i < 8U; ++i) frame[i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
@@ -432,6 +538,8 @@ int main() {
     Transactions();
     MetaOnlyChunk();
     Cancellation();
+    ValuesInPlace();
+    ValueSpansNineBytes();
     Where();
     WhereRefusals();
     WhereTransactions();

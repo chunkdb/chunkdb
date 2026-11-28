@@ -63,7 +63,7 @@ void Filters() {
     StoreId epoch{}; epoch[0] = 9U;
     FeedSlotRecords records{epoch, UINT64_MAX, {{"filtered", UINT64_MAX, false}}};
     auto& slot = records.slots.front();
-    slot.filters = {.area = FeedArea{{INT64_MIN, -3}, {INT64_MAX, 7}},
+    slot.filters = {.areas = {FeedArea{{INT64_MIN, -3}, {INT64_MAX, 7}}},
         .column_ids = std::vector<std::uint32_t>{UINT32_MAX, 2U, 1U}, .no_before = true, .chunks = true};
     const auto bytes = SerializeFeedSlotRecords(records);
     assert(ReadLe16(bytes, 4U) == 4U && bytes[6U] == 2U && bytes[7U] == 1U);
@@ -103,7 +103,7 @@ void Filters() {
     slot.filters.column_ids = std::vector<std::uint32_t>{0U}; Reject([&] { (void)SerializeFeedSlotRecords(records); });
     slot.filters.column_ids = std::vector<std::uint32_t>{1U, 1U}; Reject([&] { (void)SerializeFeedSlotRecords(records); });
     slot.filters.column_ids = std::vector<std::uint32_t>{}; Reject([&] { (void)SerializeFeedSlotRecords(records); });
-    slot.filters.column_ids.reset(); slot.filters.area = FeedArea{{1, 0}, {0, 0}};
+    slot.filters.column_ids.reset(); slot.filters.areas = {FeedArea{{1, 0}, {0, 0}}};
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
 }
 
@@ -113,11 +113,59 @@ void Checksum(std::vector<std::uint8_t>& bytes) {
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
 }
 
+// A slot with several areas sets header flag 0x2, and each slot with areas
+// then gives their count; with at most one area per slot the layout is the
+// one without counts. Areas are ordered and distinct, at most 64.
+void SeveralAreas() {
+    StoreId epoch{}; epoch[0] = 5U;
+    FeedSlotRecords records{epoch, 9U, {{"one", 9U, false}, {"several", 9U, false}, {"whole", 9U, false}}, true};
+    records.slots[0].filters.areas = {FeedArea{{5, 5}, {6, 6}}};
+    records.slots[1].filters.areas = {FeedArea{{-4, -4}, {-3, -3}}, FeedArea{{0, 0}, {1, 1}}, FeedArea{{0, 0}, {2, 2}}};
+    const auto bytes = SerializeFeedSlotRecords(records);
+    assert(bytes[7U] == 3U);
+    assert(bytes.size() == 40U + (12U + 3U + 1U + 32U) + (12U + 7U + 1U + 3U * 32U) + (12U + 5U));
+    const auto parsed = ParseFeedSlotRecords(bytes, epoch, 2U);
+    for (std::size_t i = 0U; i < records.slots.size(); ++i) assert(parsed.slots[i].filters == records.slots[i].filters);
+    for (std::size_t at = 0; at < bytes.size(); ++at) {
+        auto partial = bytes; partial.resize(at);
+        Reject([&] { (void)ParseFeedSlotRecords(partial, epoch); });
+    }
+    const auto count_at = 36U + 12U + 3U;
+    assert(bytes[count_at] == 1U && bytes[count_at + 1U + 32U + 12U + 7U] == 3U);
+    for (const auto count : {0U, 2U, 65U}) {
+        auto bad = bytes; bad[count_at] = static_cast<std::uint8_t>(count); Checksum(bad);
+        Reject([&] { (void)ParseFeedSlotRecords(bad, epoch); });
+    }
+    auto bad = bytes; bad[7U] = 2U; Checksum(bad);
+    Reject([&] { (void)ParseFeedSlotRecords(bad, epoch); }); // Counts belong to the filter format.
+    // Swapped areas are out of order.
+    bad = bytes;
+    const auto several_at = count_at + 1U + 32U + 12U + 7U + 1U;
+    std::swap_ranges(bad.begin() + static_cast<std::ptrdiff_t>(several_at), bad.begin() + static_cast<std::ptrdiff_t>(several_at + 32U),
+        bad.begin() + static_cast<std::ptrdiff_t>(several_at + 32U));
+    Checksum(bad);
+    Reject([&] { (void)ParseFeedSlotRecords(bad, epoch); });
+    auto& several = records.slots[1].filters.areas;
+    std::swap(several[0], several[1]);
+    Reject([&] { (void)SerializeFeedSlotRecords(records); });
+    several[0] = several[1];
+    Reject([&] { (void)SerializeFeedSlotRecords(records); }); // Repeated.
+    several.clear();
+    for (std::int64_t i = 0; i < 65; ++i) several.push_back(FeedArea{{i, i}, {i, i}});
+    Reject([&] { (void)SerializeFeedSlotRecords(records); });
+    several.pop_back();
+    assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(records), epoch).slots[1].filters.areas.size() == 64U);
+    several.resize(1U);
+    const auto single = SerializeFeedSlotRecords(records);
+    assert(single[7U] == 1U && single.size() == 40U + (12U + 3U + 32U) + (12U + 7U + 32U) + (12U + 5U));
+    assert(ParseFeedSlotRecords(single, epoch).slots[1].filters == records.slots[1].filters);
+}
+
 void Dimensions() {
     StoreId epoch{}; epoch[0] = 4U;
     FeedSlotRecords records{epoch, UINT64_MAX, {{"space", UINT64_MAX, true}}, true, 3U};
     auto& slot = records.slots.front();
-    slot.filters = {.area = FeedArea{{INT64_MIN, -9, INT64_MIN}, {INT64_MAX, 9, INT64_MAX}, 3U},
+    slot.filters = {.areas = {FeedArea{{INT64_MIN, -9, INT64_MIN}, {INT64_MAX, 9, INT64_MAX}, 3U}},
         .column_ids = std::vector<std::uint32_t>{7U, 1U}, .no_before = true, .chunks = true};
     slot.schema_filter_lost = true;
     const auto bytes = SerializeFeedSlotRecords(records);
@@ -142,7 +190,7 @@ void Dimensions() {
     auto bad = bytes; bad[6U] = 2U; Checksum(bad);
     Reject([&] { (void)ParseFeedSlotRecords(bad, epoch); }); // Extra active-axis bytes cannot become a 2D filter.
     bad = bytes; bad[7U] = 0U; reject_checked(bad);
-    bad = bytes; bad[7U] |= 2U; reject_checked(bad);
+    bad = bytes; bad[7U] |= 4U; reject_checked(bad);
     const auto area = 36U + 12U + slot.name.size();
     bad = bytes;
     std::swap_ranges(bad.begin() + static_cast<std::ptrdiff_t>(area + 16U),
@@ -156,21 +204,21 @@ void Dimensions() {
         catch (const EarlierDevelopmentFormatError&) { earlier = true; }
         assert(earlier);
     }
-    slot.filters.area->first.z = 0; slot.filters.area->last.z = 0;
+    slot.filters.areas[0].first.z = 0; slot.filters.areas[0].last.z = 0;
     assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(records), epoch, 3U).slots.front().filters == slot.filters);
-    slot.filters.area->dims = 2U;
+    slot.filters.areas[0].dims = 2U;
     Reject([&] { (void)SerializeFeedSlotRecords(records); }); // Zero Z still has explicit arity.
     records.dims = 2U;
-    slot.filters.area->first.z = 1;
+    slot.filters.areas[0].first.z = 1;
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
-    slot.filters.area->first.z = 0; slot.filters.area->last.z = 1;
+    slot.filters.areas[0].first.z = 0; slot.filters.areas[0].last.z = 1;
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
-    slot.filters.area->dims = 3U;
+    slot.filters.areas[0].dims = 3U;
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
     records.dims = 3U;
-    slot.filters.area->first.z = 2;
+    slot.filters.areas[0].first.z = 2;
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
-    slot.filters.area.reset();
+    slot.filters.areas.clear();
     const auto no_area = SerializeFeedSlotRecords(records);
     assert(ParseFeedSlotRecords(no_area, epoch, 3U).dims == 3U);
     Reject([&] { (void)ParseFeedSlotRecords(no_area, epoch, 2U); });
@@ -260,7 +308,7 @@ void Owners() {
 
     FeedSlotRecords space{epoch, 3U, {{"space", 3U, false}}, true, 3U};
     space.slots[0].owner = "bob";
-    space.slots[0].filters.area = FeedArea{{-1, -2, -3}, {1, 2, 3}, 3U};
+    space.slots[0].filters.areas = {FeedArea{{-1, -2, -3}, {1, 2, 3}, 3U}};
     space.slots[0].filters.column_ids = std::vector<std::uint32_t>{2U};
     const auto spatial = SerializeFeedSlotRecords(space);
     assert(spatial.size() == 40U + 12U + 5U + 48U + 4U + 1U + 3U);
@@ -302,4 +350,4 @@ void Owners() {
 
 }  // namespace
 
-int main() { Records(); Filters(); Dimensions(); AdmissionBounds(); Owners(); }
+int main() { Records(); Filters(); SeveralAreas(); Dimensions(); AdmissionBounds(); Owners(); }

@@ -589,20 +589,14 @@ class Parser {
     bool FeedFilter(Filters& filters) {
         const auto column = Peek().column;
         if (Accept("area")) {
-            if constexpr (requires { filters.areas; }) {
-                if (!filters.areas.empty()) Fail(column, "AREA is given twice");
+            if (!filters.areas.empty()) Fail(column, "AREA is given twice");
+            filters.areas.push_back(FeedBounds());
+            while (AcceptToken(TokenKind::kComma)) {
+                const auto next = Peek().column;
+                Expect("area");
+                if (filters.areas.size() == kMaxFeedAreas) Fail(next, "a watch or slot takes at most 64 areas");
                 filters.areas.push_back(FeedBounds());
-                while (AcceptToken(TokenKind::kComma)) {
-                    const auto next = Peek().column;
-                    Expect("area");
-                    if (filters.areas.size() == kMaxFeedAreas) Fail(next, "a watch takes at most 64 areas");
-                    filters.areas.push_back(FeedBounds());
-                    if (filters.areas.back().dims != filters.areas.front().dims) Fail(next, "AREA dimensions differ");
-                }
-            } else {
-                if (filters.area) Fail(column, "AREA is given twice");
-                filters.area = FeedBounds();
-                if (Peek().kind == TokenKind::kComma) Fail(Peek().column, "a slot takes one AREA");
+                if (filters.areas.back().dims != filters.areas.front().dims) Fail(next, "AREA dimensions differ");
             }
         } else if (Accept("columns")) {
             if (filters.columns) Fail(column, "COLUMNS is given twice");
@@ -1554,6 +1548,22 @@ class Parser {
             Expect("from");
             ScanChunks scan;
             scan.table = Name("a table name");
+            if (Accept("area")) {
+                scan.has_area = true;
+                auto& area = scan.area;
+                area.around = Accept("around");
+                area.dims = Point(area.first.x, area.first.y, area.first.z, true);
+                if (area.around) {
+                    Expect("radius");
+                    area.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+                } else {
+                    Expect("to");
+                    if (Point(area.last.x, area.last.y, area.last.z, true) != area.dims)
+                        Fail(1, "AREA endpoints have different dimensions");
+                    if (area.first.x > area.last.x || area.first.y > area.last.y || area.first.z > area.last.z)
+                        Fail(1, "AREA bounds are reversed");
+                }
+            }
             while (true) {
                 const auto column = Peek().column;
                 if (Accept("after")) {

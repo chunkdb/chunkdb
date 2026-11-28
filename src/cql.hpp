@@ -10,6 +10,7 @@
 #include <variant>
 #include <vector>
 
+#include "chunkdb/area_selector.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/change_feed.hpp"
 #include "sectioned_chunk_form.hpp"
@@ -297,7 +298,8 @@ struct CreateSlot {
     std::string name;
     std::string table;
     bool if_not_exists = false;
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; AREA ..., AREA ... gives several.
+    std::vector<FeedArea> areas{};
     std::optional<std::vector<std::string>> columns{};
     bool no_before = false;
     bool chunks = false;
@@ -422,6 +424,9 @@ struct ScanChunks {
     std::vector<std::string> columns;
     // WHERE (expr.hpp): only the present blocks for which it is TRUE.
     std::shared_ptr<const expr::Expression> where;
+    // AREA a TO b or AREA AROUND c RADIUS r: only the chunks inside it.
+    bool has_area = false;
+    ChunkAreaSelector area{};
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;

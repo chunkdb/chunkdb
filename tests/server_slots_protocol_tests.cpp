@@ -6,6 +6,7 @@
 #include <future>
 #include <map>
 
+#include "chunkdb/logging.hpp"
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
@@ -1542,6 +1543,60 @@ void ChunkForms(bool tls) {
     assert(NextChunks(*slot) == partial && NextChunks(*slot) == removed); Unwatch(*slot);
 }
 
+// A slot keeps several areas: CREATE SLOT records them in order without
+// repeats, SHOW SLOTS lists them, WATCH SLOT accepts the same set in any order,
+// and live delivery and the replay after a reconnect keep only their chunks.
+void SeveralAreaSlot(bool tls) {
+    struct CloseObserver final : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool closed = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterSlotSocketClose) return;
+            { std::lock_guard lock(mutex); closed = true; }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            test::FeedPhaseWatchdog::Phase("disconnected slot socket close");
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("server did not close the disconnected slot socket");
+        }
+    } observer; // Outlives the harness and its callbacks.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'several' ON t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 0 0 TO 0 0");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0, AREA 2 2 TO 2 2");
+    const auto fewer = writer->Command("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0");
+    Error(fewer, "INVALID_ARGUMENT"); assert(fewer.value.find("reason=slot_filters") != std::string::npos);
+    const auto shown = writer->Command("SHOW SLOTS ON t");
+    const auto& filters = Field(Slot(shown, "t", "several"), "filters");
+    assert(Field(filters, "area").type == '_');
+    const auto& areas = Field(filters, "areas").items;
+    assert(areas.size() == 2U && areas[0].items.size() == 4U && Number(areas[0].items[0]) == 0U && Number(areas[1].items[3]) == 2U);
+    auto watch = harness.Connect();
+    const auto one = watch->Command("WATCH t SLOT 'several' AREA 0 0 TO 0 0");
+    Error(one, "INVALID_ARGUMENT"); assert(one.value.find("reason=slot_filters") != std::string::npos);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'several' AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 2 2 TO 2 2"));
+    (void)Number(writer->Command("SET BLOCK 4 4 IN t n = 1")); // Chunk 1 1 is outside both areas.
+    const auto low = Number(writer->Command("SET BLOCK 0 0 IN t n = 2"));
+    const auto high = Number(writer->Command("SET BLOCK 8 8 IN t n = 3"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
+    {
+        FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+        Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+        watch->Close(); // Disconnect with both revisions unacknowledged.
+        observer.WaitClosed();
+    }
+    auto replacement = harness.Connect();
+    const auto resumed = Start(replacement->Command("WATCH t SLOT 'several'"));
+    assert(resumed == initial);
+    assert(Change(NextChange(*replacement)) == low && Change(NextChange(*replacement)) == high);
+    Unwatch(*replacement);
+}
+
 void PersistentFilterDelivery(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect();
@@ -1558,7 +1613,7 @@ void PersistentFilterDelivery(bool tls) {
     auto watch = harness.Connect();
     const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
     Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
-    // A slot keeps one area, so different ones never match its filters; repeats of it do.
+    // Areas other than the slot's never match its filters; repeats of them do.
     const auto areas = watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 1 1 TO 1 1");
     Error(areas, "INVALID_ARGUMENT"); assert(areas.value.find("reason=slot_filters") != std::string::npos);
     (void)Start(watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 0 0 TO 0 0"));
@@ -1721,6 +1776,54 @@ void ArchiveWhileLeaseHeld(bool tls) {
     assert(!watch->Ready(100ms));
     held_lease.reset(); // Reader progress above must not have needed an exclusive table lease.
     FeedTestAccess::SetHook(*table, nullptr); witness.reset(); Unwatch(*watch);
+}
+
+void ArchiveLogsAfterOpening(bool tls) {
+    feed_test::Pause pause(FeedTestHook::Point::kBeforeMerge);
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, 4096);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = SlotWatch::Create(table, "consumer", {});
+    watch->Activate();
+    auto witness = table->SubscribeFeed();
+
+    FeedTestAccess::SetHook(*table, &pause);
+    Cleanup clear_pause([&] { pause.Release(); FeedTestAccess::SetHook(*table, nullptr); });
+    (void)pause.Wait();
+    std::uint64_t live = 0U;
+    for (unsigned value = 1; value <= 100; ++value) live = Set(*writer, value);
+    pause.Release();
+    const auto reset = witness->Next(10s);
+    assert(reset && reset->kind == FeedEntry::Kind::kResync && reset->position.revision == live);
+
+    struct SlowOpen : FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+        Clock::duration ArchiveOpenElapsed(Clock::duration) const noexcept override { return 1s; }
+    } slow_open;
+    SlotAckDeadlineTestAccess::Hook(*watch, &slow_open);
+    std::vector<std::string> lines;
+    const auto caller = std::this_thread::get_id();
+    SetLogSinkForTests([&](const std::string& line) {
+        if (std::this_thread::get_id() != caller) return;
+        if (line.find("slot archive reader was slow to open") != std::string::npos ||
+            line.find("slot watch reads the archive") != std::string::npos) lines.push_back(line);
+    });
+    Cleanup clear_log([] { ResetLogSinkForTests(); });
+    const auto cursor = watch->position().revision;
+    assert(table->ListFeedSlots().front().durable_watermark == cursor);
+    assert(watch->WorkStep()); // Observes the reset but cannot open the archive.
+    (void)watch->WorkStep();
+    assert(lines.empty());
+
+    FeedSlotTestAccess::Sync(*table);
+    assert(watch->WorkStep());
+    assert(lines.size() == 2U);
+    assert(lines[0].find(" INFO server ") != std::string::npos);
+    assert(lines[0].ends_with(" slot=consumer cursor=" + std::to_string(cursor) + " live=" + std::to_string(live) +
+        " durable=" + std::to_string(live)));
+    assert(lines[1].find(" WARN server ") != std::string::npos);
+    assert(lines[1].ends_with("slot archive reader was slow to open slot=consumer ms=1000"));
+    SlotAckDeadlineTestAccess::Hook(*watch, nullptr);
 }
 
 void AfterWaitsForDurable(bool tls) {
@@ -2994,7 +3097,9 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
+        run("several-area-slot", SeveralAreaSlot);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
+        run("archive-diagnostics", ArchiveLogsAfterOpening);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("filtered-idle-progress", FilteredAndIdleProgress);
@@ -3004,13 +3109,13 @@ int main(int argc, char** argv) {
         run("CHUNKS-ACK-deadline-ledger", ChunksDeadlineLedger);
         run("CHUNKS-slot-live-reader", ChunkSlotLiveReader);
         run("CHUNKS-lagging-watch", LaggingChunksWatch); run("CHUNKS-lagging-slot", LaggingChunksSlot);
-        run("WATCH-AREA-buffered-CHUNKS", WatchAreaAfterBufferedChunks);
-        run("WATCH-AREA-reply-resync", WatchAreaReplySurvivesResync);
         run("ACK-deadline-wire", AckDeadlineWire);
         run("CHUNKS-ACK-deadline-wire", ChunksDeadlineWire);
         run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);
         run("CHUNKS-ACK-deadline-stalled-socket", ChunksDeadlineStalledSocket);
         run("many-subscribers", ManySubscribers);
+        run("WATCH-AREA-buffered-CHUNKS", WatchAreaAfterBufferedChunks);
+        run("WATCH-AREA-reply-resync", WatchAreaReplySurvivesResync);
         std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
     }
     if (total == 0U) { std::cerr << "no matching test group\n"; return 2; }

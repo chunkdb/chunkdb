@@ -73,14 +73,16 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, and `watch_area_replace`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, `slot_areas`, `scan_area`, and `watch_area_replace`.
 Options become visible only after authentication succeeds.
 The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 The `watch_catalog` feature permits WATCH CATALOG and its `catalog` events.
-The `watch_area_replace` feature permits WATCH AREA on a connection that watches.
+The `slot_areas` feature permits several areas in CREATE SLOT and adds `areas` to the SHOW SLOTS filters.
+The `scan_area` feature permits SCAN CHUNKS with AREA or AREA AROUND.
+The `watch_area_replace` feature permits WATCH AREA on a streaming table watch without SLOT.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.

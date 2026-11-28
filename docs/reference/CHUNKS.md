@@ -88,7 +88,8 @@ GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH S
     [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
 GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
     [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
-SCAN CHUNKS FROM table [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WHERE condition] [WITH DATA] [COLUMNS column, ...]
+SCAN CHUNKS FROM table [AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] | AREA AROUND cx cy [cz] RADIUS radius]
+    [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WHERE condition] [WITH DATA] [COLUMNS column, ...]
 COMPACT TOMBSTONES table BEFORE revision
 SHOW TABLE STATS table
 ```
@@ -108,6 +109,7 @@ SHOW TABLE STATS table
 - `AFTER`: exclude this position and all earlier positions in coordinate order.
 - `LIMIT`: requested cells per area page, or maximum positions per scan page; scans default to at most 1024.
 - `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).
+- `AREA`: in SCAN CHUNKS, list only the chunks inside the range or ball, in the same order.
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WHERE`: keep only blocks for which a [condition](../CQL.md#conditions) is true; see [Filter a scan](#filter-a-scan).
 - `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
@@ -124,7 +126,7 @@ SHOW TABLE STATS table
 - Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; on a server started with `--read-only`, `position` is null.
 - Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
 - COMPACT TOMBSTONES: the retained-deletion floor after completion.
-- SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `files`, `disk_bytes`, `slots`, and `watches`.
+- SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `cache_bytes`, `history_bytes`, `open_transactions`, `files`, `disk_bytes`, `image_bytes`, `wal_bytes`, `archive_bytes`, `index_bytes`, `slots`, `watches`, and `feed_bytes`.
 
 ## Errors
 
@@ -163,9 +165,16 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 
 SHOW TABLE STATS needs READ on the table, or MONITOR.
 `chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
+`cache_bytes` estimates the memory of loaded chunk objects and their retained payload, presence, text and bytes values and offsets, chunk columns, WAL batch, and write scratch buffers.
+Shared chunk-column state is counted for each loaded chunk that references it.
+`history_bytes` counts the chunk states kept for open transactions; `open_transactions` counts the open transactions that have used the table; one that a limit ended no longer counts.
 `files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
-`slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included.
-The counts come from memory, except `files` and `disk_bytes`, which list the table's directory: their cost grows with its file count.
+Of `disk_bytes`, `image_bytes` and `wal_bytes` count live chunk images and WALs at their canonical coordinate paths.
+`archive_bytes` counts regular files under `.chunkdb.feed/`, including retained WALs, pinned base images, and base descriptors.
+`index_bytes` counts the coordinate inventory and shard logs.
+`slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included; `feed_bytes` counts the memory of the changes the live feed buffers for them.
+The counts come from memory, except `cache_bytes`, which visits the table's loaded chunks one at a time while the statement uses the table, and the file counts, which list the table's directory once: their cost grows with the number of loaded chunks and of files.
+Cancellation and statement timeouts interrupt a wait for a loaded chunk.
 The listing runs after the statement stops using the table, so no other statement waits for it, and a statement timeout stops it.
 A file written or removed during the listing may or may not be counted; a table dropped before it returns NO_TABLE, and a SWAP TABLES, or a DROP TABLE and CREATE TABLE of the same name, during it may count the other table's files.
 
@@ -235,10 +244,11 @@ position = 3
 retained_deletion_floor = 0
 ```
 
-With SINCE, which then requires WITH DATA, a scan lists every identity changed after the revision: a form of the matching blocks, or null when no block matches or the chunk was deleted.
+With SINCE, which then requires WITH DATA, a scan lists every identity in its area that changed after the revision, or every changed identity when the scan covers the whole table.
+Each row includes a form of the matching blocks, or null when no block matches or the chunk was deleted.
 A consumer that replaces each listed chunk with that form, or drops the chunk on null, holds exactly the matching blocks.
 
-To follow a filtered scan, start WATCH AFTER the first page's `epoch` and `position` as in [Resume a consumer](../FEED_RESUME.md) and apply the same condition to each change's blocks.
+To follow a filtered scan, start WATCH AFTER the first page's `epoch` and `position` as in [Resume a consumer](../FEED_RESUME.md), keep the scan's area when specified, and apply the same condition to each change's blocks.
 This converges when the condition reads only the block's own columns, EXISTS and positions.
 A change to a chunk column carries no blocks, so a condition on `chunk.column` needs the chunk read again with GET CHUNK when that column changes; a condition with NOW() selects at the time of each statement.
 
@@ -259,7 +269,9 @@ As a page's first cell, or in a plain area, it is refused with `OUT_OF_RANGE rea
 `required` is the size of a reply holding only that chunk; read it with GET CHUNK or fewer COLUMNS, then continue AFTER its coordinate.
 A server started with `--max-area-response-bytes` of at least `required` returns that chunk in GET AREA.
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
+A SCAN CHUNKS AFTER may lie outside its AREA; the page starts at the first chunk of the area after it.
 SCAN CHUNKS runs inside a [BEGIN READ ONLY](TRANSACTION_STATEMENTS.md) transaction without SINCE: its pages list the chunks populated at the snapshot and report the snapshot's revision as `position`.
+On a server started with `--read-only`, SCAN CHUNKS can read chunks outside its AREA while building or refreshing the table's coordinate index.
 
 An empty page still provides a continuation when requested cells remain:
 
