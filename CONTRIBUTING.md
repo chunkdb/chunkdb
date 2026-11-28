@@ -6,6 +6,10 @@ For end-user installation and running instructions, use:
 - [README.md](README.md)
 - [docs/WINDOWS_NATIVE.md](docs/WINDOWS_NATIVE.md)
 
+## Changelog
+
+Add your CHANGELOG entry as a file `changelog.d/<branch>.md`, not by editing `CHANGELOG.md`; see [changelog.d/README.md](changelog.d/README.md).
+
 ## Local Test Policy
 
 Before opening a PR:
