@@ -115,8 +115,8 @@ selection:
 - `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WHERE`: keep only blocks for which a [condition](../CQL.md#conditions) is true; see [Filter a scan](#filter-a-scan).
-- With WHERE or BLOCKS, each form holds only the blocks that stay, and a chunk where none stays is left out, unless a SINCE scan lists it with null data so that a consumer drops its copy.
-- `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
+- With WHERE or BLOCKS, each form holds only the matching blocks, and GET and scans without SINCE omit chunks with no matching blocks.
+- `WITH DATA` appends a chunk form or null and is required with scan COLUMNS.
 
 ## Returns
 
@@ -214,8 +214,11 @@ Compaction does not discard a durable slot's independently retained history.
 ## Filter a scan
 
 WHERE keeps the present blocks for which the condition is true; a block where it is false or NULL is left out.
-Without SINCE, a scan lists only chunks with a matching block, and WITH DATA returns a form of those blocks with complete chunk columns.
+Without SINCE, a scan with WHERE or BLOCKS lists only chunks with a matching block, and WITH DATA returns a form of those blocks with complete chunk columns.
 LIMIT counts every chunk the page visits, kept or not, so a page can hold fewer rows than LIMIT, or none.
+A selected scan reads chunk data only inside the selection.
+LIMIT also counts candidates within the selection's x range that fall outside the selection.
+The `after` cursor can therefore lie outside the selection, including on an empty page.
 Continue AFTER the returned `after` coordinate while `more` is true; it is null when `more` is false.
 
 ```cql docs-check session=main
@@ -241,7 +244,8 @@ position = 3
 retained_deletion_floor = 0
 ```
 
-With SINCE, which then requires WITH DATA, a scan lists every identity changed after the revision: a form of the matching blocks, or null when no block matches or the chunk was deleted.
+A scan with WHERE and SINCE requires WITH DATA.
+A scan with SINCE and WITH DATA lists each identity in the scan region changed after the given revision and returns a form of the matching blocks, or null when no block matches or the chunk was deleted.
 A consumer that replaces each listed chunk with that form, or drops the chunk on null, holds exactly the matching blocks.
 
 To follow a filtered scan, start WATCH AFTER the first page's `epoch` and `position` as in [Resume a consumer](../FEED_RESUME.md) and apply the same condition to each change's blocks.

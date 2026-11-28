@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -13,13 +14,14 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "block_selection.hpp"
 #include "chunk_store_internal.hpp"
+#include "statement_control.hpp"
 #include "typed_chunk_form.hpp"
 #include "test_utils.hpp"
 
@@ -53,8 +55,6 @@ struct Fixture {
     }
 };
 
-bool Contains(const std::string& text, std::string_view part) { return text.find(part) != std::string::npos; }
-
 // An integer parameter: eight bytes, little-endian, whatever the column width.
 std::string Le(std::uint64_t value) {
     std::string out;
@@ -62,9 +62,11 @@ std::string Le(std::uint64_t value) {
     return out;
 }
 
-void Error(const std::string& reply, std::string_view part) {
-    if (!reply.starts_with("-ERR ") || !Contains(reply, part)) {
-        std::fprintf(stderr, "expected an error with '%s', got '%s'\n", std::string(part).c_str(), reply.c_str());
+void Error(const std::string& reply, std::string_view code, std::string_view message = {}) {
+    const auto prefix = "-ERR " + std::string(code) + ' ';
+    if (!reply.starts_with(prefix) || reply.find(message, prefix.size()) == std::string::npos) {
+        std::fprintf(stderr, "expected error %s with '%s', got '%s'\n",
+            std::string(code).c_str(), std::string(message).c_str(), reply.c_str());
         assert(false);
     }
 }
@@ -171,7 +173,7 @@ void TestGetBlocks() {
     rows = Rows(f, f.Run("GET AREA 0 0 TO 0 0 FROM t"), "t");
     assert(rows.size() == 1U && rows[0].blocks.size() == 16U);
 
-    Error(f.Run("GET BLOCKS 5 5 TO 0 0 FROM t"), "INVALID_ARGUMENT block range corners are reversed");
+    Error(f.Run("GET BLOCKS 5 5 TO 0 0 FROM t"), "INVALID_ARGUMENT", "block range corners are reversed");
     Error(f.Run("GET BLOCKS 0 0 0 TO 1 1 1 FROM t"), "INVALID_ARGUMENT");
     Error(f.Run("GET BLOCKS 0 0 TO 1 1 FROM t WHERE nope = 1"), "INVALID_ARGUMENT");
 }
@@ -187,58 +189,136 @@ void TestAggregateBlocks() {
     assert(reply == "%1\r\n$8\r\ncount(*)\r\n:0\r\n");
 }
 
-// The chunk rows of a SCAN CHUNKS reply, and its `after`.
-std::pair<std::vector<ChunkCoord>, std::string> Scan(const std::string& reply) {
+struct ScanPage {
+    std::vector<ChunkCoord> coords{};
+    std::vector<std::optional<std::string>> forms{};
+    std::string after{};
+};
+
+// The rows, optional data fields and continuation of a selected 2D scan.
+ScanPage Scan(const std::string& reply) {
     assert(reply.starts_with("%6\r\n$6\r\nchunks\r\n*"));
     std::size_t at = std::string_view("%6\r\n$6\r\nchunks\r\n*").size();
     const std::size_t count = Number(reply, &at);
-    std::vector<ChunkCoord> coords;
+    ScanPage page;
     for (std::size_t i = 0; i < count; ++i) {
         assert(reply[at] == '*');
         ++at;
         const std::size_t items = Number(reply, &at);
+        assert(items == 3U || items == 4U);
         ChunkCoord coord{};
         coord.x = Integer(reply, &at);
         coord.y = Integer(reply, &at);
         (void)Integer(reply, &at);
         if (items == 4U) {
-            assert(reply[at] == '$');
-            ++at;
-            at += Number(reply, &at) + 2U;
+            if (std::string_view(reply).substr(at).starts_with("_\r\n")) {
+                page.forms.push_back(std::nullopt);
+                at += 3U;
+            } else {
+                assert(reply[at] == '$');
+                ++at;
+                const auto length = Number(reply, &at);
+                page.forms.emplace_back(reply.substr(at, length));
+                at += length + 2U;
+            }
         }
-        coords.push_back(coord);
+        page.coords.push_back(coord);
     }
-    const auto after = reply.find("$5\r\nafter\r\n");
-    assert(after != std::string::npos);
-    return {coords, reply.substr(after + 11U, reply.find("$5\r\nepoch") - after - 11U)};
+    constexpr std::string_view more_key = "$4\r\nmore\r\n";
+    assert(std::string_view(reply).substr(at).starts_with(more_key));
+    at += more_key.size();
+    const auto more = std::string_view(reply).substr(at, 4U);
+    assert(more == "#t\r\n" || more == "#f\r\n");
+    at += more.size();
+    constexpr std::string_view after_key = "$5\r\nafter\r\n";
+    assert(std::string_view(reply).substr(at).starts_with(after_key));
+    at += after_key.size();
+    const auto epoch = reply.find("$5\r\nepoch\r\n", at);
+    assert(epoch != std::string::npos);
+    page.after = reply.substr(at, epoch - at);
+    assert((page.after == "_\r\n") == (more == "#f\r\n"));
+    return page;
 }
 
 void TestScanSelections() {
     Fixture f;
     Fill(f);
-    auto [coords, after] = Scan(f.Run("SCAN CHUNKS FROM t AREA 1 0 TO 3 0"));
-    assert((coords == std::vector<ChunkCoord>{{1, 0, 0}, {3, 0, 0}}) && after == "_\r\n");
-    std::tie(coords, after) = Scan(f.Run("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1"));
-    assert((coords == std::vector<ChunkCoord>{{0, 0, 0}, {1, 0, 0}}));
-    // BLOCKS lists only chunks with a block in the box, with data clipped.
-    std::tie(coords, after) = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 6 0 TO 13 0"));
-    assert((coords == std::vector<ChunkCoord>{{1, 0, 0}, {3, 0, 0}}));
-    std::tie(coords, after) = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 8 0 TO 11 3"));
-    assert(coords.empty());
-    const auto with_data = f.Run("SCAN CHUNKS FROM t BLOCKS 6 0 TO 6 0 WITH DATA WHERE n = 6");
-    std::tie(coords, after) = Scan(with_data);
-    assert((coords == std::vector<ChunkCoord>{{1, 0, 0}}));
+    auto page = Scan(f.Run("SCAN CHUNKS FROM t AREA 1 0 TO 3 0"));
+    assert((page.coords == std::vector<ChunkCoord>{{1, 0, 0}, {3, 0, 0}}) && page.after == "_\r\n");
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1"));
+    assert((page.coords == std::vector<ChunkCoord>{{0, 0, 0}, {1, 0, 0}}));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 6 0 TO 13 0"));
+    assert((page.coords == std::vector<ChunkCoord>{{1, 0, 0}, {3, 0, 0}}));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 8 0 TO 11 3"));
+    assert(page.coords.empty());
     // Pages: LIMIT bounds the identities visited; continue AFTER `after`.
-    std::tie(coords, after) = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 LIMIT 1"));
-    assert((coords == std::vector<ChunkCoord>{{-1, -1, 0}}) && after == "*2\r\n:-1\r\n:-1\r\n");
-    std::tie(coords, after) = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 AFTER -1 -1 LIMIT 2"));
-    assert((coords == std::vector<ChunkCoord>{{0, 0, 0}, {1, 0, 0}}) && after == "*2\r\n:1\r\n:0\r\n");
-    std::tie(coords, after) = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 AFTER 1 0 LIMIT 2"));
-    assert((coords == std::vector<ChunkCoord>{{3, 0, 0}}) && after == "_\r\n");
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 LIMIT 1"));
+    assert((page.coords == std::vector<ChunkCoord>{{-1, -1, 0}}) && page.after == "*2\r\n:-1\r\n:-1\r\n");
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 AFTER -1 -1 LIMIT 2"));
+    assert((page.coords == std::vector<ChunkCoord>{{0, 0, 0}, {1, 0, 0}}) && page.after == "*2\r\n:1\r\n:0\r\n");
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 AFTER 1 0 LIMIT 2"));
+    assert((page.coords == std::vector<ChunkCoord>{{3, 0, 0}}) && page.after == "_\r\n");
+    // The first candidate's x is in range, but its y is outside the area.
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 0 TO 3 0 LIMIT 1"));
+    assert(page.coords.empty() && page.after == "*2\r\n:-1\r\n:-1\r\n");
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 0 TO 3 0 AFTER -1 -1 LIMIT 1"));
+    assert((page.coords == std::vector<ChunkCoord>{{0, 0, 0}}) && page.after == "*2\r\n:0\r\n:0\r\n");
     // Without a selection the reply keeps its five keys.
     assert(f.Run("SCAN CHUNKS FROM t LIMIT 1").starts_with("%5\r\n"));
     Error(f.Run("SCAN CHUNKS FROM t AREA 3 0 TO 1 0"), "INVALID_ARGUMENT");
     Error(f.Run("SCAN CHUNKS FROM t BLOCKS 0 0 0 TO 1 1 1"), "INVALID_ARGUMENT");
+}
+
+void TestScanBlockData() {
+    Fixture f;
+    Fill(f);
+    const auto write = f.Run("SET BLOCK 6 0 IN t n = 6, name = 'keep'");
+    std::size_t at = 0U;
+    const auto revision = Integer(write, &at);
+    const std::string selection = "SCAN CHUNKS FROM t BLOCKS 6 0 TO 6 0";
+    auto page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 6 0 TO 7 0 WITH DATA WHERE n = 6"));
+    assert((page.coords == std::vector<ChunkCoord>{{1, 0, 0}}));
+    assert(page.forms.size() == 1U && page.forms.front());
+    const auto& form = *page.forms.front();
+    const auto geometry = f.catalog->Require("t")->geometry();
+    const auto state = DecodeSectionedChunkState(geometry,
+        std::span(reinterpret_cast<const std::uint8_t*>(form.data()), form.size()), kVarMaxChunkBytesLimit);
+    constexpr std::uint32_t block = 2U; // Local coordinates (2, 0).
+    assert(PresentBlockCount(state.presence_bitmap) == 1U && BlockPresent(state.presence_bitmap, block));
+    assert(state.vars.size() == 1U);
+    const auto name = state.vars.Find({geometry.layout().schema().columns[1].id, block});
+    assert(name && std::string_view(reinterpret_cast<const char*>(name->data()), name->size()) == "keep");
+
+    f.Ok("DELETE BLOCK 6 0 FROM t");
+    assert(f.Run("GET BLOCK 7 0 FROM t").starts_with("*"));
+    assert(Scan(f.Run(selection + " WITH DATA")).coords.empty());
+    page = Scan(f.Run(selection + " SINCE " + std::to_string(revision) + " WITH DATA"));
+    assert((page.coords == std::vector<ChunkCoord>{{1, 0, 0}}));
+    assert(page.forms.size() == 1U && !page.forms.front());
+}
+
+std::size_t clip_clock_reads = 0U;
+
+StatementControl::Clock::time_point ClipNow() noexcept {
+    // Start and the first poll succeed. The next poll crosses the deadline.
+    return StatementControl::Clock::time_point(std::chrono::milliseconds(++clip_clock_reads < 3U ? 0 : 1));
+}
+
+void TestClipCancellation() {
+    const Geometry geometry(GeometryConfig{.chunk_width_blocks = 512U, .chunk_height_blocks = 512U});
+    const BlockBox box{.last = {510, 511, 0}};
+    std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+    SetBlockPresent(&presence, geometry.ChunkBlockCount() - 1U, true);
+    clip_clock_reads = 0U;
+    StatementControl control(StatementControl::Clock::time_point{}, 1U, &ClipNow);
+    assert(control.Start());
+    const ScopedStatementControl scope(&control);
+    try {
+        (void)ClipToBox(geometry, box, {}, presence);
+        assert(false);
+    } catch (const StatementStoppedError& error) {
+        assert(error.reason() == StatementStopReason::kTimeout);
+    }
 }
 
 void TestThreeDimensions() {
@@ -262,6 +342,8 @@ int main() {
     TestGetBlocks();
     TestAggregateBlocks();
     TestScanSelections();
+    TestScanBlockData();
+    TestClipCancellation();
     TestThreeDimensions();
     return 0;
 }

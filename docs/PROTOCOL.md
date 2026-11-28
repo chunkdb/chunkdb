@@ -168,7 +168,8 @@ Never-written chunks and identities forgotten by tombstone compaction have null 
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
 Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
-With WHERE or a selection, the map adds `after` after `more`: the coordinates of the last chunk the page visited, or null when `more` is false.
+With WHERE or a selection, the map adds `after` after `more` with the last chunk coordinate counted toward the page limit, or null when `more` is false.
+In a selected scan this cursor can lie outside the selection because the limit also counts candidates within the selection's x range that it excludes.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.

@@ -4,10 +4,13 @@
 #include <stdexcept>
 
 #include "chunk_store_internal.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 
 namespace {
+
+constexpr std::size_t kBlocksPerCheck = 65536U;
 
 // The chunk and local coordinate of block `point` on each axis.
 struct Located {
@@ -59,6 +62,7 @@ std::size_t ClipToBox(const Geometry& geometry, const BlockBox& box, const Chunk
     const std::size_t count = geometry.layout().block_count();
     std::size_t kept = 0;
     for (std::size_t block = 0; block < count && block / 8U < presence.size(); ++block) {
+        if (block != 0U && block % kBlocksPerCheck == 0U) CheckStatementCancellation();
         const auto bit = static_cast<std::uint8_t>(1U << (block % 8U));
         if ((presence[block / 8U] & bit) == 0U) continue;
         const std::array<std::size_t, 3> local{
