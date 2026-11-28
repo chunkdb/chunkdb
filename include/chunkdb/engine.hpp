@@ -62,7 +62,7 @@ enum class ServerRight : std::uint8_t;
 struct CommandEngineTestHook {
     enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
         kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing,
-        kBeforeCatalogRefresh };
+        kBeforeCatalogRefresh, kAfterCatalogMark };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -413,9 +413,8 @@ class CommandEngine {
     std::shared_ptr<CatalogFeed> catalog_feed_;
     // The records of the catalog feed (engine_cql.cpp).
     [[nodiscard]] CatalogState ReadCatalog(const CatalogScope& scope) const;
-    // The first 16 bytes of SHA-256 over the user records the catalog feed
-    // shows, in name order; zero bytes without users (engine_cql.cpp).
-    [[nodiscard]] std::array<std::uint8_t, 16> UsersDigest() const;
+    // Digest of the catalog inputs that can change at startup (engine_cql.cpp).
+    [[nodiscard]] std::array<std::uint8_t, 16> CatalogDigest() const;
 
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);

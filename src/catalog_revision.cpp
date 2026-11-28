@@ -22,7 +22,7 @@ constexpr std::uint16_t kInProgress = 1U;
 constexpr std::size_t kFlagsOffset = 6U;
 constexpr std::size_t kEpochOffset = 8U;
 constexpr std::size_t kRevisionOffset = 24U;
-constexpr std::size_t kUsersOffset = 32U;
+constexpr std::size_t kDigestOffset = 32U;
 constexpr std::size_t kReservedOffset = 48U;
 constexpr std::size_t kCrcOffset = 52U;
 
@@ -36,7 +36,7 @@ std::vector<std::uint8_t> EncodeCatalogRevision(const CatalogRevisionRecord& rec
     WriteLe16(bytes, record.in_progress ? kInProgress : 0U);
     bytes.insert(bytes.end(), record.epoch.begin(), record.epoch.end());
     WriteLe64(bytes, record.revision);
-    bytes.insert(bytes.end(), record.users.begin(), record.users.end());
+    bytes.insert(bytes.end(), record.digest.begin(), record.digest.end());
     WriteLe32(bytes, 0U);
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
@@ -57,7 +57,7 @@ CatalogRevisionRecord DecodeCatalogRevision(const std::vector<std::uint8_t>& byt
     std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(kEpochOffset), record.epoch.size(), record.epoch.begin());
     if (record.epoch == StoreId{}) throw std::runtime_error("catalog epoch is zero");
     record.revision = ReadLe64(bytes, kRevisionOffset);
-    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(kUsersOffset), record.users.size(), record.users.begin());
+    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(kDigestOffset), record.digest.size(), record.digest.begin());
     record.in_progress = (flags & kInProgress) != 0U;
     return record;
 }
@@ -92,8 +92,8 @@ void MarkCatalogRevision(const std::filesystem::path& data_dir) {
         /*enable_generic_failpoints=*/false);
 }
 
-CatalogClock::CatalogClock(std::filesystem::path data_dir, Mode mode, std::function<CatalogUsersDigest()> users)
-    : data_dir_(std::move(data_dir)), mode_(mode), users_(std::move(users)) {
+CatalogClock::CatalogClock(std::filesystem::path data_dir, Mode mode, std::function<CatalogRevisionDigest()> digest)
+    : data_dir_(std::move(data_dir)), mode_(mode), digest_(std::move(digest)) {
     if (mode_ == Mode::kMemory) {
         epoch_ = NewStoreId();
         return;
@@ -112,28 +112,23 @@ CatalogClock::CatalogClock(std::filesystem::path data_dir, Mode mode, std::funct
     }
     if (record && record->revision < std::numeric_limits<std::uint64_t>::max()) {
         epoch_ = record->epoch;
-        // A statement may have changed the catalog after the recorded
-        // revision named it: the catalog as it is now gets a new one.
-        users_digest_ = users_ ? users_() : CatalogUsersDigest{};
-        // Users can change without a statement: a start with or without
-        // authentication, the first administrator, an offline change.
-        const bool changed = record->in_progress || record->users != users_digest_;
+        // An interrupted statement or changed startup inputs invalidate the
+        // recorded revision. Only an actual disk mark can cover a new write.
+        const bool changed = record->in_progress || (mode_ == Mode::kDurable && record->digest != CurrentDigest());
         revision_ = record->revision + (changed ? 1U : 0U);
-        // What the record says; the start writes nothing. The first mark or
-        // read records the revision before it is handed out, a changed
-        // catalog counting as marked.
         recorded_ = record->revision;
-        marked_ = changed;
+        marked_ = record->in_progress;
+        recorded_digest_ = record->digest;
     } else {
         epoch_ = NewStoreId();
         revision_ = 0U;
     }
 }
 
-CatalogUsersDigest CatalogClock::CurrentUsers() const {
+CatalogRevisionDigest CatalogClock::CurrentDigest() const {
     // Read before the clock mutex: a statement that changes users holds the
     // registry lock while its mark takes the clock mutex.
-    return users_ && mode_ == Mode::kDurable ? users_() : CatalogUsersDigest{};
+    return digest_ && mode_ == Mode::kDurable ? digest_() : CatalogRevisionDigest{};
 }
 
 std::uint64_t CatalogClock::revision() const {
@@ -141,10 +136,9 @@ std::uint64_t CatalogClock::revision() const {
     return revision_;
 }
 
-void CatalogClock::Write(std::uint64_t revision, bool in_progress, const CatalogUsersDigest& current) {
-    // A complete record names the user records too. A mark keeps the last
-    // digest, since a start moves past it anyway.
-    const auto users = in_progress ? users_digest_ : current;
+void CatalogClock::Write(std::uint64_t revision, bool in_progress, const CatalogRevisionDigest& current) {
+    // A mark keeps the last digest, since a start moves past it anyway.
+    const auto digest = in_progress ? recorded_digest_ : current;
     // Unknown until the replace completes: a failure, even after the rename,
     // may leave either record, so the next mark and revision are written again.
     marked_ = false;
@@ -152,12 +146,12 @@ void CatalogClock::Write(std::uint64_t revision, bool in_progress, const Catalog
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE"))
         throw std::runtime_error("injected catalog revision write failure");
     AtomicWrite(data_dir_ / std::string(kCatalogRevisionFileName),
-        EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch_, .revision = revision, .in_progress = in_progress, .users = users}),
+        EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch_, .revision = revision, .in_progress = in_progress, .digest = digest}),
         /*fsync_file=*/true, /*fsync_directory=*/true, /*out_replaced=*/nullptr, /*after_rename_failpoint=*/nullptr,
         /*enable_generic_failpoints=*/false);
     marked_ = in_progress;
     recorded_ = revision;
-    users_digest_ = users;
+    recorded_digest_ = digest;
     if (in_progress && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_CATALOG_AFTER_MARK_ONCE")) ExitAbruptly(86);
     if (!in_progress && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_CATALOG_AFTER_REVISION_ONCE")) ExitAbruptly(86);
 }
@@ -165,15 +159,21 @@ void CatalogClock::Write(std::uint64_t revision, bool in_progress, const Catalog
 void CatalogClock::Begin() {
     std::lock_guard lock(mutex_);
     // Shared: the first statement marks the record, and nothing clears it.
-    if (mode_ != Mode::kMemory && !marked_) Write(revision_, true, users_digest_);
+    if (mode_ != Mode::kMemory && !marked_) Write(revision_, true, recorded_digest_);
     ++running_;
 }
 
-std::uint64_t CatalogClock::End() {
-    const auto current = CurrentUsers();
+std::uint64_t CatalogClock::End(bool decided) {
+    const auto current = CurrentDigest();
     std::lock_guard lock(mutex_);
     if (running_ == 0U) throw std::logic_error("catalog clock ended a statement it did not begin");
     --running_;
+    if (!decided) {
+        // Under the feed's refresh mutex, any earlier revision has finished
+        // refreshing. Keep the mark for other statements or unread tables.
+        if (mode_ == Mode::kDurable && running_ == 0U && !holding_ && marked_) Write(revision_, false, current);
+        return revision_;
+    }
     if (revision_ == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("catalog revisions are exhausted");
     ++revision_;
     // Recorded before it is returned; on failure it is never handed out.
@@ -182,17 +182,17 @@ std::uint64_t CatalogClock::End() {
 }
 
 std::uint64_t CatalogClock::Snapshot() {
-    const auto current = CurrentUsers();
+    const auto current = CurrentDigest();
     std::lock_guard lock(mutex_);
     if (running_ == 0U && mode_ != Mode::kDurable) return revision_;
-    if (running_ == 0U && !marked_) {
+    if (running_ == 0U && !marked_ && (!recorded_ || *recorded_ == revision_)) {
         // Recorded before it is handed out: a failed write may have left an
         // earlier revision on disk.
         if (recorded_ != revision_) Write(revision_, holding_, current);
         return revision_;
     }
-    // A statement runs, or the record is marked: the catalog may differ from
-    // what the current revision named, so the read takes a new one.
+    // A statement runs, the disk record is marked, or startup moved past it:
+    // the read takes a new revision.
     if (revision_ == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("catalog revisions are exhausted");
     ++revision_;
     if (mode_ == Mode::kDurable) Write(revision_, running_ != 0U || holding_, current);
@@ -202,11 +202,11 @@ std::uint64_t CatalogClock::Snapshot() {
 void CatalogClock::Hold(bool hold) {
     std::lock_guard lock(mutex_);
     holding_ = hold;
-    if (mode_ == Mode::kDurable && hold && !marked_) Write(revision_, true, users_digest_);
+    if (mode_ == Mode::kDurable && hold && !marked_) Write(revision_, true, recorded_digest_);
 }
 
 void CatalogClock::Settle(std::uint64_t revision) {
-    const auto current = CurrentUsers();
+    const auto current = CurrentDigest();
     std::lock_guard lock(mutex_);
     // The refresh that took `revision` read every table it needed: published
     // under it, the records are whole, so an idle server does not stay marked.

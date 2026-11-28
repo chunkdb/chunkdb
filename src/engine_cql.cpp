@@ -1296,16 +1296,28 @@ CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
     return state;
 }
 
-std::array<std::uint8_t, 16> CommandEngine::UsersDigest() const {
-    std::array<std::uint8_t, 16> digest{};
-    if (!config_.users) return digest;
+std::array<std::uint8_t, 16> CommandEngine::CatalogDigest() const {
     crypto::Sha256 hash;
-    for (const auto& [name, user] : config_.users->Snapshot().users) {
-        std::string record;
-        AppendUserMap(record, name, user);
-        hash.Update(std::string_view(record));
+    // These defaults appear in the records of tables with no explicit limit.
+    const std::array limits{static_cast<std::uint64_t>(catalog_->feed_buffer_bytes()),
+                           static_cast<std::uint64_t>(catalog_->slot_max_bytes())};
+    for (auto limit : limits) {
+        std::array<std::uint8_t, 8> bytes{};
+        for (auto& byte : bytes) {
+            byte = static_cast<std::uint8_t>(limit);
+            limit >>= 8U;
+        }
+        hash.Update(bytes);
+    }
+    if (config_.users) {
+        for (const auto& [name, user] : config_.users->Snapshot().users) {
+            std::string record;
+            AppendUserMap(record, name, user);
+            hash.Update(std::string_view(record));
+        }
     }
     const auto full = hash.Finish();
+    std::array<std::uint8_t, 16> digest{};
     std::copy_n(full.begin(), digest.size(), digest.begin());
     return digest;
 }
@@ -1547,24 +1559,26 @@ std::string CommandEngine::ExecuteStatement(
             std::optional<CatalogScope> scope;
             std::string_view user;
             const std::atomic<CommandEngineTestHook*>& hook;
-            // The statement reached its decision and marked the catalog revision.
             bool marked = false;
+            bool decided = false;
             ~CatalogRefresh() {
                 if (!marked) return;
-                if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
-                feed.Refresh(*scope, user);
+                if (decided) {
+                    if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
+                }
+                feed.Refresh(*scope, user, decided);
             }
         };
-        CatalogRefresh catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_, false};
-        // Marked when it enters its decision, before it changes anything: a
-        // statement refused before that costs no write and takes no revision.
-        // A mark that cannot be recorded fails it there.
+        CatalogRefresh catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_};
+        // Mark before admitting the decision. A stop accepted during admission
+        // releases the mark without taking a statement revision.
         std::optional<ScopedDecisionHook> catalog_mark;
         if (catalog_refresh.scope) catalog_mark.emplace([this, &catalog_refresh] {
             if (catalog_refresh.marked) return;
             catalog_feed_->Begin();
             catalog_refresh.marked = true;
-        });
+            if (auto* test = hook_.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kAfterCatalogMark, {});
+        }, catalog_refresh.decided);
         return std::visit(
             Overloaded{
                 [&](const cql::ShowConnections&) {

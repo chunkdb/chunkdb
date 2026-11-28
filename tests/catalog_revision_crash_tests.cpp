@@ -26,6 +26,7 @@ using namespace chunkdb;
 using namespace chunkdb::migration_test;
 
 constexpr const char* kStatement = "CREATE TABLE crash_t (n u8) CHUNK 4 x 4";
+constexpr const char* kCrashAfterTablePublish = "CHUNKDB_FAILPOINT_CRASH_TABLE_CREATE_AFTER_PUBLISH_ONCE";
 
 int RunChild(const std::string& executable, const std::vector<std::string>& arguments) {
     std::string command = "\"" + executable + "\"";
@@ -55,7 +56,7 @@ struct Point {
 };
 const Point kPoints[] = {
     {"CHUNKDB_FAILPOINT_CRASH_CATALOG_AFTER_MARK_ONCE", false, false},
-    {"CHUNKDB_FAILPOINT_CRASH_TABLE_CREATE_AFTER_PUBLISH_ONCE", true, false},
+    {kCrashAfterTablePublish, true, false},
     {"CHUNKDB_FAILPOINT_CRASH_CATALOG_AFTER_REVISION_ONCE", true, true},
 };
 
@@ -94,6 +95,32 @@ void Case(const std::string& executable, const Point& point) {
         const auto whole = e.session.catalog_watch->Next();
         assert(whole && (whole->bytes->find("$7\r\ncrash_t\r\n") != std::string::npos) == point.table);
     }
+}
+
+// A different user digest at startup leaves the old complete record on disk.
+// The first statement must mark it before a crash can leave a changed catalog.
+void CrashAfterAuthModeChange(const std::string& executable) {
+    test::ScopedTempDir dir("chunkdb-catalog-crash-auth-change");
+    {
+        Engine seed(dir.path());
+        Reply(seed.Run("CREATE TABLE seed (n u8) CHUNK 4 x 4"), "+OK\r\n");
+        assert(seed.Run("WATCH CATALOG").starts_with("%2\r\n"));
+        assert(seed.session.catalog_watch->Next());
+    }
+    const auto before = *ReadCatalogRevision(dir.path());
+    assert(!before.in_progress);
+    assert(RunChild(executable, {"--crash", dir.path().string(), kCrashAfterTablePublish}) == 86);
+    const auto crashed = *ReadCatalogRevision(dir.path());
+    assert(crashed.epoch == before.epoch && crashed.in_progress);
+
+    Engine reopened(dir.path());
+    assert(reopened.catalog->Find("crash_t"));
+    const auto position = StoreIdHex(before.epoch) + " " + std::to_string(before.revision);
+    assert(reopened.Run("WATCH CATALOG AFTER " + position).starts_with("%2\r\n"));
+    const auto first = reopened.session.catalog_watch->Next();
+    assert(first && first->bytes->find("$6\r\nresync\r\n") != std::string::npos);
+    const auto whole = reopened.session.catalog_watch->Next();
+    assert(whole && whole->bytes->find("$7\r\ncrash_t\r\n") != std::string::npos);
 }
 
 // chunkdb_verify reads the record, and reports a damaged one as a warning: the
@@ -198,6 +225,7 @@ void UsersAcrossStarts() {
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--crash") return CrashChild(argv[2], argv[3]);
     for (const auto& point : kPoints) Case(argv[0], point);
+    CrashAfterAuthModeChange(argv[0]);
     VerifyRecord();
     SlotOwnerRevision();
     UsersAcrossStarts();

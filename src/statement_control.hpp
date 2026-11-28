@@ -71,17 +71,19 @@ class StatementControl {
 // Runs `hook` on this thread each time the current statement enters its
 // irreversible decision (EnterStatementDecision), just before the decision
 // is entered; a hook that throws fails the statement before its change, and a
-// stop requested meanwhile still stops it. Every durable change of a
-// statement comes after that point.
+// stop requested meanwhile still stops it. `entered` is set once the
+// decision is accepted, before any durable change of the statement.
 class ScopedDecisionHook {
   public:
-    explicit ScopedDecisionHook(std::function<void()> hook) noexcept;
+    ScopedDecisionHook(std::function<void()> hook, bool& entered) noexcept;
     ~ScopedDecisionHook();
     ScopedDecisionHook(const ScopedDecisionHook&) = delete;
     ScopedDecisionHook& operator=(const ScopedDecisionHook&) = delete;
   private:
+    friend void EnterStatementDecision();
     std::function<void()> hook_;
-    std::function<void()>* previous_;
+    bool& entered_;
+    ScopedDecisionHook* previous_;
 };
 
 class ScopedStatementControl {

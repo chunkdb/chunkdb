@@ -462,6 +462,7 @@ class TableCatalog {
     [[nodiscard]] bool allow_multiple_processes() const noexcept { return config_.allow_multiple_processes; }
     // --feed-buffer-bytes: the default feed budget of tables, and the catalog feed's.
     [[nodiscard]] std::size_t feed_buffer_bytes() const noexcept { return config_.feed_buffer_bytes; }
+    [[nodiscard]] std::size_t slot_max_bytes() const noexcept { return config_.slot_max_bytes; }
     [[nodiscard]] const QueryLimits& query_limits() const noexcept { return config_.query_limits; }
     [[nodiscard]] const TableOptions& default_options() const noexcept {
         return config_.default_options;

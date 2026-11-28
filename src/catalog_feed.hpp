@@ -84,9 +84,9 @@ class CatalogFeed : public std::enable_shared_from_this<CatalogFeed> {
     [[nodiscard]] std::size_t buffer_bytes() const noexcept { return buffer_bytes_; }
     // Runs after a statement of `user` (empty: none) that Begin started, finished
     // or failed: takes its revision and publishes under it the records of
-    // `scope` that differ from the published ones. A failure to record the
-    // revision or read the records ends every subscription with INTERNAL.
-    void Refresh(const CatalogScope& scope, std::string_view user) noexcept;
+    // `scope` that differ from the published ones. Without a decision it only
+    // releases the mark. A write or read failure ends watches with INTERNAL.
+    void Refresh(const CatalogScope& scope, std::string_view user, bool decided = true) noexcept;
     // Starts at the current revision; the first push holds the whole catalog.
     // With `after` of this epoch at a revision the history still holds, or at
     // the current one, it starts there instead; with another `after` the first

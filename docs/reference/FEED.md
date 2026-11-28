@@ -190,10 +190,12 @@ For a slot, ACK of the merged revision acknowledges every merged change; after a
 WATCH CATALOG streams changes to tables, columns, users, grants and slots.
 It needs MONITOR or ADMIN on `*`; users, grants and slot owners appear only with MANAGES USERS.
 The reply is `{epoch, revision}`: the catalog epoch, and the catalog revision the watch starts at; one revision of an epoch names one catalog state.
-The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event.
-Each catalog statement that reaches its decision takes the next revision when it ends, also one that then changed nothing or failed; a statement refused before it takes none.
+Without `AFTER`, the first push holds the whole catalog as one `create` for each visible table, user and slot.
+Each catalog statement that reaches its decision takes the next revision when it ends, including one that then changed nothing or failed.
+A statement refused or cancelled before its decision takes no statement revision.
 An event carries what a statement changed, under its revision; it can also carry changes of statements that ended at the same time.
-A revision whose statement changed nothing the watch can see arrives as `[progress, epoch, revision]`: your catalog is the catalog of that revision.
+When no visible change is pending, `[progress, epoch, revision]` advances the watch to the latest known revision.
+A progress push or a later visible change can advance past several revisions that changed nothing the watch can see.
 An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with `txn` null; `user` names the user whose statement sent the event, and is null in the whole-catalog event and for watches without MANAGES USERS.
 Each entry of `events` is a map of `kind` (`table`, `user` or `slot`), `action` (`create`, `alter` or `drop`), `name`, `table` (the table of a slot, null otherwise) and `data`, the object after the change, null for `drop`.
 A table's `data` is its DESCRIBE map without `revision`, so columns, CHECK constraints and options changes appear as `alter`.
@@ -204,10 +206,13 @@ A table that cannot be read without waiting, such as one ALTER TABLE is reopenin
 The server keeps at most `--feed-buffer-bytes` (default 67108864) of catalog events for all catalog watches together; a table's `feed_buffer_bytes` does not apply.
 A watch further behind receives `[resync, epoch, revision, null, null]` and then the whole catalog again; start your catalog over from it.
 Catalog watches count against `--max-watches`, and a connection that already watches cannot start another watch.
-With the directory feature `catalog_revision`, which new directories have, the epoch and revision survive restarts; without it, or on a server that shares its directory with other processes, each start has a new epoch.
+With the directory feature `catalog_revision`, which new directories have, the epoch and revision survive restarts.
+Without the feature, each start has a new epoch.
+WATCH CATALOG requires a read-write server with exclusive access to its data directory.
 `AFTER epoch revision` continues from your last event or progress: with the current epoch and the current revision, or a revision the server still holds, it sends only later events.
 With another epoch or revision it sends `resync` and then the whole catalog; after a restart only the current revision continues.
 A start after a crash during a catalog statement moves to the next revision, and a restored backup starts a new epoch.
+A change across restarts to the user records or to `--feed-buffer-bytes` or `--slot-max-bytes` makes a watch at the old position rebuild its catalog.
 AFTER resumes the view the watch had: after MANAGES USERS of its user changed, watch without AFTER, since the server cannot tell.
 A filesystem rollback or a cold copy of the data directory keeps the epoch: a consumer that was away from such a directory must watch without AFTER.
 `CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.

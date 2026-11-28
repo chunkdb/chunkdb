@@ -115,7 +115,7 @@ std::vector<std::function<void()>> CatalogFeed::NotifiesLocked() const {
     return notifies;
 }
 
-void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noexcept {
+void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user, bool decided) noexcept {
     std::vector<std::function<void()>> notifies;
     {
         std::lock_guard refresh(refresh_mutex_);
@@ -123,7 +123,8 @@ void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noex
           // Returns leave only this step; the wakes below always run.
           const auto publish = [&] {
             // Under refresh_mutex_: revisions are published in the order they are taken.
-            const std::uint64_t revision = clock_->End();
+            const std::uint64_t revision = clock_->End(decided);
+            if (!decided) return;
             {
                 std::lock_guard lock(mutex_);
                 if (!built_) return;

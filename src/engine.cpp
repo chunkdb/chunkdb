@@ -246,7 +246,7 @@ CommandEngine::CommandEngine(
         : catalog_->allow_multiple_processes() ? CatalogClock::Mode::kShared : CatalogClock::Mode::kDurable;
     catalog_feed_ = std::make_shared<CatalogFeed>(
         [this](const CatalogScope& scope) { return ReadCatalog(scope); }, catalog_->feed_buffer_bytes(),
-        std::make_unique<CatalogClock>(catalog_->data_dir(), mode, [this] { return UsersDigest(); }));
+        std::make_unique<CatalogClock>(catalog_->data_dir(), mode, [this] { return CatalogDigest(); }));
 }
 
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.

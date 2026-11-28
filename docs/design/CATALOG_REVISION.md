@@ -18,11 +18,14 @@ The directory feature `catalog_revision` (incompat bit 7) owns the file, so a bu
 ## Clock
 
 A catalog statement is one CatalogScopeOf names: table, column, check, slot, user and grant statements, MIGRATE, RESTORE TABLE, SWAP TABLES, RECOVER TABLE and WATCH SLOT; a WATCH SLOT reaches a decision only when it records the slot's first owner or takes the slot over, so a plain attach does not touch the clock.
-Begin, just before the statement enters its decision (EnterStatementDecision, the point after which CANCEL no longer stops it, which every durable change of a statement comes after): when no statement is marked, the record is written in progress. If that write fails, the statement fails before its change. A statement refused before its decision writes nothing and takes no revision.
-End, after the statement finished or failed: the revision moves up by one and is written, still in progress while another statement runs, complete otherwise. Only then are its changes published under it.
+Begin writes the in-progress record when no durable mark covers the statement, before admitting its decision and before any catalog change.
+If that write fails, the statement fails before its change.
+End takes a revision for a statement that entered its decision and records it before publishing changes at that revision.
+A stop accepted before the decision takes no statement revision, and on an exclusive writer End can clear its provisional mark at the current revision once other statements and unread tables no longer need it.
 End runs under the feed's refresh mutex, so revisions are published in the order they are taken.
-A whole-catalog read takes its revision after the read: the current one when no statement runs, since a statement ends only under the same mutex, and a new one, written in progress, when one does. Two reads at one revision cannot see different states.
-Every statement that reached its decision takes a revision, also one that then changed nothing or failed; watches then receive `[progress, epoch, revision]`, so their position reaches the current revision.
+A whole-catalog read takes its revision after the read and uses the current revision when the clock is settled and no statement ran during the read.
+When a statement overlaps the read, the read takes a new revision and keeps the record marked.
+Watches advance across revisions with no visible changes through progress or a later visible change.
 
 Every revision is recorded before it is handed out. A failed write leaves the record unknown: the next Begin writes the mark again, and the next read or End writes its revision first.
 While a read could not read some tables, the record stays marked in progress, so a start does not let a consumer resume at a revision that misses them; a whole-catalog read with the record marked takes a new revision, and a refresh that reads every table again clears the mark at its own revision.
@@ -30,10 +33,11 @@ While a read could not read some tables, the record stays marked in progress, so
 
 ## Start
 
-A complete record: the clock continues at its revision. Nothing changed after it: every change is preceded by a mark.
-An in-progress record: the clock continues at its revision plus one, which no state was published under.
-Users can change at a start without a statement: a server started with authentication after one without it, or the reverse, the first administrator created, or an offline change. The record keeps a digest of the user records at its revision, and a start whose users differ counts as in progress. A mark keeps the last digest, since a start moves past it anyway; complete writes read the users before taking the clock's lock, because a statement that changes users holds the registry lock while it marks.
-The start writes nothing; the first mark or whole-catalog read records the revision before it is handed out.
+A complete record with the same startup digest keeps its revision.
+An in-progress record or a changed digest moves the clock past the stored revision.
+The digest covers the user records and the server defaults for feed and slot byte limits, which can change across starts without a catalog statement.
+A mark keeps the last recorded digest, and complete writes read the users before taking the clock lock because a user statement can hold the registry lock while it marks.
+Startup leaves the record alone, so the first catalog statement must persist a mark if the record on disk is complete, even when the clock has advanced past it.
 No record, or one that cannot be read: a new random epoch at revision 0. Consumers of the old epoch read the whole catalog again.
 
 ## Consumers
@@ -44,9 +48,10 @@ After a restart the history is empty: only a consumer at the current revision co
 
 ## Modes
 
-Without `catalog_revision` (an existing directory before ENABLE FEATURE) or on a read-only server, the clock is in memory with a random epoch per process, as in #286.
-ENABLE FEATURE 'catalog_revision' takes effect at the next start, which creates the record with a new epoch.
-With several processes on the directory the record stays in progress and the clock does not write it; WATCH CATALOG is refused there, and the next single-process start moves to a new revision.
+Without `catalog_revision` the clock is in memory with a random epoch per process, as in #286.
+WATCH CATALOG is refused on read-only and shared servers.
+ENABLE FEATURE 'catalog_revision' takes effect at the next start, and the first mark or whole-catalog read then records the new epoch.
+With `catalog_revision` enabled, a shared writer marks the record before its first catalog decision if it found the record unmarked and leaves it marked for the next exclusive writer.
 
 A filesystem rollback or a cold copy of the directory keeps the epoch: consumers that were away must watch without AFTER.
 
@@ -69,6 +74,6 @@ Catalog statements write the record once or twice (two syncs); plain reads and w
 
 ## Tests
 
-`catalog_feed`: the clock across stops with and without a running statement, shared mode, damaged and missing records, AFTER against history and epochs, resume after a restart.
-`catalog_revision_crash`: crashes after the mark, after the table is created and after the revision is written; a consumer rebuilds or continues as the record says.
+`catalog_feed` covers stops around decisions, shared mode, damaged and missing records, AFTER against history and epochs, progress, and restarts with changed defaults.
+`catalog_revision_crash` covers crashes before and after the revision is written, including the first catalog statement after an authentication mode change.
 `feed_watch`: a consumer resumes over the server after a restart.

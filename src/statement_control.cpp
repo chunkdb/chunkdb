@@ -8,7 +8,7 @@
 namespace chunkdb {
 namespace {
 thread_local StatementControl* current_statement = nullptr;
-thread_local std::function<void()>* decision_hook = nullptr;
+thread_local ScopedDecisionHook* decision_hook = nullptr;
 
 const char* StopMessage(StatementStopReason reason) {
     switch (reason) {
@@ -186,11 +186,13 @@ void CheckStatementCancellation() { if (current_statement) current_statement->Ch
 void EnterStatementDecision() {
     // First, while a stop can still be accepted: a statement whose hook fails
     // is stopped or fails before the decision, never refused as too late.
-    if (decision_hook != nullptr && *decision_hook) (*decision_hook)();
+    auto* const hook = decision_hook;
+    if (hook != nullptr && hook->hook_) hook->hook_();
     if (current_statement) current_statement->EnterDecision();
+    if (hook != nullptr) hook->entered_ = true;
 }
-ScopedDecisionHook::ScopedDecisionHook(std::function<void()> hook) noexcept
-    : hook_(std::move(hook)), previous_(decision_hook) { decision_hook = &hook_; }
+ScopedDecisionHook::ScopedDecisionHook(std::function<void()> hook, bool& entered) noexcept
+    : hook_(std::move(hook)), entered_(entered), previous_(std::exchange(decision_hook, this)) {}
 ScopedDecisionHook::~ScopedDecisionHook() { decision_hook = previous_; }
 void ReportStatementProgress(const StatementProgress& progress) {
     if (current_statement) current_statement->ReportProgress(progress);

@@ -128,14 +128,17 @@ Read-only opening never initializes the directory.
 | 1 | `CKCR` (4 bytes), format `1` (`u16`), flags (`u16`): bit 0 in progress, other bits zero |
 | 2 | nonzero catalog epoch (16 bytes) |
 | 3 | revision (`u64`) |
-| 4 | users digest (16 bytes): the first 16 bytes of SHA-256 over the user records WATCH CATALOG shows, in name order; zero without users |
+| 4 | startup digest (16 bytes): the first 16 bytes of SHA-256 over `--feed-buffer-bytes` and `--slot-max-bytes` defaults in that order (each a little-endian `u64`), followed by the wire-encoded user record maps WATCH CATALOG shows, in name order |
 | 5 | reserved zero (`u32`) |
 | 6 | CRC32 of all preceding bytes (`u32`) |
 
-With `catalog_revision` enabled, a server that is the directory's only writer replaces it atomically with file and directory sync; with several processes, the first catalog statement of each process marks it in progress and nothing clears the mark.
-A catalog statement marks it in progress at its decision, before it changes anything, and records its revision before the revision is published; a start writes nothing.
-A start whose users differ from the digest (authentication turned on or off, the first administrator created, an offline change) counts as in progress.
-A start after an in-progress record takes the next revision, and its first whole-catalog read a new one again; a missing or unreadable record starts a new epoch at revision 0, written by the first mark or read.
+With `catalog_revision` enabled, a server replaces the record atomically with file and directory sync.
+A shared writer marks the record before its first catalog decision if it found the record unmarked, and leaves the mark for the next exclusive writer.
+A catalog statement marks the record before entering its decision and records its revision before publishing it.
+An exclusive writer that cancels a marked statement before its decision clears the mark at the current revision once no other statements are running and no unread tables need the mark.
+A start writes no record and advances past the stored revision if the record is marked or the startup digest differs.
+A whole-catalog read advances again while the record is marked or still behind the startup revision.
+A missing or unreadable record starts a new epoch at revision 0, written by the first mark or read.
 Backups do not copy it, so a restored directory starts a new epoch.
 
 ### Table manifest
