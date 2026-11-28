@@ -9,8 +9,10 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "chunkdb/chunk_layout.hpp"
@@ -18,6 +20,7 @@
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/types.hpp"
 #include "crypto.hpp"
+#include "shared_file_input.hpp"
 
 namespace chunkdb {
 
@@ -132,7 +135,7 @@ class SecondaryIndex {
     // manifest or run, or an index still building, is rebuilt from `source`
     // and flushed, or in memory when read-only.
     OpenReport Open(const IndexChunkSource& source);
-    // Recomputes every chunk of `source` and replaces the runs with one.
+    // Recomputes every chunk of `source` and replaces the persisted layers.
     void Rebuild(const IndexChunkSource& source);
 
     // The delta covers `coord` at `revision` with `entries`, ordered.
@@ -164,7 +167,7 @@ class SecondaryIndex {
     [[nodiscard]] std::vector<std::string> Verify(const IndexChunkSource& source) const;
 
     [[nodiscard]] IndexState state() const noexcept { return manifest_.state; }
-    // A manifest publication failed after it may have replaced the manifest.
+    // The index must be reopened before its layers can be used again.
     [[nodiscard]] bool failed() const noexcept { return failed_; }
     [[nodiscard]] std::size_t runs() const noexcept { return manifest_.runs.size(); }
     [[nodiscard]] std::size_t delta_chunks() const noexcept { return delta_.size(); }
@@ -185,12 +188,14 @@ class SecondaryIndex {
     };
     static constexpr std::size_t kDelta = static_cast<std::size_t>(-1);
 
-    void LoadOrThrow();
+    OpenReport OpenLayers(const IndexChunkSource& source, bool rebuild);
+    void LoadOrThrow(bool load_runs);
+    void RebuildFromSource(const IndexChunkSource& source);
     void RebuildInMemory(const IndexChunkSource& source);
     void RequireWriter() const;
     void RequireUsable() const;
-    [[nodiscard]] std::uint64_t NextGeneration() noexcept;
-    void RemoveUnlisted() const;
+    [[nodiscard]] std::uint64_t NextGeneration();
+    void RemoveUnlisted();
     void Clear() noexcept;
     void PublishManifest(IndexManifest next);
     [[nodiscard]] IndexRunRef WriteRun(std::uint64_t generation, const std::vector<IndexRunChunk>& chunks,
@@ -204,13 +209,15 @@ class SecondaryIndex {
     std::size_t column_index_;
     IndexIdentity identity_;
     bool read_only_;
-    // Set from a manifest replacement until memory follows it; every change
-    // then throws until Open runs again.
+    // Set until the in-memory layers follow a manifest replacement, or when
+    // opening or rebuilding the layers fails.
     bool failed_ = false;
     // The highest generation this index may have put on disk.
     std::uint64_t issued_ = 0U;
     IndexManifest manifest_{};
     std::vector<std::uint64_t> run_entries_;
+    // A read-only open pins the files it validated, in manifest order.
+    std::vector<std::unique_ptr<SharedFileInput>> run_inputs_{};
     std::map<ChunkCoord, DeltaChunk> delta_;
     std::map<ChunkCoord, Cover> covers_;
 };

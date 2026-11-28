@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <set>
 #include <stdexcept>
@@ -16,7 +18,6 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/chunk_layout.hpp"
 #include "durability_io.hpp"
-#include "shared_file_input.hpp"
 
 namespace chunkdb {
 namespace {
@@ -34,6 +35,12 @@ constexpr std::string_view kManifestName = "manifest";
 constexpr std::string_view kRunPrefix = "run-";
 
 void Crash(const char* point) { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
+
+struct FenceOnFailure {
+    bool& failed;
+    bool complete = false;
+    ~FenceOnFailure() { if (!complete) failed = true; }
+};
 
 void PutU8(std::vector<std::uint8_t>& out, std::uint8_t value) { out.push_back(value); }
 void PutU16(std::vector<std::uint8_t>& out, std::uint16_t value) {
@@ -133,14 +140,31 @@ IndexEntry ReadEntry(Reader& reader, std::uint8_t dims) {
     return entry;
 }
 
+// Digest the same open file that supplies the header and entries.
+crypto::Sha256Digest FileDigest(std::istream& input, std::uint64_t* bytes) {
+    input.clear();
+    input.seekg(0, std::ios::beg);
+    if (!input) throw std::runtime_error("index run cannot be read for its digest");
+    crypto::Sha256 digest;
+    std::array<char, 64U * 1024U> buffer{};
+    *bytes = 0U;
+    while (input.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || input.gcount() > 0) {
+        const auto count = static_cast<std::size_t>(input.gcount());
+        digest.Update(std::span(reinterpret_cast<const std::uint8_t*>(buffer.data()), count));
+        *bytes += count;
+    }
+    if (input.bad() || !input.eof()) throw std::runtime_error("index run cannot be read for its digest");
+    return digest.Finish();
+}
+
 // The header, chunk table and footer of one run, checked against what the
 // manifest says of it; entries are read block by block.
 class RunReader {
   public:
     RunReader(const std::filesystem::path& path, const IndexIdentity& identity, std::uint64_t generation,
-        std::uint64_t expected_bytes)
-        : input_(path), dims_(identity.dims) {
-        if (!input_) throw std::runtime_error("index run is missing: " + path.filename().string());
+        std::uint64_t expected_bytes, SharedFileInput* pinned = nullptr)
+        : input_(pinned == nullptr ? owned_input_.emplace(path) : *pinned), dims_(identity.dims) {
+        if (!input_.is_open()) throw std::runtime_error("index run is missing: " + path.filename().string());
         const auto size = FileBytes(input_);
         if (size != expected_bytes) throw std::runtime_error("index run has another size than its manifest lists");
         if (size < kRunHeaderBytes + kRunFooterBytes) throw std::runtime_error("index run is truncated");
@@ -201,6 +225,10 @@ class RunReader {
 
     [[nodiscard]] const std::vector<IndexRunChunk>& chunks() const noexcept { return chunks_; }
     [[nodiscard]] std::uint64_t entry_count() const noexcept { return entry_count_; }
+    [[nodiscard]] bool MatchesDigest(const IndexRunRef& ref) {
+        std::uint64_t bytes = 0U;
+        return FileDigest(input_, &bytes) == ref.sha256 && bytes == ref.bytes;
+    }
 
     // The next entry, or false after the last; checks each block's checksum
     // and the entry count.
@@ -273,7 +301,8 @@ class RunReader {
   private:
     [[nodiscard]] std::uint64_t input_size() { return FileBytes(input_); }
 
-    SharedFileInput input_;
+    std::optional<SharedFileInput> owned_input_{};
+    SharedFileInput& input_;
     std::uint8_t dims_;
     std::uint64_t chunk_count_ = 0U;
     std::uint64_t chunks_at_ = 0U;
@@ -298,21 +327,6 @@ std::vector<std::uint8_t> LoadWhole(const std::filesystem::path& path) {
     const auto size = FileBytes(input);
     if (size > kMaxManifestBytes) throw std::runtime_error("index manifest is larger than any manifest");
     return ReadRange(input, 0U, size, "index manifest");
-}
-
-// The SHA-256 and size of a whole file.
-crypto::Sha256Digest FileDigest(const std::filesystem::path& path, std::uint64_t* bytes) {
-    SharedFileInput input(path);
-    if (!input) throw std::runtime_error("cannot be opened");
-    crypto::Sha256 digest;
-    std::array<char, 64U * 1024U> buffer{};
-    *bytes = 0U;
-    while (input.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || input.gcount() > 0) {
-        const auto count = static_cast<std::size_t>(input.gcount());
-        digest.Update(std::span(reinterpret_cast<const std::uint8_t*>(buffer.data()), count));
-        *bytes += count;
-    }
-    return digest.Finish();
 }
 
 bool RunGeneration(const std::filesystem::path& path, std::uint64_t* generation) {
@@ -533,7 +547,7 @@ std::filesystem::path SecondaryIndex::RunPath(const std::filesystem::path& direc
 }
 
 void SecondaryIndex::RequireUsable() const {
-    if (failed_) throw std::runtime_error("the index failed while publishing a manifest and must be reopened");
+    if (failed_) throw std::runtime_error("the index must be reopened before its layers can be used");
 }
 
 void SecondaryIndex::RequireWriter() const {
@@ -541,25 +555,28 @@ void SecondaryIndex::RequireWriter() const {
     RequireUsable();
 }
 
-std::uint64_t SecondaryIndex::NextGeneration() noexcept {
-    // Never below anything this process may have published, even when a
-    // publication failed after it replaced the manifest.
-    issued_ = std::max(issued_, manifest_.generation) + 1U;
-    return issued_;
+std::uint64_t SecondaryIndex::NextGeneration() {
+    issued_ = std::max(issued_, manifest_.generation);
+    if (issued_ == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("index generations exhausted");
+    return ++issued_;
 }
 
 void SecondaryIndex::Clear() noexcept {
     delta_.clear();
     covers_.clear();
     run_entries_.clear();
+    run_inputs_.clear();
 }
 
-void SecondaryIndex::LoadOrThrow() {
+void SecondaryIndex::LoadOrThrow(bool load_runs) {
     Clear();
     const auto path = ManifestPath(directory_);
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) throw std::runtime_error("the index has no manifest");
     auto manifest = ParseIndexManifest(LoadWhole(path));
+    issued_ = std::max(issued_, manifest.generation);
+    if (!load_runs) return;
     const auto& identity = manifest.identity;
     if (identity.epoch != identity_.epoch || identity.dims != identity_.dims || identity.index_id != identity_.index_id ||
         identity.column_id != identity_.column_id || identity.prefix != identity_.prefix)
@@ -567,11 +584,12 @@ void SecondaryIndex::LoadOrThrow() {
     for (std::size_t layer = 0U; layer < manifest.runs.size(); ++layer) {
         const auto& run = manifest.runs[layer];
         const auto path = RunPath(directory_, run.generation);
-        RunReader reader(path, identity_, run.generation, run.bytes);
+        auto pinned = read_only_ ? std::make_unique<SharedFileInput>(path) : nullptr;
+        RunReader reader(path, identity_, run.generation, run.bytes, pinned.get());
         // A flipped byte anywhere in a run is found here, not by a later read.
-        std::uint64_t bytes = 0U;
-        if (FileDigest(path, &bytes) != run.sha256 || bytes != run.bytes)
+        if (!reader.MatchesDigest(run))
             throw std::runtime_error("index run does not match the digest its manifest lists");
+        if (read_only_) run_inputs_.push_back(std::move(pinned));
         // Runs are newest first, so the first layer to cover a chunk wins.
         for (const auto& chunk : reader.chunks()) covers_.try_emplace(chunk.coord, Cover{layer, chunk.revision});
         run_entries_.push_back(reader.entry_count());
@@ -580,40 +598,62 @@ void SecondaryIndex::LoadOrThrow() {
     manifest_ = std::move(manifest);
 }
 
-void SecondaryIndex::RemoveUnlisted() const {
+void SecondaryIndex::RemoveUnlisted() {
     std::set<std::uint64_t> listed;
     for (const auto& run : manifest_.runs) listed.insert(run.generation);
-    std::error_code ec;
+    auto generation_floor = manifest_.generation;
+    bool has_unlisted_run = false;
     std::vector<std::filesystem::path> unlisted;
-    for (const auto& item : std::filesystem::directory_iterator(directory_, ec)) {
+    for (const auto& item : std::filesystem::directory_iterator(directory_)) {
         const auto name = item.path().filename().string();
         std::uint64_t generation = 0U;
         if (name == kManifestName) continue;
-        if (RunGeneration(item.path(), &generation) && listed.contains(generation)) continue;
+        if (RunGeneration(item.path(), &generation)) {
+            if (listed.contains(generation)) continue;
+            generation_floor = std::max(generation_floor, generation);
+            has_unlisted_run = true;
+        }
         unlisted.push_back(item.path());
     }
+    // An interrupted publication can leave a run newer than the manifest.
+    // Record its generation durably before deleting the last record of it.
+    if (generation_floor > manifest_.generation) {
+        auto next = manifest_;
+        next.generation = generation_floor;
+        PublishManifest(std::move(next));
+        failed_ = false;
+    } else if (has_unlisted_run) {
+        // A prior replacement could be visible after a failed directory sync.
+        SyncDirectoryPath(directory_);
+    }
+    std::error_code ec;
     for (const auto& path : unlisted) std::filesystem::remove(path, ec);
 }
 
 SecondaryIndex::OpenReport SecondaryIndex::Open(const IndexChunkSource& source) {
+    return OpenLayers(source, false);
+}
+
+SecondaryIndex::OpenReport SecondaryIndex::OpenLayers(const IndexChunkSource& source, bool rebuild) {
     OpenReport report;
+    FenceOnFailure fence{.failed = failed_};
     failed_ = false;
-    issued_ = 0U;
     // A manifest or run this index cannot trust is replaced from chunk state,
     // which is the only source of truth; the reason is returned.
     try {
-        LoadOrThrow();
-        if (manifest_.state == IndexState::kBuilding) report.rebuilt = "the index was still building";
+        LoadOrThrow(!rebuild);
+        if (!rebuild && manifest_.state == IndexState::kBuilding) report.rebuilt = "the index was still building";
     } catch (const std::runtime_error& error) {
         report.rebuilt = error.what();
     }
-    if (!report.rebuilt.empty()) {
+    if (rebuild || !report.rebuilt.empty()) {
         if (read_only_) RebuildInMemory(source);
-        else Rebuild(source);
-        return report;
+        else RebuildFromSource(source);
+    } else {
+        if (!read_only_) RemoveUnlisted();
+        RefreshCovers(source, &report);
     }
-    if (!read_only_) RemoveUnlisted();
-    RefreshCovers(source, &report);
+    fence.complete = true;
     return report;
 }
 
@@ -660,10 +700,13 @@ void SecondaryIndex::RebuildInMemory(const IndexChunkSource& source) {
 
 void SecondaryIndex::Rebuild(const IndexChunkSource& source) {
     RequireWriter();
+    (void)OpenLayers(source, true);
+}
+
+void SecondaryIndex::RebuildFromSource(const IndexChunkSource& source) {
     std::uint64_t generation = manifest_.generation;
-    std::error_code ec;
-    std::filesystem::create_directories(directory_);
-    for (const auto& item : std::filesystem::directory_iterator(directory_, ec)) {
+    EnsureDirectoryPathExists(directory_, true);
+    for (const auto& item : std::filesystem::directory_iterator(directory_)) {
         std::uint64_t found = 0U;
         if (RunGeneration(item.path(), &found)) generation = std::max(generation, found);
     }
@@ -695,6 +738,7 @@ void SecondaryIndex::Forget(const ChunkCoord& coord) {
 }
 
 bool SecondaryIndex::Covered(const ChunkCoord& coord, std::uint64_t* revision) const {
+    RequireUsable();
     const auto at = covers_.find(coord);
     if (at == covers_.end()) return false;
     *revision = at->second.revision;
@@ -712,7 +756,6 @@ std::uint64_t SecondaryIndex::DeltaEntries() const noexcept {
 
 IndexRunRef SecondaryIndex::WriteRun(std::uint64_t generation, const std::vector<IndexRunChunk>& chunks,
     const std::function<void(const std::function<void(const IndexEntry&)>&)>& entries) const {
-    std::filesystem::create_directories(directory_);
     const auto dims = identity_.dims;
     IndexRunRef ref{.generation = generation};
     crypto::Sha256 digest;
@@ -806,7 +849,7 @@ IndexRunRef SecondaryIndex::WriteRun(std::uint64_t generation, const std::vector
 void SecondaryIndex::PublishManifest(IndexManifest next) {
     RequireWriter();
     next.identity = identity_;
-    std::filesystem::create_directories(directory_);
+    EnsureDirectoryPathExists(directory_, true);
     // A synced temporary manifest replaces the old one atomically; a crash
     // before the rename leaves the old one and a file open removes.
     const auto path = ManifestPath(directory_);
@@ -823,7 +866,6 @@ void SecondaryIndex::PublishManifest(IndexManifest next) {
         throw std::runtime_error("injected failure after replacing the index manifest");
     SyncDirectoryPath(directory_);
     manifest_ = std::move(next);
-    failed_ = false;
 }
 
 void SecondaryIndex::SetState(IndexState state) {
@@ -832,6 +874,7 @@ void SecondaryIndex::SetState(IndexState state) {
     next.state = state;
     next.generation = NextGeneration();
     PublishManifest(std::move(next));
+    failed_ = false;
 }
 
 namespace {
@@ -870,6 +913,7 @@ void SecondaryIndex::Flush(std::uint64_t oldest_snapshot) {
     auto next = manifest_;
     next.generation = generation;
     next.runs.insert(next.runs.begin(), ref);
+    run_entries_.reserve(run_entries_.size() + 1U);
     PublishManifest(std::move(next));
     run_entries_.insert(run_entries_.begin(), ordered.size());
     for (auto& [coord, cover] : covers_) {
@@ -877,6 +921,7 @@ void SecondaryIndex::Flush(std::uint64_t oldest_snapshot) {
         cover.layer = cover.layer == kDelta ? 0U : cover.layer + 1U;
     }
     delta_.clear();
+    failed_ = false;
     const bool large = run_entries_.size() > 1U && run_entries_.front() * 4U >= run_entries_.back();
     if (large) Merge(oldest_snapshot);
 }
@@ -909,19 +954,23 @@ void SecondaryIndex::Merge(std::uint64_t oldest_snapshot) {
     auto next = manifest_;
     next.generation = generation;
     next.runs = {ref};
+    run_entries_.reserve(1U);
     PublishManifest(std::move(next));
     Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_MERGE_AFTER_MANIFEST_ONCE");
-    std::error_code ec;
-    for (const auto& run : previous) std::filesystem::remove(RunPath(directory_, run.generation), ec);
     delta_.clear();
     for (auto at = covers_.begin(); at != covers_.end();) {
         if (at->second.revision == 0U) at = covers_.erase(at);
         else (at++)->second.layer = 0U;
     }
-    run_entries_ = {total};
+    run_entries_.clear();
+    run_entries_.push_back(total);
+    failed_ = false;
+    std::error_code ec;
+    for (const auto& run : previous) std::filesystem::remove(RunPath(directory_, run.generation), ec);
 }
 
 void SecondaryIndex::ForEach(const std::function<bool(const IndexEntry&)>& visit) const {
+    RequireUsable();
     // One stream per layer: the delta's entries in order, then each run's.
     struct Stream {
         std::size_t layer = 0U;
@@ -944,7 +993,9 @@ void SecondaryIndex::ForEach(const std::function<bool(const IndexEntry&)>& visit
     for (std::size_t layer = 0U; layer < manifest_.runs.size(); ++layer) {
         const auto& run = manifest_.runs[layer];
         Stream stream{.layer = layer};
-        stream.run = std::make_unique<RunReader>(RunPath(directory_, run.generation), identity_, run.generation, run.bytes);
+        auto* pinned = read_only_ ? run_inputs_[layer].get() : nullptr;
+        stream.run = std::make_unique<RunReader>(RunPath(directory_, run.generation), identity_, run.generation, run.bytes,
+            pinned);
         streams.push_back(std::move(stream));
     }
     // Advances a stream to its next entry from the layer that covers it.
@@ -973,21 +1024,32 @@ void SecondaryIndex::ForEach(const std::function<bool(const IndexEntry&)>& visit
 }
 
 std::vector<std::string> SecondaryIndex::Verify(const IndexChunkSource& source) const {
+    RequireUsable();
     std::vector<std::string> problems;
-    for (const auto& run : manifest_.runs) {
+    for (std::size_t layer = 0U; layer < manifest_.runs.size(); ++layer) {
+        const auto& run = manifest_.runs[layer];
         const auto path = RunPath(directory_, run.generation);
         const auto name = path.filename().string();
         try {
-            std::uint64_t bytes = 0U;
-            if (FileDigest(path, &bytes) != run.sha256 || bytes != run.bytes)
+            auto* pinned = read_only_ ? run_inputs_[layer].get() : nullptr;
+            RunReader reader(path, identity_, run.generation, run.bytes, pinned);
+            if (!reader.MatchesDigest(run))
                 throw std::runtime_error("does not match the digest its manifest lists");
-            RunReader reader(path, identity_, run.generation, run.bytes);
             reader.CheckBlockIndex();
             std::map<ChunkCoord, std::uint32_t> counts;
+            std::set<std::uint64_t> removal_revisions;
             IndexEntry previous;
             bool first = true;
             for (IndexEntry entry; reader.Next(&entry);) {
-                if (!first && !IndexEntryLess(previous, entry)) throw std::runtime_error("holds entries out of order");
+                if (!first && !IndexEntryLess(previous, entry)) {
+                    if (IndexEntryLess(entry, previous)) throw std::runtime_error("holds entries out of order");
+                    // A value may have been removed and reinserted at this block.
+                    if (removal_revisions.empty()) removal_revisions.insert(previous.removed);
+                    if (!removal_revisions.insert(entry.removed).second)
+                        throw std::runtime_error("holds duplicate entries");
+                } else {
+                    removal_revisions.clear();
+                }
                 ++counts[entry.coord];
                 previous = entry;
                 first = false;

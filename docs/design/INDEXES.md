@@ -1,7 +1,8 @@
 # Secondary indexes
 
 A secondary index finds blocks by the value of one block column without reading every chunk.
-This note fixes its statements, key encoding, structure, write maintenance, durability, recovery, failures and limits before any code.
+The internal component implements key encoding, files, layers, recovery and verification against a caller-supplied chunk source.
+The statements, table integration and query behavior below describe the planned interface.
 Chunk state stays the only source of truth: an index is derived data, every index candidate is checked against the chunk, and a lost or damaged index is rebuilt from chunk state.
 
 ## Statements
@@ -62,7 +63,8 @@ The delta is bounded by `index_delta_bytes`, 64 MiB per table by default; above 
 
 A flush writes the delta as a run file with a temporary name in the index directory, syncs it, renames it and syncs the directory, then publishes a new index manifest the same way.
 The manifest lists the runs and their checksums and records the table epoch; its atomic replacement is the only commit point of a flush or merge.
-A failure after the manifest was replaced but before memory follows it fails the index closed until it is reopened, and no generation is used twice, so no run a manifest may list is rewritten.
+A failure after the manifest may have been replaced fails index reads and writes closed until the index is successfully reopened.
+Generation allocation advances past the manifest and surviving runs, and writer recovery records any higher unlisted run generation in the synced manifest before deleting that run.
 Runs and manifests are written in every durability mode; they are a cache of chunk state and never carry a write that its chunk lost.
 A run may cover a chunk state that the chunk's WAL later loses in relaxed mode; recovery then finds a different revision for that chunk and rebuilds its entries.
 Within one epoch and clock a revision is never reissued, because the store clock reserves ranges durably before issuing them, so an equal revision means the same chunk state.
@@ -72,13 +74,13 @@ FLUSH WAL does not flush indexes; the next open repairs what the runs miss.
 
 ## Recovery
 
-Opening a table loads the index manifest and the runs' chunk tables after chunk recovery and the coordinate index are complete.
-Each chunk the coordinate index lists is compared with its covering layer: a missing chunk, a different revision or a covered chunk that is no longer populated has its entries recomputed from its recovered state into the delta.
-This is the WAL replay of the index: chunk recovery already applied every durable frame after the run, and the comparison finds every chunk it changed.
-The comparison walks the coordinate index once and reads only the changed chunks.
+Opening the index component loads its manifest and run chunk tables, then compares them against the caller's recovered chunk source.
+An uncovered populated chunk or one with a different revision has its entries recomputed into the delta.
+A previously populated chunk that is now empty or absent is marked as having no entries.
+The comparison walks the source once and reads only populated chunks that need recomputing.
 A missing, unreadable or mismatched manifest, a run whose digest, header, table identity or index identity does not match, or an index in state `building` is rebuilt from the chunk images; the schema version a run records does not decide this (see Build and drop).
-A rebuild sets the index to `building`, and GET BLOCKS that would use it returns `INDEX_BUILDING name=...` until it is ready, or scans with ALLOW SCAN.
-Every rebuild and every chunk recomputed at open is logged with the index name.
+A writer rebuild that produces a run publishes it with a `building` manifest before marking the index `ready`.
+The open report gives the rebuild reason, if any, and counts the chunks recomputed to refresh stale layers.
 
 ## Build and drop
 
@@ -94,7 +96,9 @@ ALTER TABLE that drops, renames or changes the type of an indexed column is refu
 An index page seeks the chosen key ranges after `AFTER`, merges the layers in key order, skips entries of chunks a newer layer covers, and checks each candidate.
 A page costs its rows and the candidates it discards, each a seek in up to 9 layers and a block read; it does not grow with the table.
 Inside a transaction, a page reads candidates from the index and checks them at the snapshot; entries removed after the snapshot are kept with their removal revision in the delta and in the runs written from it (see Structure), within `--txn-history-bytes`; a snapshot that outlives that bound ends with CONFLICT reason=history_limit as other snapshot reads do.
-A read-only process never writes or removes an index file: it loads the runs, recomputes stale chunks into its own delta at open, rebuilds in memory an index it cannot trust, and recomputes the chunks the writer reports in `chunkdb.snapshot.changes` before a page, as it does for the coordinate index.
+A read-only open never writes or removes an index file.
+It keeps the validated runs open even if the writer merges them, recomputes stale chunks into its own delta at open, and rebuilds in memory an index it cannot trust.
+Refreshing from `chunkdb.snapshot.changes` before a page is part of the planned query integration.
 
 ## Commit groups
 
@@ -106,10 +110,11 @@ No index change is ever a group member, so a group's record and its durability d
 ## Backup, restore and verify
 
 BACKUP copies index definitions with the table manifest but not index runs; a restored table builds its indexes at open.
-`chunkdb_verify` checks each run's checksums and order, and recomputes the entries of every chunk to compare them with the index.
-DURABILITY_CONTRACT.md states that indexes never decide whether a write committed and are rebuilt from chunk state after any loss.
-Crash tests stop the process inside a flush, a merge, a build and a drop, and check that GET BLOCKS returns exactly the rows a full scan returns.
-Tests check that a rebuilt clock and RESTORE TABLE each make the next open rebuild the index, that SWAP TABLES keeps it, and that a flush and a merge during an open READ ONLY transaction keep the entries its snapshot reads.
+The component's verifier checks each run's checksums and order and compares current entries against the supplied chunk state.
+`chunkdb_verify` does not invoke the component yet.
+The crash tests interrupt run publication, manifest publication, merge and rebuild and compare recovered entries with entries derived from a test chunk source.
+The layer tests exercise retention and pruning across a supplied snapshot revision.
+End-to-end coverage for table recovery, backup and restore, and indexed queries belongs to the planned table integration.
 
 ## Limits
 

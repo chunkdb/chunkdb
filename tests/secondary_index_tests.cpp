@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -528,6 +529,70 @@ void RemovedEntriesFollowSnapshots() {
     assert(marked() == 0U);
 }
 
+void ReinsertedEntriesVerifyAcrossSnapshots() {
+    test::ScopedTempDir directory("chunkdb-secondary-index-reinserted");
+    const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
+    const auto column = ColumnIndex(layout, "u");
+    const ChunkCoord coord{0, 0, 0};
+    Model model;
+    const auto write = [&](std::uint64_t value) {
+        const auto revision = ++model.clock;
+        model.chunks[coord] = Model::Chunk{.revision = revision, .populated = true,
+            .state = State(layout, revision, {{0U, Block{.u = value}}})};
+    };
+    write(7U);
+    const auto snapshot = model.clock;
+    SecondaryIndex index(directory.path(), layout, column, Identity(1U));
+    (void)index.Open(model.Source());
+
+    write(9U);
+    const auto removed = model.clock;
+    write(7U);
+    const auto& chunk = model.chunks.at(coord);
+    auto entries = ChunkIndexEntries(layout, column, 0U, coord, chunk.state.presence_bitmap, chunk.state.payload,
+        chunk.state.vars);
+    auto history = entries.front();
+    history.removed = removed;
+    entries.push_back(history);
+    index.Replace(coord, chunk.revision, entries);
+    index.Flush(snapshot);
+    assert(Effective(index).size() == 2U && index.Verify(model.Source()).empty());
+
+    entries.push_back(std::move(history));
+    index.Replace(coord, chunk.revision, std::move(entries));
+    index.Merge(snapshot);
+    const auto problems = index.Verify(model.Source());
+    assert(problems.size() == 1U && problems.front().ends_with("holds duplicate entries"));
+}
+
+void ReadOnlyRunsSurviveWriterMerge() {
+    test::ScopedTempDir directory("chunkdb-secondary-index-pinned");
+    const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
+    const auto column = ColumnIndex(layout, "u");
+    const ChunkCoord coord{0, 0, 0};
+    const auto identity = Identity(1U);
+    Model before;
+    before.Write(layout, coord);
+    const auto expected = Expected(layout, column, 0U, before);
+    assert(!expected.empty());
+
+    SecondaryIndex writer(directory.path(), layout, column, identity);
+    (void)writer.Open(before.Source());
+    SecondaryIndex reader(directory.path(), layout, column, identity, true);
+    assert(reader.Open(before.Source()).rebuilt.empty());
+
+    Model after;
+    after.clock = before.clock;
+    after.Empty(coord);
+    writer.Forget(coord);
+    writer.Merge();
+    assert(Effective(writer).empty());
+    assert(Same(Effective(reader), expected));
+    assert(reader.Verify(before.Source()).empty());
+    assert(reader.Open(after.Source()).rebuilt.empty());
+    assert(Effective(reader).empty());
+}
+
 // A failure after the manifest was replaced, before memory follows it, fails
 // the index closed: a retry with a changed delta cannot rewrite the run the
 // new manifest lists. Reopening trusts that manifest and recomputes the rest.
@@ -563,15 +628,24 @@ void FailedPublicationFailsClosed() {
     assert(refused([&] { index.Flush(); }) && index.failed());
     assert(refused([&] { write(index, {1, 0, 0}); }));
     assert(refused([&] { index.Flush(); }) && refused([&] { index.Merge(); }));
-    SecondaryIndex reopened(directory.path(), layout, column, Identity(1U));
-    const auto report = reopened.Open(model.Source());
-    assert(report.rebuilt.empty() && report.recomputed == 1U && !reopened.failed());
-    assert(Same(Effective(reopened), Expected(layout, column, 0U, model)));
-    assert(reopened.Verify(model.Source()).empty());
-    write(reopened, {2, 0, 0});
-    reopened.Flush();
-    assert(Same(Effective(reopened), Expected(layout, column, 0U, model)));
-    assert(reopened.Verify(model.Source()).empty());
+    std::uint64_t revision = 0U;
+    assert(refused([&] { (void)index.Covered({0, 0, 0}, &revision); }));
+    assert(refused([&] { (void)Effective(index); }));
+    assert(refused([&] { (void)index.Verify(model.Source()); }));
+
+    auto unavailable = model.Source();
+    unavailable.for_each = [](const auto&) { throw std::runtime_error("chunk source unavailable"); };
+    assert(refused([&] { (void)index.Open(unavailable); }) && index.failed());
+    assert(refused([&] { (void)Effective(index); }));
+
+    const auto report = index.Open(model.Source());
+    assert(report.rebuilt.empty() && report.recomputed == 1U && !index.failed());
+    assert(Same(Effective(index), Expected(layout, column, 0U, model)));
+    assert(index.Verify(model.Source()).empty());
+    write(index, {2, 0, 0});
+    index.Flush();
+    assert(Same(Effective(index), Expected(layout, column, 0U, model)));
+    assert(index.Verify(model.Source()).empty());
 }
 
 // The deterministic chunk state of the crash scenario at each step.
@@ -654,6 +728,19 @@ void CrashBoundaries(const char* executable) {
         test::ScopedTempDir directory("chunkdb-secondary-index-crash");
         const auto root = directory.path() / "index";
         assert(CrashChild(executable, root, point) == 86);
+        const bool orphaned_run = std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE" ||
+            std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE";
+        std::uint64_t orphan_generation = 0U;
+        if (orphaned_run) {
+            for (const auto& file : Files(root)) {
+                const auto name = file.string();
+                if (!name.starts_with("run-")) continue;
+                std::uint64_t generation = 0U;
+                assert(TryParseUint64(name.substr(4U), &generation));
+                orphan_generation = std::max(orphan_generation, generation);
+            }
+            assert(orphan_generation > 0U);
+        }
         const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
         const auto column = ColumnIndex(layout, "u");
         Model model;
@@ -670,6 +757,20 @@ void CrashBoundaries(const char* executable) {
             if (file != "manifest") ++runs;
         }
         assert(runs == index.runs());
+        if (orphaned_run) {
+            assert(!std::filesystem::exists(SecondaryIndex::RunPath(root, orphan_generation)));
+            SecondaryIndex reopened(root, layout, column, Identity(1U));
+            if (std::string_view(point) == "CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE") {
+                assert(reopened.Open(model.Source()).rebuilt.empty());
+                assert(reopened.manifest_generation() >= orphan_generation);
+                reopened.Flush();
+            } else {
+                reopened.Rebuild(model.Source());
+            }
+            assert(reopened.manifest_generation() > orphan_generation);
+            assert(!std::filesystem::exists(SecondaryIndex::RunPath(root, orphan_generation)));
+            assert(Same(Effective(reopened), Expected(layout, column, 0U, model)));
+        }
     }
 }
 
@@ -686,5 +787,7 @@ int main(int argc, char** argv) {
     ManifestRoundTripAndDamage();
     LayersFollowChunkState();
     RemovedEntriesFollowSnapshots();
+    ReinsertedEntriesVerifyAcrossSnapshots();
+    ReadOnlyRunsSurviveWriterMerge();
     FailedPublicationFailsClosed();
 }

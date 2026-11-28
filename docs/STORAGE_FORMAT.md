@@ -53,7 +53,7 @@ data_dir/
     L_<lx>_<ly>/C_<cx>_<cy>.chk         checkpoint image
     L_<lx>_<ly>/C_<cx>_<cy>.wal         live delta log
     L_<lx>_<ly>/chunkdb.index          checked coordinate decisions, when listed
-    indexes/<id>/manifest             secondary index manifest (no statement creates one yet)
+    indexes/<id>/manifest             secondary index manifest (internal format)
     indexes/<id>/run-<generation>     secondary index run
 ```
 
@@ -460,7 +460,8 @@ Pending compaction refuses read-only opening, and uncertain decided failures fen
 
 ## Secondary indexes
 
-An index (see [Secondary indexes](design/INDEXES.md)) is derived from chunk state; a table opens it after chunk recovery and the coordinate index, and rebuilds it from chunk state when a file below cannot be trusted.
+The internal secondary index component (see [Secondary indexes](design/INDEXES.md)) takes recovered chunk coordinates and revisions from its caller and rebuilds from chunk state when a file below cannot be trusted.
+Table startup and statements do not use this component yet.
 Integers are little-endian; coordinates are the table's active axes as two's-complement u64 values.
 
 | File | Encoding |
@@ -473,8 +474,12 @@ Integers are little-endian; coordinates are the table's active axes as two's-com
 | block index | block count `u32`, per block its file offset `u64`, reserved zero `u32` and first entry, CRC32 |
 | footer | chunk table, entry blocks and block index offsets `u64`, entry count `u64`, block count `u32`, `CKXE`, CRC32 of the 40 bytes before it |
 
-A manifest larger than 448 bytes or whose epoch, dims, index id, column id or prefix differ from the table's, an index still building, or a listed run whose size, SHA-256, header, footer or chunk table does not check is rebuilt; the recorded schema version does not decide this. Verification also checks each run's block checksums, block index and order, and every chunk's current entries against its state.
-A run is written under a temporary name, synced, renamed and its directory synced before the manifest that lists it replaces the previous one the same way; files the manifest does not list are removed when a writer opens the index, and a read-only process writes and removes nothing.
+A manifest larger than 448 bytes or whose epoch, dims, index id, column id or prefix differ from the table's, an index still building, or a listed run whose size, SHA-256, header, footer or chunk table does not check is rebuilt; the recorded schema version does not decide this.
+The component's verifier also checks each run's block checksums, block index and order, and every chunk's current entries against its state.
+A run is written under a temporary name, synced, renamed and its directory synced before the manifest that lists it replaces the previous one the same way.
+On writer open, the manifest records any higher generation found in an unlisted run before that run is removed.
+A read-only open writes and removes nothing and keeps its validated runs open until the index is reopened or destroyed.
+A run can hold entries with the same key, coordinates and block if their removal revisions differ.
 A flush that would make more than 8 runs merges instead; flushes and merges drop entries removed at or before the oldest open snapshot's revision.
 
 ## Conditional and transaction intents
