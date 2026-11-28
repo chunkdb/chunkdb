@@ -395,8 +395,9 @@ void OwnerAdmissionPrecedesChunkReads() {
 
 void BackupOwnerAdmissionPrecedesChunkReads() {
     test::ScopedTempDir temporary("chunkdb-owner-verify-backup-reads");
-    const auto backup = temporary.path() / "backup";
-    CatalogConfig config; config.data_dir = temporary.path() / "source"; config.background_maintenance = false;
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto backup = root / "backup";
+    CatalogConfig config; config.data_dir = root / "source"; config.background_maintenance = false;
     {
         TableCatalog catalog(config);
         auto alpha = catalog.Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
