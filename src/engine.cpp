@@ -1152,7 +1152,12 @@ std::string CommandEngine::RenderMetrics() const {
     // that failed, is left out rather than waited for.
     std::vector<TableRuntimeStats> tables;
     std::vector<MetricsRegistry::TableExpiryMetrics> expiry;
-    const auto now = UnixMillisNow();
+    const auto expiry_now = catalog_->access_mode() == AccessMode::kReadWrite
+        ? std::optional<std::uint64_t>(UnixMillisNow()) : std::nullopt;
+    const auto expiry_sample = [](const std::string& name, const Table::ExpiryStatus& status) {
+        return MetricsRegistry::TableExpiryMetrics{.table = name, .lag_ms = status.lag_ms,
+            .expired_blocks = status.expired_blocks, .failed_passes = status.failed_passes};
+    };
     // The state gauges list every table by name, fenced ones out of service too.
     std::vector<MetricsRegistry::TableState> states;
     for (const auto& info : catalog_->List()) {
@@ -1161,9 +1166,8 @@ std::string CommandEngine::RenderMetrics() const {
             continue;
         }
         // A read-only server runs no expiry.
-        if (const auto status = catalog_->access_mode() == AccessMode::kReadWrite ? table->Expiry(now) : std::nullopt) {
-            expiry.push_back({.table = info.name, .lag_ms = status->lag_ms, .expired_blocks = status->expired_blocks,
-                .failed_passes = status->failed_passes});
+        if (const auto status = expiry_now ? table->Expiry(*expiry_now) : std::nullopt) {
+            expiry.push_back(expiry_sample(info.name, *status));
         }
         auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name, .fenced = false, .slot_frontier_frozen = std::nullopt});
         const auto lease = table->TryAcquire();
@@ -1174,7 +1178,14 @@ std::string CommandEngine::RenderMetrics() const {
         state.slot_frontier_frozen = table->SlotFrontierFrozen(*lease);
     }
     // Fences waits for no table.
-    for (const auto& fence : catalog_->Fences()) {
+    for (const auto& fence : catalog_->Fences(expiry_now)) {
+        if (fence.expiry) {
+            const auto at = std::lower_bound(expiry.begin(), expiry.end(), fence.table,
+                [](const MetricsRegistry::TableExpiryMetrics& sample, const std::string& name) { return sample.table < name; });
+            auto sample = expiry_sample(fence.table, *fence.expiry);
+            if (at != expiry.end() && at->table == fence.table) *at = std::move(sample);
+            else expiry.insert(at, std::move(sample));
+        }
         const auto at = std::lower_bound(states.begin(), states.end(), fence.table,
             [](const MetricsRegistry::TableState& state, const std::string& name) { return state.table < name; });
         if (at != states.end() && at->table == fence.table) at->fenced = true;

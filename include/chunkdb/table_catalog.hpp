@@ -207,17 +207,6 @@ struct TableRestoreResult {
     std::uint64_t bytes = 0;
 };
 
-// A table that refuses its commands until TableCatalog::RecoverTable or a
-// restart recovers it: after a failure that left it out of service, or while
-// its store is fail-closed after a durability failure or its feed cleanup
-// failed.
-struct TableFence {
-    std::string table;
-    std::string reason;
-    // What it served last; std::nullopt when it never served.
-    std::optional<TableInfo> info;
-};
-
 // One table of a catalog. A connection keeps a shared_ptr<Table> for the
 // table it selected; every command on it runs under a Lease.
 class Table : public std::enable_shared_from_this<Table> {
@@ -396,6 +385,8 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] bool HasExpireColumn() const;
     void RequestExpiry(const std::shared_ptr<MaintenancePool>& pool, std::chrono::milliseconds interval, bool now = false);
     void StopExpiry() noexcept;
+    // Publishes the reopened table's options under mutex_ after leases drain.
+    void SetOptionsLocked(const TableOptions& options);
     void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
     // Why a table in its catalog refuses commands; nullptr when it does not.
     [[nodiscard]] const char* FenceReason() const;
@@ -419,7 +410,7 @@ class Table : public std::enable_shared_from_this<Table> {
     std::jthread feed_linger_timer_;
     std::atomic<bool> feed_timer_finished_{true};
     // Guards the expiry members; never held while a pass runs.
-    mutable std::mutex expiry_mutex_;
+    std::mutex expiry_mutex_;
     bool expiry_stopped_ = false;
     std::shared_ptr<ExpiryJob> expiry_;
     std::shared_ptr<MaintenancePool> expiry_pool_;
@@ -448,6 +439,12 @@ class Table : public std::enable_shared_from_this<Table> {
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
+    // Changes to expire_column reset these under mutex_ with no leases active.
+    // A sweep updates its counters and frontier while holding a lease.
+    std::uint64_t expiry_generation_ = 0U;
+    std::atomic<std::uint64_t> expiry_frontier_ms_{0U};
+    std::atomic<std::uint64_t> expired_blocks_{0U};
+    std::atomic<std::uint64_t> expiry_failed_passes_{0U};
     // Protected with options_ by mutex_.
     std::size_t slot_max_bytes_ = kDefaultSlotMaxBytes;
     std::shared_ptr<ChangeFeed> feed_;
@@ -456,6 +453,19 @@ class Table : public std::enable_shared_from_this<Table> {
     std::shared_ptr<FeedSlotAckState> slot_ack_state_;
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
     std::shared_ptr<FeedExcessPool> slot_excess_;
+};
+
+// A table that refuses its commands until TableCatalog::RecoverTable or a
+// restart recovers it: after a failure that left it out of service, or while
+// its store is fail-closed after a durability failure or its feed cleanup
+// failed.
+struct TableFence {
+    std::string table;
+    std::string reason;
+    // What it served last; std::nullopt when it never served.
+    std::optional<TableInfo> info;
+    // Requested only by metrics, for a table outside the serving catalog.
+    std::optional<Table::ExpiryStatus> expiry{};
 };
 
 struct CatalogTxnSnapshot {
@@ -525,8 +535,9 @@ class TableCatalog {
     // service, and TableNotFoundError when there is no such table.
     [[nodiscard]] std::shared_ptr<Table> Require(std::string_view name) const;
     // Fenced tables, sorted by name: those out of service, which Find does
-    // not return, and those it returns that refuse changes.
-    [[nodiscard]] std::vector<TableFence> Fences() const;
+    // not return, and those it returns that refuse changes. With a time,
+    // include expiry status for tables out of service that had expiry.
+    [[nodiscard]] std::vector<TableFence> Fences(std::optional<std::uint64_t> expiry_now_ms = std::nullopt) const;
     [[nodiscard]] std::optional<TableFence> Fence(std::string_view name) const;
     // Runs for one fenced table what opening the catalog runs for each table,
     // while other tables keep serving: waits for the commands running on it

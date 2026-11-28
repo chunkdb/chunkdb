@@ -238,7 +238,8 @@ A migration with an unknown outcome fences every table; RECOVER TABLE refuses it
 
 A DEFAULT COMMIT_TIME column holds the time of the last commit that created the block or changed another of its values, in Unix milliseconds.
 That time is the commit's `time_ms` in the change feed, and the same for every block of one commit or transaction.
-A write that gives the column a value different from the stored one keeps that value; a write that gives the stored value, or none, gets the commit time.
+A write that gives the column a value different from the stored one keeps that value and stamps other DEFAULT COMMIT_TIME columns it leaves unchanged.
+A write that changes another value and gives this column its stored value, or omits it, stamps it with the commit time.
 A write that changes no value commits nothing and leaves the time as it is; deleting a block removes it with its time.
 SET BLOCK, SET CHUNK, transactions and conditional writes all follow these rules.
 Inside a transaction, statements read the stored value, or zero for a new block, until COMMIT stamps the column.
@@ -268,7 +269,9 @@ A sweep reads every populated chunk in coordinate order, at most 64 chunks per w
 Each chunk with expired blocks is one ordinary commit, decided under its chunk lock, so a write that moves the time ahead first keeps its block.
 Its change event has user `@expire`, and the WAL, slots and backups see it as any other delete.
 A sweep never waits for a schema change, drop or reopen of its table; it skips the table instead, and those wait at most for the running turn.
-A crash loses no committed deletion; after a restart the next sweep starts from the first chunk.
+Expiry deletions follow the table's [durability mode](../DURABILITY_CONTRACT.md).
+In `relaxed` mode a crash can lose a deletion whose WAL entry was still batched or unsynced.
+After a restart the next sweep starts from the first chunk.
 SHOW METRICS reports `chunkdb_expiry_lag_seconds`, `chunkdb_expired_blocks_total` and `chunkdb_expiry_failed_passes_total` per table with an `expire_column`; see [Server statements](SERVER.md#notes).
 ## Checks
 

@@ -22,7 +22,7 @@
 namespace chunkdb {
 
 struct Table::ExpiryJob {
-    ExpiryJob(Table* owner, std::uint64_t now_ms) : table(owner), frontier_ms(now_ms) {}
+    explicit ExpiryJob(Table* owner) : table(owner) {}
 
     // One pool turn: a pass of the current sweep. Whether the sweep goes on.
     bool Step() noexcept;
@@ -31,16 +31,10 @@ struct Table::ExpiryJob {
     // Held through a pass; StopExpiry takes it to end the passes.
     std::mutex mutex;
     bool stopped = false;
-    std::uint32_t column = 0U;
+    std::uint64_t generation = 0U;
     bool has_cursor = false;
     ChunkCoord cursor{};
     std::uint64_t sweep_started_ms = 0U;
-    // Every block whose time is at or before it was deleted, unless written
-    // after its sweep passed its chunk: the start of the last completed
-    // sweep, or when expiry started on the table.
-    std::atomic<std::uint64_t> frontier_ms;
-    std::atomic<std::uint64_t> expired_blocks{0U};
-    std::atomic<std::uint64_t> failed_passes{0U};
     // Between RequestExpiry starting a sweep and its last turn; when it ended.
     std::atomic<bool> sweeping{false};
     std::atomic<std::chrono::steady_clock::rep> ended{0};
@@ -61,30 +55,29 @@ bool Table::ExpiryJob::Step() noexcept {
         return end();
     const auto lease = table->TryAcquire();
     if (!lease) return end();
-    std::uint32_t current = 0U;
+    std::uint32_t column = 0U;
     {
         std::lock_guard options(table->mutex_);
-        current = table->options_.expire_column;
-    }
-    const std::uint64_t now = UnixMillisNow();
-    if (current != column) {
-        column = current;
-        has_cursor = false;
-        frontier_ms.store(now, std::memory_order_relaxed);
+        column = table->options_.expire_column;
+        if (generation != table->expiry_generation_) {
+            generation = table->expiry_generation_;
+            has_cursor = false;
+        }
     }
     if (column == 0U || Table::StoreFenceReason(lease->store()) != nullptr) return end();
+    const std::uint64_t now = UnixMillisNow();
     if (!has_cursor) sweep_started_ms = now;
     try {
         const ScopedWriteUser user(kExpiryWriteUser);
-        const auto pass = lease->store().ExpireBlocks(column, has_cursor, cursor, kExpiryPassChunks, now);
-        expired_blocks.fetch_add(pass.deleted, std::memory_order_relaxed);
+        const auto pass = lease->store().ExpireBlocks(
+            column, has_cursor, cursor, kExpiryPassChunks, now, &table->expired_blocks_);
         if (pass.more) {
             has_cursor = true;
             cursor = pass.next;
             return true;
         }
     } catch (const std::exception& error) {
-        failed_passes.fetch_add(1U, std::memory_order_relaxed);
+        table->expiry_failed_passes_.fetch_add(1U, std::memory_order_relaxed);
         has_cursor = false;
         try {
             LogMessage(LogLevel::kError, LogComponent::kStore, "expiry pass failed; the next sweep retries",
@@ -95,13 +88,23 @@ bool Table::ExpiryJob::Step() noexcept {
         return end();
     }
     has_cursor = false;
-    frontier_ms.store(sweep_started_ms, std::memory_order_relaxed);
+    table->expiry_frontier_ms_.store(sweep_started_ms, std::memory_order_relaxed);
     return end();
 }
 
 bool Table::HasExpireColumn() const {
     std::lock_guard options(mutex_);
     return options_.expire_column != 0U;
+}
+
+void Table::SetOptionsLocked(const TableOptions& options) {
+    if (options_.expire_column != options.expire_column) {
+        ++expiry_generation_;
+        expiry_frontier_ms_.store(options.expire_column == 0U ? 0U : UnixMillisNow(), std::memory_order_relaxed);
+        expired_blocks_.store(0U, std::memory_order_relaxed);
+        expiry_failed_passes_.store(0U, std::memory_order_relaxed);
+    }
+    options_ = options;
 }
 
 void Table::RequestExpiry(const std::shared_ptr<MaintenancePool>& pool, std::chrono::milliseconds interval, bool now) {
@@ -116,7 +119,7 @@ void Table::RequestExpiry(const std::shared_ptr<MaintenancePool>& pool, std::chr
         if (!now && std::chrono::steady_clock::now() - ended < interval) return;
     }
     if (!expiry_) {
-        auto job = std::make_shared<ExpiryJob>(this, UnixMillisNow());
+        auto job = std::make_shared<ExpiryJob>(this);
         // The job outlives every turn: StopExpiry waits for them.
         expiry_task_ = pool->MakeTask([job = job.get()] { return job->Step(); });
         expiry_pool_ = pool;
@@ -147,17 +150,13 @@ void Table::StopExpiry() noexcept {
 }
 
 std::optional<Table::ExpiryStatus> Table::Expiry(std::uint64_t now_ms) const {
-    {
-        std::lock_guard options(mutex_);
-        if (options_.expire_column == 0U) return std::nullopt;
-    }
-    std::lock_guard lock(expiry_mutex_);
-    if (!expiry_) return ExpiryStatus{};
-    const auto frontier = expiry_->frontier_ms.load(std::memory_order_relaxed);
+    std::lock_guard options(mutex_);
+    if (options_.expire_column == 0U) return std::nullopt;
+    const auto frontier = expiry_frontier_ms_.load(std::memory_order_relaxed);
     return ExpiryStatus{
         .lag_ms = now_ms > frontier ? now_ms - frontier : 0U,
-        .expired_blocks = expiry_->expired_blocks.load(std::memory_order_relaxed),
-        .failed_passes = expiry_->failed_passes.load(std::memory_order_relaxed),
+        .expired_blocks = expired_blocks_.load(std::memory_order_relaxed),
+        .failed_passes = expiry_failed_passes_.load(std::memory_order_relaxed),
     };
 }
 

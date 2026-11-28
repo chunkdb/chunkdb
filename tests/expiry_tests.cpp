@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -24,6 +26,7 @@
 #include "feed_test_utils.hpp"
 #include "table_expiry.hpp"
 #include "test_utils.hpp"
+#include "txn_test_utils.hpp"
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -47,16 +50,16 @@ void Expect(const std::string& reply, const std::string& part) {
     }
 }
 
-CatalogConfig Config(const std::filesystem::path& dir) {
+CatalogConfig Config(const std::filesystem::path& dir, std::chrono::milliseconds expiry_interval) {
     auto config = feed_test::Config(dir);
-    // Sweeps run only when a test starts them.
-    config.expiry_interval = std::chrono::milliseconds(0);
+    config.expiry_interval = expiry_interval;
     return config;
 }
 
 struct Server {
-    explicit Server(const std::filesystem::path& dir)
-        : catalog(std::make_shared<TableCatalog>(Config(dir))), engine({.require_auth = false}, catalog) {
+    // Most cases start sweeps explicitly so they can control each pass.
+    explicit Server(const std::filesystem::path& dir, std::chrono::milliseconds expiry_interval = {})
+        : catalog(std::make_shared<TableCatalog>(Config(dir, expiry_interval))), engine({.require_auth = false}, catalog) {
         Expect(Run("HELLO 3"), "%");
     }
     std::string Run(const std::string& statement) { return engine.Execute(session, statement); }
@@ -193,6 +196,48 @@ void TestCommitTimeWrites() {
     assert(server.Get("3 0", "t", "at") == Int(10'000U));
 }
 
+void TestCommitTimePeerColumns() {
+    ScopedTempDir dir("chunkdb-expiry-peer-commit-times");
+    Server server(dir.path());
+    server.Ok("CREATE TABLE t (v u8, a u64 DEFAULT COMMIT_TIME, b u64 DEFAULT COMMIT_TIME) CHUNK 2 x 2");
+    g_now = 1'000U;
+    server.Write("SET BLOCK 0 0 IN t v = 1");
+    g_now = 2'000U;
+    server.Write("SET BLOCK 0 0 IN t a = 7");
+    assert(server.Get("0 0", "t", "a") == Int(7U));
+    assert(server.Get("0 0", "t", "b") == Int(2'000U));
+    g_now = 3'000U;
+    server.Write("SET BLOCK 0 0 IN t a = 7");
+    assert(server.Get("0 0", "t", "b") == Int(2'000U));
+    const auto reply = server.Run("SET BLOCK 0 0 IN t a = 8 IF a = 7 RETURNING NEW a, b");
+    Expect(reply, ":8\r\n:3000\r\n");
+    assert(server.Get("0 0", "t", "a") == Int(8U));
+    assert(server.Get("0 0", "t", "b") == Int(3'000U));
+    {
+        auto lease = server.catalog->Find("t")->Acquire();
+        auto& store = lease->store();
+        g_now = 4'000U;
+        const ChunkCoord coord{0, 0};
+        auto state = store.ReadChunkState(coord);
+        store.SetBlockInState(state, 0, 0, {{"a", std::uint64_t{9}}});
+        assert(store.WriteChunkState(coord, std::move(state), std::nullopt).ok);
+        assert(server.Get("0 0", "t", "b") == Int(4'000U));
+        g_now = 5'000U;
+        state = store.ReadChunkState(coord);
+        const auto version = state.version;
+        store.SetBlockInState(state, 0, 0, {{"a", std::uint64_t{10}}});
+        assert(store.WriteChunkState(coord, std::move(state), version).ok);
+    }
+    assert(server.Get("0 0", "t", "a") == Int(10U));
+    assert(server.Get("0 0", "t", "b") == Int(5'000U));
+    server.Ok("BEGIN");
+    assert(server.Run("SET BLOCK 0 0 IN t a = 11") == "_\r\n");
+    g_now = 6'000U;
+    Expect(server.Run("COMMIT"), ":");
+    assert(server.Get("0 0", "t", "a") == Int(11U));
+    assert(server.Get("0 0", "t", "b") == Int(6'000U));
+}
+
 void TestExpireColumnOption() {
     ScopedTempDir dir("chunkdb-expiry-option");
     {
@@ -326,6 +371,89 @@ void TestSweepsFeedAndLag() {
     assert(!Contains(server.Run("SHOW METRICS"), "chunkdb_expiry_lag_seconds"));
 }
 
+unsigned g_expiry_decisions = 0U;
+void FailSecondExpiryChunk() {
+    if (++g_expiry_decisions == 2U) throw std::runtime_error("injected expiry failure on the second chunk");
+}
+
+void TestExpiryMetricsAfterPartialFailureAndOptionChange() {
+    ScopedTempDir dir("chunkdb-expiry-metrics-reset");
+    Server server(dir.path());
+    g_now = 750U;
+    server.Ok("CREATE TABLE e (v u8, until u64 NULL, next_until u64 NULL) CHUNK 2 x 2 WITH expire_column = until");
+    auto table = server.catalog->Find("e");
+    g_now = 1'000U;
+    assert(table->Expiry(g_now.load())->lag_ms == 250U);
+    WriteChunks(server, "e", 2);
+    g_expiry_decisions = 0U;
+    ChunkStore::SetExpiryDecideHookForTests(&FailSecondExpiryChunk);
+    ExpiryTestAccess::RunSweep(*server.catalog, "e");
+    ChunkStore::SetExpiryDecideHookForTests(nullptr);
+    assert(server.Get("0 0", "e", "v") == "_\r\n");
+    assert(server.Get("2 0", "e", "v") == Int(1U));
+    auto status = table->Expiry(g_now.load());
+    assert(status && status->lag_ms == 250U && status->expired_blocks == 1U && status->failed_passes == 1U);
+    ExpiryTestAccess::RunSweep(*server.catalog, "e");
+    assert(server.Get("2 0", "e", "v") == "_\r\n");
+    status = table->Expiry(g_now.load());
+    assert(status && status->expired_blocks == 2U && status->failed_passes == 1U);
+
+    g_now = 1'200U;
+    server.Ok("ALTER TABLE e SET expire_column = next_until");
+    g_now = 1'500U;
+    status = table->Expiry(g_now.load());
+    assert(status && status->lag_ms == 300U && status->expired_blocks == 0U && status->failed_passes == 0U);
+    server.Write("SET BLOCK 0 0 IN e v = 1, next_until = 100");
+    ExpiryTestAccess::RunSweep(*server.catalog, "e");
+    assert(table->Expiry(g_now.load())->expired_blocks == 1U);
+
+    server.Ok("ALTER TABLE e SET expire_column = NULL");
+    assert(!table->Expiry(g_now.load()));
+    server.Ok("ALTER TABLE e SET expire_column = next_until");
+    g_now = 1'600U;
+    status = table->Expiry(g_now.load());
+    assert(status && status->lag_ms == 100U && status->expired_blocks == 0U && status->failed_passes == 0U);
+}
+
+void TestFencedExpiryMetrics() {
+    ScopedTempDir dir("chunkdb-expiry-fenced-metrics");
+    Server server(dir.path());
+    g_now = 1'000U;
+    server.Ok("CREATE TABLE e (v u8, until u64) CHUNK 2 x 2 WITH expire_column = until");
+    server.Write("SET BLOCK 0 0 IN e v = 1, until = 500");
+    ExpiryTestAccess::RunSweep(*server.catalog, "e");
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE", "1");
+        Expect(server.Run("ALTER TABLE e SET checkpoint_updates = 9000"), "injected failure reopening a table");
+    }
+    assert(server.catalog->Find("e") == nullptr);
+    g_now = 1'250U;
+    const auto metrics = server.Run("SHOW METRICS");
+    Expect(metrics, "chunkdb_table_fenced{table=\"e\"} 1\n");
+    Expect(metrics, "chunkdb_expiry_lag_seconds{table=\"e\"} 0.250000\n");
+    Expect(metrics, "chunkdb_expired_blocks_total{table=\"e\"} 1\n");
+    Expect(metrics, "chunkdb_expiry_failed_passes_total{table=\"e\"} 0\n");
+    server.Ok("RECOVER TABLE e");
+    g_now = 1'500U;
+    const auto recovered = server.catalog->Find("e")->Expiry(g_now.load());
+    assert(recovered && recovered->lag_ms == 250U && recovered->expired_blocks == 0U && recovered->failed_passes == 0U);
+}
+
+void TestAutomaticExpirySweep() {
+    ScopedTempDir dir("chunkdb-expiry-ticker");
+    Server server(dir.path(), std::chrono::milliseconds(10));
+    g_now = 1'000U;
+    server.Ok("CREATE TABLE e (v u8, until u64) CHUNK 2 x 2 WITH expire_column = until");
+    auto feed = server.catalog->Find("e")->SubscribeFeed();
+    server.Write("SET BLOCK 0 0 IN e v = 1, until = 500");
+    const auto write = feed_test::Next(*feed);
+    assert(write->blocks.size() == 1U && write->blocks[0].after);
+    const auto expiry = feed_test::Next(*feed);
+    assert(expiry->user == std::optional<std::string>("@expire"));
+    assert(expiry->blocks.size() == 1U && expiry->blocks[0].before && !expiry->blocks[0].after);
+    assert(server.Get("0 0", "e", "v") == "_\r\n");
+}
+
 // Checks that read a DEFAULT COMMIT_TIME column see the stamped value: a
 // plain write and SET CHUNK when they are evaluated, a transaction at COMMIT.
 void TestChecksReadCommitTime() {
@@ -398,17 +526,20 @@ void TestDecideAgainUnderLock() {
 }
 
 #ifndef _WIN32
-// A crash between the passes of a sweep: the committed deletions stay, and
-// the sweep after the restart takes the rest.
-void TestCrashBetweenPasses() {
+// A crash between passes: synced deletions survive, while relaxed deletions
+// still in the WAL batch are lost. The next sweep takes the remaining blocks.
+void TestCrashBetweenPasses(bool synced) {
     ScopedTempDir dir("chunkdb-expiry-crash");
     constexpr int kChunks = 6;
     const pid_t child = ::fork();
     assert(child >= 0);
     if (child == 0) {
         Server server(dir.path());
-        server.Ok("CREATE TABLE e (v u8, until u64 NULL) CHUNK 2 x 2 WITH expire_column = until, durability_mode = 'fsync-wal'");
+        const std::string mode = synced ? "fsync-wal" : "relaxed";
+        server.Ok("CREATE TABLE e (v u8, until u64 NULL) CHUNK 2 x 2 WITH expire_column = until, "
+                  "wal_group_commit_updates = 8, durability_mode = '" + mode + "'");
         WriteChunks(server, "e", kChunks);
+        server.Ok("FLUSH WAL");
         g_now = 1'000U;
         auto table = server.catalog->Find("e");
         const auto column = table->Info().options.expire_column;
@@ -420,28 +551,41 @@ void TestCrashBetweenPasses() {
     assert(::waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     Server server(dir.path());
-    assert(Present(server, "e", kChunks) == 4 * kChunks - 2);
-    assert(server.Get("0 0", "e", "v") == "_\r\n" && server.Get("2 0", "e", "v") == "_\r\n");
+    const int survived = synced ? 2 : 0;
+    assert(Present(server, "e", kChunks) == 4 * kChunks - survived);
+    for (const auto* coord : {"0 0", "2 0"})
+        assert(server.Get(coord, "e", "v") == (synced ? "_\r\n" : Int(1U)));
     g_now = 1'000U;
     ExpiryTestAccess::RunSweep(*server.catalog, "e");
     assert(Present(server, "e", kChunks) == 3 * kChunks);
-    assert(server.catalog->Find("e")->Expiry(g_now.load())->expired_blocks == static_cast<std::uint64_t>(kChunks - 2));
+    assert(server.catalog->Find("e")->Expiry(g_now.load())->expired_blocks == static_cast<std::uint64_t>(kChunks - survived));
 }
 #endif
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     SetUnixMillisClockForTests(&FakeNow);
 #ifndef _WIN32
-    // First, while this process has no other threads.
-    TestCrashBetweenPasses();
+    if (argc == 2 && std::string_view(argv[1]) == "--crash") {
+        TestCrashBetweenPasses(true);
+        TestCrashBetweenPasses(false);
+        SetUnixMillisClockForTests(nullptr);
+        return 0;
+    }
+#else
+    (void)argv;
 #endif
+    assert(argc == 1);
     TestCommitTimeRules();
     TestCommitTimeWrites();
+    TestCommitTimePeerColumns();
     TestExpireColumnOption();
     TestBoundedPasses();
     TestSweepsFeedAndLag();
+    TestExpiryMetricsAfterPartialFailureAndOptionChange();
+    TestFencedExpiryMetrics();
+    TestAutomaticExpirySweep();
     TestChecksReadCommitTime();
     TestDecideAgainUnderLock();
     SetUnixMillisClockForTests(nullptr);

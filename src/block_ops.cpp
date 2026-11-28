@@ -1094,7 +1094,7 @@ void ChunkStore::WriteBlockColumnsLocked(
             return std::find(stamp_columns.begin(), stamp_columns.end(), index) != stamp_columns.end();
         };
         constexpr std::size_t kChangedByWrite = std::numeric_limits<std::size_t>::max();
-        bool other = presence_changed || !var_update.empty();
+        bool block_changed = presence_changed || !var_update.empty();
         // Each edited commit-time column with its value range, or
         // kChangedByWrite when the write changes it.
         std::vector<std::pair<const ChunkLayout::FixedColumn*, std::size_t>> edited;
@@ -1103,10 +1103,10 @@ void ChunkStore::WriteBlockColumnsLocked(
             const std::size_t value_range = next++;
             bool edit_changed = changed(ranges[value_range]);
             if (edit.fixed->validity != ChunkLayout::kNoValidity) edit_changed = changed(ranges[next++]) || edit_changed;
-            if (!stamps(edit.fixed)) other = other || edit_changed;
-            else edited.emplace_back(edit.fixed, edit_changed ? kChangedByWrite : value_range);
+            block_changed = block_changed || edit_changed;
+            if (stamps(edit.fixed)) edited.emplace_back(edit.fixed, edit_changed ? kChangedByWrite : value_range);
         }
-        if (other) {
+        if (block_changed) {
             if constexpr (sizeof...(Pinned) == 0U) stamped_time = NextCommitTimeMs(*chunk);
             else stamped_time = (pinned_commit_time_ms, ...);
             std::array<std::uint8_t, 8> time{};
@@ -1759,7 +1759,9 @@ std::vector<ColumnValue> ChunkStore::BlockAfterSet(const std::vector<ColumnValue
             after[index] = DecodeVarValue(column, {});
         }
     }
-    if (layout.commit_time_columns().empty()) [[likely]] return after;
+    if (layout.commit_time_columns().empty() || std::none_of(slots.begin(), slots.end(),
+            [&](std::size_t index) { return columns[index].default_commit_time; })) [[likely]]
+        return after;
     // DEFAULT COMMIT_TIME columns, as the write stamps them: the commit time
     // when the block is new or another of its stored values changes, unless
     // the write changes the column's stored value itself.
@@ -1784,12 +1786,11 @@ std::vector<ColumnValue> ChunkStore::BlockAfterSet(const std::vector<ColumnValue
         return static_cast<std::size_t>(std::find_if(columns.begin(), columns.end(),
             [&](const Column& column) { return column.name == assignment.column; }) - columns.begin());
     };
-    bool other = before == nullptr;
-    for (const auto& assignment : values) {
+    const bool block_changed = before == nullptr || std::any_of(values.begin(), values.end(), [&](const auto& assignment) {
         const auto index = index_of(assignment);
-        if (!other && index < columns.size() && !columns[index].default_commit_time) other = changes(index, assignment.value);
-    }
-    if (!other) return after;
+        return index < columns.size() && changes(index, assignment.value);
+    });
+    if (!block_changed) return after;
     for (const std::size_t index : slots) {
         if (!columns[index].default_commit_time) continue;
         const auto given = std::find_if(values.begin(), values.end(),

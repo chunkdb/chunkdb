@@ -274,7 +274,8 @@ Table::Table(
       migration_health_(std::move(migration_health)),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
-      options_(options) {
+      options_(options),
+      expiry_frontier_ms_(options.expire_column != 0U && store_->access_mode_ == AccessMode::kReadWrite ? UnixMillisNow() : 0U) {
     slot_excess_ = std::make_shared<FeedExcessPool>();
     slot_max_bytes_ = store_->feed_slots_->max_bytes();
     slot_ack_state_ = std::make_shared<FeedSlotAckState>();
@@ -1115,7 +1116,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         {
             std::lock_guard lock(mutex_);
             store_ = std::move(store);
-            options_ = options;
+            SetOptionsLocked(options);
             slot_max_bytes_ = store_->feed_slots_->max_bytes();
             state_.store(State::kFailed, std::memory_order_seq_cst);
         }
@@ -1147,7 +1148,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
             slot_max_bytes_ = store->feed_slots_->max_bytes();
         }
         store_ = std::move(store);
-        options_ = options;
+        SetOptionsLocked(options);
         state_.store(next, std::memory_order_seq_cst);
     }
     cv_.notify_all();
@@ -1596,7 +1597,7 @@ void TableCatalog::ThrowIfFenced(std::string_view name) const {
     if (const auto it = fenced_.find(name); it != fenced_.end()) throw TableFencedError(FencedMessage(name, it->second.reason));
 }
 
-std::vector<TableFence> TableCatalog::Fences() const {
+std::vector<TableFence> TableCatalog::Fences(std::optional<std::uint64_t> expiry_now_ms) const {
     std::vector<std::pair<std::string, Fenced>> candidates;
     {
         std::shared_lock lock(tables_mutex_);
@@ -1612,6 +1613,8 @@ std::vector<TableFence> TableCatalog::Fences() const {
             .table = name,
             .reason = reason,
             .info = fenced.table ? std::optional<TableInfo>(fenced.table->Info()) : std::nullopt,
+            .expiry = expiry_now_ms && fenced.reason != nullptr && fenced.table
+                ? fenced.table->Expiry(*expiry_now_ms) : std::nullopt,
         });
     }
     return fences;

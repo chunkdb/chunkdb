@@ -849,9 +849,10 @@ class ChunkStore {
     // present blocks whose u64 column `column_id` holds a time t with
     // 0 < t <= now_ms. Each chunk with such blocks is one ordinary commit of
     // the current write user, decided under its chunk lock; other chunks
-    // are read without entering the cache.
+    // are read without entering the cache. When supplied, deleted_total
+    // counts each successful chunk even if a later chunk fails.
     [[nodiscard]] ExpiryPass ExpireBlocks(std::uint32_t column_id, bool has_cursor, ChunkCoord cursor,
-        std::size_t max_chunks, std::uint64_t now_ms);
+        std::size_t max_chunks, std::uint64_t now_ms, std::atomic<std::uint64_t>* deleted_total = nullptr);
 #ifdef CHUNKDB_FAILPOINTS
     // Runs between a chunk's read without the cache and its chunk lock.
     static void SetExpiryDecideHookForTests(void (*hook)()) noexcept;

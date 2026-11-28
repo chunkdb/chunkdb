@@ -602,6 +602,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_expiry_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_expiry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     add_test(NAME expiry COMMAND chunkdb_expiry_test)
+    if(NOT WIN32)
+        add_test(NAME expiry_crash COMMAND chunkdb_expiry_test --crash)
+        set_tests_properties(expiry_crash PROPERTIES TIMEOUT 60)
+    endif()
+    set_tests_properties(expiry PROPERTIES TIMEOUT 60)
     add_executable(chunkdb_check_constraint_test tests/check_constraint_tests.cpp)
     target_link_libraries(chunkdb_check_constraint_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_check_constraint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1506,6 +1511,7 @@ if(CHUNKDB_BUILD_TESTS)
         txn_concurrency
         docs_check
         alter_column
+        expiry
         schema_check
         txn_read_only
         user_admission
@@ -1538,6 +1544,9 @@ if(CHUNKDB_BUILD_TESTS)
         commit_group_coordinator_crash
         recover_table
     )
+    if(NOT WIN32)
+        list(APPEND CHUNKDB_CRASH_TESTS expiry_crash)
+    endif()
 
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_SMOKE_TESTS server_tls_error_queue)

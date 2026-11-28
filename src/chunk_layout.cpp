@@ -106,9 +106,6 @@ void ChunkLayout::StampCommitTime(std::span<const std::uint8_t> before_payload,
     if (commit_time_columns_.empty()) return;
     std::array<std::uint8_t, 8> time{};
     for (std::size_t i = 0; i < time.size(); ++i) time[i] = static_cast<std::uint8_t>(commit_time_ms >> (8U * i));
-    const auto stamped = [this](std::size_t fixed) {
-        return std::find(commit_time_columns_.begin(), commit_time_columns_.end(), fixed) != commit_time_columns_.end();
-    };
     // A chunk without state reads as zero bytes.
     std::vector<std::uint8_t> zero;
     if (before_payload.size() < payload_bytes_) {
@@ -131,10 +128,9 @@ void ChunkLayout::StampCommitTime(std::span<const std::uint8_t> before_payload,
             ReadValueBits(payload->data(), first, now.data(), column.width);
             return was != now;
         };
-        bool other = !BitOrZero(before_presence, block) || (block < var_changed.size() && var_changed[block]);
-        for (std::size_t fixed = 0; !other && fixed < fixed_.size(); ++fixed)
-            other = !stamped(fixed) && differs(fixed_[fixed]);
-        if (!other) continue;
+        const bool block_changed = !BitOrZero(before_presence, block) || (block < var_changed.size() && var_changed[block]) ||
+            std::any_of(fixed_.begin(), fixed_.end(), differs);
+        if (!block_changed) continue;
         for (const auto fixed : commit_time_columns_) {
             // A value the commit gives the column itself stays.
             if (differs(fixed_[fixed])) continue;

@@ -76,7 +76,7 @@ KILL CONNECTION id
 ## Notes
 
 There is no native HTTP metrics endpoint.
-The expiry metrics also have a `table` label, and appear only for each table with an `expire_column` ([Expiry](TABLES.md#expiry)), also while the table is not serving.
+The expiry metrics have a `table` label and appear for each serving table with an `expire_column` ([Expiry](TABLES.md#expiry)) and each fenced table whose last serving configuration had one.
 `chunkdb_expiry_lag_seconds` is the time since the start of the table's last completed expiry sweep: every block whose time was at or before that start has been deleted, unless a write set that time after the sweep passed its chunk.
 Until a sweep completes, it counts from when expiry started on the table: the server start, the `expire_column` change, or the RENAME TO, SWAP TABLES, RESTORE TABLE or RECOVER TABLE that serves it.
 `chunkdb_expired_blocks_total` counts the blocks expiry deleted and `chunkdb_expiry_failed_passes_total` its passes that failed, which the log names; both start at zero then too.

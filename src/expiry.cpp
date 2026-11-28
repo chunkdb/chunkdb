@@ -51,7 +51,7 @@ void ChunkStore::SetExpiryDecideHookForTests(void (*hook)()) noexcept {
 #endif
 
 ExpiryPass ChunkStore::ExpireBlocks(std::uint32_t column_id, bool has_cursor, ChunkCoord cursor,
-    std::size_t max_chunks, std::uint64_t now_ms) {
+    std::size_t max_chunks, std::uint64_t now_ms, std::atomic<std::uint64_t>* deleted_total) {
     if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
     ThrowIfDurabilityPoisoned();
     const auto& layout = geometry_.layout();
@@ -68,7 +68,10 @@ ExpiryPass ChunkStore::ExpireBlocks(std::uint32_t column_id, bool has_cursor, Ch
     for (const auto& coord : page.coords) {
         CheckStatementCancellation();
         ++pass.chunks;
-        pass.deleted += ExpireChunkBlocks(coord, *column, now_ms);
+        const auto deleted = ExpireChunkBlocks(coord, *column, now_ms);
+        pass.deleted += deleted;
+        if (deleted_total != nullptr && deleted != 0U)
+            deleted_total->fetch_add(deleted, std::memory_order_relaxed);
     }
     pass.more = page.more;
     if (!page.coords.empty()) pass.next = page.coords.back();
