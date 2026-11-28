@@ -976,7 +976,7 @@ void TestScanChunks() {
     assert((box == std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}, {1, 0}}) && !box_more);
     const auto [ball, ball_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA AROUND -1 1 RADIUS 1"));
     assert((ball == std::vector<std::pair<std::int64_t, std::int64_t>>{{-1, 2}}) && !ball_more);
-    const auto [paged, paged_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA -1 0 TO 1 2 LIMIT 1 AFTER -1 2"));
+    const auto [paged, paged_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA 0 0 TO 1 1 LIMIT 1 AFTER -1 1"));
     assert((paged == std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}}) && paged_more);
     ExpectError(f.Run("SCAN CHUNKS FROM world AREA 0 0 0 TO 1 1 1"), "coordinate dimensions differ");
     ExpectError(f.Run("SCAN CHUNKS FROM nowhere"), "NO_TABLE");

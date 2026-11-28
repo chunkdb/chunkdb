@@ -109,7 +109,7 @@ SHOW TABLE STATS table
 - `AFTER`: exclude this position and all earlier positions in coordinate order.
 - `LIMIT`: requested cells per area page, or maximum positions per scan page; scans default to at most 1024.
 - `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).
-- `AREA`: in SCAN CHUNKS, list only the chunks inside the range or ball, in the same order, without reading chunks outside it.
+- `AREA`: in SCAN CHUNKS, list only the chunks inside the range or ball, in the same order.
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WHERE`: keep only blocks for which a [condition](../CQL.md#conditions) is true; see [Filter a scan](#filter-a-scan).
 - `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
@@ -237,10 +237,11 @@ position = 3
 retained_deletion_floor = 0
 ```
 
-With SINCE, which then requires WITH DATA, a scan lists every identity changed after the revision: a form of the matching blocks, or null when no block matches or the chunk was deleted.
+With SINCE, which then requires WITH DATA, a scan lists every identity in its area that changed after the revision, or every changed identity when the scan covers the whole table.
+Each row includes a form of the matching blocks, or null when no block matches or the chunk was deleted.
 A consumer that replaces each listed chunk with that form, or drops the chunk on null, holds exactly the matching blocks.
 
-To follow a filtered scan, start WATCH AFTER the first page's `epoch` and `position` as in [Resume a consumer](../FEED_RESUME.md) and apply the same condition to each change's blocks.
+To follow a filtered scan, start WATCH AFTER the first page's `epoch` and `position` as in [Resume a consumer](../FEED_RESUME.md), keep the scan's area when specified, and apply the same condition to each change's blocks.
 This converges when the condition reads only the block's own columns, EXISTS and positions.
 A change to a chunk column carries no blocks, so a condition on `chunk.column` needs the chunk read again with GET CHUNK when that column changes; a condition with NOW() selects at the time of each statement.
 
@@ -263,6 +264,7 @@ A server started with `--max-area-response-bytes` of at least `required` returns
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
 A SCAN CHUNKS AFTER may lie outside its AREA; the page starts at the first chunk of the area after it.
 SCAN CHUNKS runs inside a [BEGIN READ ONLY](TRANSACTION_STATEMENTS.md) transaction without SINCE: its pages list the chunks populated at the snapshot and report the snapshot's revision as `position`.
+On a server started with `--read-only`, SCAN CHUNKS can read chunks outside its AREA while building or refreshing the table's coordinate index.
 
 An empty page still provides a continuation when requested cells remain:
 

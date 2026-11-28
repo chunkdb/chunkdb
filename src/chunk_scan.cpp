@@ -97,9 +97,8 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* sna
         page.after = last;
         return finish();
     };
-    // The candidates after a coordinate. Inside an area, one run of
-    // consecutive cells at a time; a seek passes over cells and runs with no
-    // indexed coordinate, so a page costs its cells, not the table.
+    // The candidates after a coordinate. Inside an area, seek through one
+    // column at a time and skip gaps with no indexed coordinate.
     const auto candidates_after = [&](bool has_after, ChunkCoord after, std::size_t count) {
         if (area == nullptr)
             return snapshot != nullptr ? index->SnapshotPage(has_after, after, count, snapshot->version())
