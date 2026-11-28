@@ -414,6 +414,12 @@ void ScanWhere() {
     assert(reply.starts_with("%6\r\n" + rows({{2, kept}}) + last));
     reply = f.Run("SCAN CHUNKS FROM t AFTER 2 0 LIMIT 1 WHERE a > 2");
     assert(reply.starts_with("%6\r\n" + rows({}) + last));
+    // The area skips the matching chunk at 0 0. WHERE rejects 1 0, but it
+    // still uses the first page's limit and supplies its continuation.
+    reply = f.Run("SCAN CHUNKS FROM t AREA 1 0 TO 3 0 WHERE a > 2 LIMIT 1");
+    assert(reply.starts_with("%6\r\n" + rows({}) + "$4\r\nmore\r\n#t\r\n$5\r\nafter\r\n*2\r\n:1\r\n:0\r\n"));
+    reply = f.Run("SCAN CHUNKS FROM t AREA 1 0 TO 3 0 AFTER 1 0 WHERE a > 2");
+    assert(reply.starts_with("%6\r\n" + rows({{2, kept}}) + last));
     // NULL and false skip a block; chunk columns, positions and parameters.
     assert(f.Run("SCAN CHUNKS FROM t WHERE NOT (name = 'x')").starts_with("%6\r\n" + rows({}) + last));
     assert(f.Run("SCAN CHUNKS FROM t WHERE name IS NULL").starts_with("%6\r\n" + rows({{0, zero_version}, {1, skipped}, {2, kept}}) + last));
@@ -442,6 +448,13 @@ void ScanWhere() {
     reply = f.Run("SCAN CHUNKS FROM t SINCE " + std::to_string(meta) + " WHERE a > 2 WITH DATA");
     assert(reply.starts_with("%6\r\n$6\r\nchunks\r\n*2\r\n*4\r\n:0\r\n:0\r\n:" + std::to_string(zero_version) + "\r\n$"));
     assert(reply.find("*4\r\n:2\r\n:0\r\n:" + std::to_string(deleted) + "\r\n_\r\n") != std::string::npos);
+    // SINCE excludes the unchanged chunk at 1 0 and the area excludes 3 0.
+    reply = f.Run("SCAN CHUNKS FROM t AREA 0 0 TO 2 0 SINCE " + std::to_string(skipped) + " WITH DATA");
+    assert(reply.starts_with("%5\r\n$6\r\nchunks\r\n*2\r\n*4\r\n:0\r\n:0\r\n:" + std::to_string(zero_version) + "\r\n$"));
+    assert(reply.find("*4\r\n:2\r\n:0\r\n:" + std::to_string(deleted) + "\r\n_\r\n$4\r\nmore\r\n#f\r\n") != std::string::npos);
+    forms = ScanForms(geometry, reply);
+    assert(forms.size() == 2U && forms[0] && !forms[1]);
+    assert(forms[0]->presence_bitmap == std::vector<std::uint8_t>{0x0B});
     {
         auto lease = f.catalog->Require("t")->Acquire();
         lease->store().CheckpointForTests(0, 0);
