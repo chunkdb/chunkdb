@@ -1,13 +1,25 @@
 // RESTORE TABLE into a running catalog, SWAP TABLES and ALTER TABLE ... RENAME
 // TO (docs/design/RESTORE_TABLE.md).
+#include <algorithm>
 #include <new>
 #include <stop_token>
 
 #include "feed_slots.hpp"
+#include "feature_flags.hpp"
 #include "migrations_records.hpp"
 #include "restore_table_test_utils.hpp"
 #include "statement_control.hpp"
 #include "txn_test_utils.hpp"
+
+namespace chunkdb {
+struct BackupTestAccess {
+    static bool CanActivateFeature(TableCatalog& catalog) {
+        if (!catalog.feature_metadata_gate_.try_lock()) return false;
+        catalog.feature_metadata_gate_.unlock();
+        return true;
+    }
+};
+}
 
 namespace {
 using namespace chunkdb;
@@ -64,6 +76,42 @@ void KeepsTheBackedUpName() {
     const auto result = catalog.RestoreTable(request);
     const auto table = catalog.Require("t");
     assert(table->store_id() == result.epoch && result.epoch != source.epoch);
+    assert(table->Acquire()->store().GetBlockBits(8, 0) == "00000011");
+}
+
+void RestoreKeepsOwnerStableDuringRewrite() {
+    Source source;
+    auto config = source.Config();
+    config.data_dir = source.root / "destination";
+    { TableCatalog initialized(config); }
+    auto directory = *ReadDataDirManifest(config.data_dir);
+    directory.features.incompat &= ~kFeatureCommitGroups;
+    directory.commit_owner.reset();
+    AtomicWrite(DataDirManifestPath(config.data_dir), SerializeDataDirManifest(directory), true, true);
+    assert(std::filesystem::remove(config.data_dir / "chunkdb.groups.owner"));
+    TableCatalog catalog(config);
+
+    bool rewrite_checked = false;
+    struct ResetObserver { ~ResetObserver() { SetDirectorySyncObserverForTests({}); } } reset_observer;
+    SetDirectorySyncObserverForTests([&](const auto& path) {
+        if (path.parent_path().filename() != ".chunkdb.staging") return;
+        const auto manifest = ReadStoreManifest(path);
+        if (manifest && manifest->store_id != source.epoch) {
+            assert(!BackupTestAccess::CanActivateFeature(catalog));
+            rewrite_checked = true;
+        }
+    });
+    auto request = source.Request();
+    request.progress = [&](std::uint64_t files, std::uint64_t, std::uint64_t, std::uint64_t) {
+        if (files == 0U) assert(catalog.EnableFeature("commit_groups"));
+    };
+    const auto restored = catalog.RestoreTable(request);
+    assert(rewrite_checked);
+    const auto scope = ReadDataDirManifest(config.data_dir)->commit_owner;
+    assert(scope && scope != ReadDataDirManifest(source.backup)->commit_owner);
+    assert(ReadStoreManifest(config.data_dir / "tables" / request.name)->commit_owner == scope);
+    const auto table = catalog.Require(request.name);
+    assert(table->store_id() == restored.epoch);
     assert(table->Acquire()->store().GetBlockBits(8, 0) == "00000011");
 }
 
@@ -263,6 +311,41 @@ void DamagedBackups() {
         std::filesystem::create_symlink(moved, wal);
     }, "unsafe backup entry");
 #endif
+}
+
+void RefusesDamagedBackupOwner() {
+    RefusesDamagedBackup([](const auto& copy) {
+        auto record = ReadBackupRecord(copy);
+        const auto entry = std::find_if(record.files.begin(), record.files.end(),
+            [](const auto& file) { return file.relative_path == kDataDirManifestFileName; });
+        assert(entry != record.files.end());
+        entry->crc32 ^= 1U;
+        AtomicWrite(copy / kBackupMarkerName, SerializeBackupRecord(record), true, true);
+    }, "backup inventory checksum mismatch: chunkdb.manifest");
+    RefusesDamagedBackup([](const auto& copy) {
+        assert(std::filesystem::remove(copy / "chunkdb.groups.owner"));
+    }, "claimed owner is not initial INACTIVE generation one");
+    RefusesDamagedBackup([](const auto& copy) {
+        auto record = ReadBackupRecord(copy);
+        assert(std::erase_if(record.files, [](const auto& file) { return file.relative_path == "chunkdb.groups.owner"; }) == 1U);
+        AtomicWrite(copy / kBackupMarkerName, SerializeBackupRecord(record), true, true);
+    }, "backup inventory is missing the canonical commit owner");
+    RefusesDamagedBackup([](const auto& copy) {
+        auto record = ReadBackupRecord(copy);
+        const auto owner = std::find_if(record.files.begin(), record.files.end(),
+            [](const auto& file) { return file.relative_path == "chunkdb.groups.owner"; });
+        assert(owner != record.files.end());
+        owner->crc32 ^= 1U;
+        AtomicWrite(copy / kBackupMarkerName, SerializeBackupRecord(record), true, true);
+    }, "backup inventory checksum or length mismatch: chunkdb.groups.owner");
+    RefusesDamagedBackup([](const auto& copy) {
+        auto directory = *ReadDataDirManifest(copy);
+        CommitOwnerRoot owner;
+        owner.scope = *directory.commit_owner;
+        owner.generation = 2U;
+        const auto bytes = SerializeCommitOwnerRoot(owner);
+        AtomicWrite(copy / "chunkdb.groups.owner", {bytes.begin(), bytes.end()}, true, true);
+    }, "claimed owner is not initial INACTIVE generation one");
 }
 
 void InjectedFailures() {
@@ -756,8 +839,10 @@ void RenameStatementStops() {
 int main() {
     RestoresIntoNewName();
     KeepsTheBackedUpName();
+    RestoreKeepsOwnerStableDuringRewrite();
     Refusals();
     DamagedBackups();
+    RefusesDamagedBackupOwner();
     InjectedFailures();
     RecoverLeavesRunningRestore();
     Cancellation();

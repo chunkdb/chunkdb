@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "commit_group_owner_format.hpp"
 
 namespace chunkdb {
 
@@ -26,6 +27,7 @@ struct FeatureActivationJournal {
     StoreId data_dir_id{};
     std::uint32_t feature = 0U;
     std::vector<FeatureActivationTarget> tables;
+    std::optional<CommitOwnerScope> commit_owner{};
     friend bool operator==(const FeatureActivationJournal&, const FeatureActivationJournal&) = default;
 };
 
@@ -39,7 +41,9 @@ void WriteFeatureActivationJournal(const std::filesystem::path& root, const Feat
 void ValidateFeatureInventory(const std::filesystem::path& root, const StoreId& directory_id,
     const std::vector<FeatureActivationTarget>& tables);
 void ValidateFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal);
-void CompleteFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal);
-void RecoverFeatureActivation(const std::filesystem::path& root, AccessMode access_mode);
+void CompleteFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal,
+    const ProcessLock* exclusive_lock = nullptr);
+void RecoverFeatureActivation(const std::filesystem::path& root, AccessMode access_mode,
+    const ProcessLock* exclusive_lock = nullptr);
 
 }  // namespace chunkdb

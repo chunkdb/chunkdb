@@ -50,7 +50,7 @@ void FilteredSlots() {
     Fixture fixture;
     fixture.manifest.features.incompat |= kFeatureSlotFilters;
     Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest));
-    const FeedSlotFilters healthy{.area = FeedArea{{-1, -2}, {4, 5}}, .column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
+    const FeedSlotFilters healthy{.areas = {FeedArea{{-1, -2}, {4, 5}}}, .column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
     const FeedSlotFilters missing{.column_ids = std::vector<std::uint32_t>{UINT32_MAX}};
     WriteFeedSlotRecords(fixture.Table(), {fixture.manifest.store_id, 3U,
         {{"healthy", 1U, false, healthy}, {"schema_lost", 2U, true, missing, true}}});

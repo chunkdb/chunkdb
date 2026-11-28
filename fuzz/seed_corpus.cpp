@@ -74,16 +74,22 @@ int main(int argc, char** argv) {
     const auto& geometry = fuzz::Model(1U);
     StoreManifest manifest{kKnownFeatures, geometry.config(), fuzz::kId,
         EncodeTableOptions(TableOptions{}), geometry.layout().schema()};
+    // The commit_groups bit in kKnownFeatures requires the owner scope it binds.
+    const CommitOwnerScope owner{fuzz::kId, {17U}, CommitOwnerRole::kCatalog};
+    manifest.commit_owner = owner;
     const auto before = SerializeStoreManifest(manifest);
     Fixture("manifest", "table", before);
-    Fixture("manifest", "directory", SerializeDataDirManifest({kKnownFeatures, fuzz::kId, {}}));
+    Fixture("manifest", "directory", SerializeDataDirManifest({kKnownFeatures, fuzz::kId, {}, owner}));
     Fixture("slots", "active-lost", SerializeFeedSlotRecords(
         {fuzz::kId, 987U, {{"consumer_1", 123U, false}, {"lost", 456U, true}}}));
     Fixture("slots", "owned-filtered", SerializeFeedSlotRecords({fuzz::kId, 987U,
-        {{"owned", 123U, false, {.area = FeedArea{{-1, -2}, {3, 4}}, .column_ids = std::vector<std::uint32_t>{2U, 1U}}, false, "bot"},
+        {{"owned", 123U, false, {.areas = {FeedArea{{-1, -2}, {3, 4}}}, .column_ids = std::vector<std::uint32_t>{2U, 1U}}, false, "bot"},
          {"unowned", 456U, false}}}));
     Fixture("slots", "owned-space", SerializeFeedSlotRecords({fuzz::kId, 987U,
-        {{"space", 123U, false, {.area = FeedArea{{-1, -2, -3}, {3, 4, 5}, 3U}, .chunks = true}, false, "bot"}}, true, 3U}));
+        {{"space", 123U, false, {.areas = {FeedArea{{-1, -2, -3}, {3, 4, 5}, 3U}}, .chunks = true}, false, "bot"}}, true, 3U}));
+    Fixture("slots", "several-areas", SerializeFeedSlotRecords({fuzz::kId, 987U,
+        {{"one", 123U, false, {.areas = {FeedArea{{5, 5}, {6, 6}}}}},
+         {"several", 456U, false, {.areas = {FeedArea{{-4, -4}, {-3, -3}}, FeedArea{{0, 0}, {1, 1}}}}}}}));
     const MigrationRecord record{"set_options", 1234U, "admin", "ALTER TABLE default SET checkpoint_updates = 512"};
     const auto ledger = EncodeMigrationRecords(fuzz::kId, {record});
     Fixture("migrations", "ledger", ledger);

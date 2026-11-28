@@ -22,7 +22,8 @@ namespace chunkdb {
 // Isolated deterministic hook, like the transaction pause points. Tests must
 // install it before starting writers and retain it until the feed stops.
 struct FeedTestHook {
-    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge, kBeforeMergeDrain, kBeforeResume, kAfterResume, kBeforeLingerPause };
+    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge, kBeforeMergeDrain, kBeforeResume, kAfterResume,
+        kBeforeLingerPause, kBeforeProjectionJoin };
     virtual ~FeedTestHook() = default;
     virtual void Run(Point point, std::uint64_t revision) = 0;
 };
@@ -183,6 +184,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     [[nodiscard]] bool HasError() const;
     void Fail(std::exception_ptr error);
     void Send();
+    // Under mutex_: puts a filtered reader into the projection group of its
+    // filters, at its position; `released` holds what other groups trimmed.
+    void JoinGroup(FeedSubscription& subscription, bool chunks, FeedProjectionGroup::Released& released);
     void Merge(std::uint64_t watermark);
     void Append(std::shared_ptr<const FeedEntry> entry, std::size_t bytes, RawWrite* consumed = nullptr,
                 bool notify = true);

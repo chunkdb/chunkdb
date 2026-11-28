@@ -19,13 +19,14 @@ Both statements are refused inside a transaction and on a `--read-only` server.
 The restored table gets a new epoch; its lineage records the backed-up epoch and the backup cut as parent epoch and fork revision.
 Its clock restarts at the cut's successor, and every chunk keeps its committed revision, commit time and deletion floor.
 Retained slots get the new epoch at the cut, with no archived history, exactly as the offline restore does.
-The table must have `table_lineage`, and its table-owned feature bits must equal the directory's; otherwise the copy is removed and nothing is published.
+The table must have `table_lineage` and match the directory's table-owned feature bits apart from `commit_groups`, which follows the destination owner.
 SWAP keeps each table's epoch: identity travels with the data, and only the name that reaches it changes.
 The 2.0 plan asked for new epochs on both tables; that would rewrite every file of both, and would end the exact-fork resume of a restored table, while a name reaching another epoch already makes its consumers resume by lineage or resync.
 
 ## Building and publication
 
 The restore copies only the table's inventory files into a private directory under `.chunkdb.staging`, the place CREATE TABLE builds tables.
+Before copying, it checks the source directory manifest and any claimed INACTIVE owner root against the backup inventory.
 Each copied file's length and CRC must match the backup inventory, and the table directory in the backup must hold exactly those files, all regular.
 The copy is then checked against its cut like a backup inventory check, rebound to the new identity with the offline restore's code, verified like `chunkdb_verify`, and synced.
 Rebinding drops a column narrowing, DROP NULL check or ADD CHECK that the backup caught running: it belonged to the backed-up table, and the restored schema is the one before it.
@@ -36,7 +37,8 @@ A failure before the rename removes the private directory; a crash before it lea
 The catalog records the private directory while the restore runs, so RECOVER TABLE of the same name, which removes the interrupted operations of that name, leaves it alone.
 A failure after the rename that leaves the table unopened moves it out again, or fences its name until RECOVER TABLE.
 The backup is only read; a backup that changes while it is copied fails the checksum check.
-The feature check runs after the copy and again at publication, under the feature metadata gate held shared until the table serves, so a feature cannot be enabled in between.
+After copying, the restore takes the feature metadata gate shared and checks the destination features and scope before rewriting the staged table.
+It holds that gate through verification, sync, publication and serving admission so feature activation cannot change the chosen owner.
 The copy itself holds no catalog gate, so other DDL, backups and feature activation proceed while it runs.
 
 ## Cancellation and progress

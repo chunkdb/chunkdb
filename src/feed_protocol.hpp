@@ -40,10 +40,6 @@ std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnVal
 std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
     const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after);
 std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::shared_ptr<const std::string>& form);
-// A slot filter area as a list: empty or one area.
-inline std::span<const FeedArea> FeedAreas(const std::optional<FeedArea>& area) noexcept {
-    return area ? std::span<const FeedArea>(&*area, 1U) : std::span<const FeedArea>{};
-}
 // True when `areas` is empty or one of them holds chunk `coord`.
 bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord);
 // The indexes in `columns` of the projected column `ids`, in their order, as FilterFeedEntry and ChunkFeedEntry

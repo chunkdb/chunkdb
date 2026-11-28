@@ -39,6 +39,7 @@ bool CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // sync) left the target already updated. Throws on any failure; if
 // `out_replaced` is false after a throw, the target file is unchanged.
 // Published files are readable and writable by their owner alone.
+// The optional crash failpoint ends the process before the directory sync.
 void AtomicWrite(
     const std::filesystem::path& path,
     const std::vector<std::uint8_t>& bytes,
@@ -47,7 +48,8 @@ void AtomicWrite(
     bool* out_replaced = nullptr,
     const char* after_rename_failpoint = nullptr,
     bool enable_generic_failpoints = true,
-    void (*before_replace)() = nullptr);
+    void (*before_replace)() = nullptr,
+    const char* after_replace_crash_failpoint = nullptr);
 void AtomicWriteStream(
     const std::filesystem::path& path, const AtomicFileProducer& produce,
     bool fsync_file, bool fsync_directory, bool* out_replaced = nullptr,

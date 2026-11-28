@@ -9,11 +9,13 @@
 #include <system_error>
 
 #include "checkpoint.hpp"
+#include "chunkdb/logging.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "verify.hpp"
 #include "migrations_records.hpp"
 #include "wal_replay.hpp"
@@ -150,7 +152,8 @@ void RewriteRetainedIndex(const std::filesystem::path& directory, const Geometry
 }
 } // namespace
 StoreId RebindRestoredTable(const std::filesystem::path& directory, const BackupTableCut& cut,
-    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled) {
+    const std::vector<std::filesystem::path>& files, const std::optional<CommitOwnerScope>& owner,
+    const BackupCancel& cancelled) {
     const auto check_cancelled = [&] { if (cancelled.stop_requested()) throw std::runtime_error("backup cancelled"); };
     auto manifest = *ReadStoreManifest(directory);
     RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
@@ -210,6 +213,11 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
     // belongs to the backed-up table, not to this one.
     manifest.schema = WithoutPendingNarrowing(manifest.schema);
     manifest.store_id = new_epoch;
+    // The table joins the destination directory's owner. Only INACTIVE
+    // owners exist in this build, so no grouped artifact refers to the old one.
+    manifest.commit_owner = owner;
+    if (owner) manifest.features.incompat |= kFeatureCommitGroups;
+    else manifest.features.incompat &= ~kFeatureCommitGroups;
     manifest.lineage = TableLineage{old_epoch, cut.revision};
     AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
@@ -264,7 +272,9 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadWrite);
         const auto old_directory_id = directory_manifest.data_dir_id;
         const auto migrations = ReadMigrationRecords(temporary);
-        directory_manifest.data_dir_id = NewStoreId();
+        if (directory_manifest.commit_owner)
+            directory_manifest = CommitOwnerBootstrap::RewriteInactiveRestore(temporary, record);
+        else directory_manifest.data_dir_id = NewStoreId();
         if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
         AtomicWrite(DataDirManifestPath(temporary), SerializeDataDirManifest(directory_manifest), true, true);
         if (std::filesystem::exists(temporary / kMigrationsFileName))
@@ -276,7 +286,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                 auto relative = file.relative_path.lexically_relative(prefix);
                 if (!relative.empty() && relative.begin()->string() != "..") files.push_back(std::move(relative));
             }
-            cut.epoch = RebindRestoredTable(temporary / prefix, cut, files);
+            cut.epoch = RebindRestoredTable(temporary / prefix, cut, files, directory_manifest.commit_owner);
         }
         std::erase_if(record.files, [&](const auto& file) { return !std::filesystem::exists(temporary / file.relative_path); });
         for (auto& file : record.files) file = InspectBackupFile(temporary, file.relative_path);
@@ -295,6 +305,17 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_PARENT_SYNC_ONCE");
         CompleteBackupGuard(target, kRestoreIncompleteName, "RESTORE");
         // No cleanup or fallible callback follows the completion point.
+    } catch (const CommitOwnerRestoreOwnershipError&) {
+        // The detected replacement is not our private tree to clean up.
+        // Retain the guard/name and preserve the original ownership failure.
+        try {
+            LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                "restore kept its private copy because the copy no longer admits its name",
+                {{"path", temporary.string()}});
+        } catch (const std::exception&) {
+            // The log line is best effort; the ownership failure is reported.
+        }
+        throw;
     } catch (const std::exception& failure) {
         if (!moved) {
             const auto error = RemoveBackupTemporaryTree(temporary);

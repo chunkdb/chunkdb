@@ -55,6 +55,8 @@ struct ServerConnection : public std::enable_shared_from_this<ServerConnection> 
     bool waiting_credit = false, waiting_line_credit = false, control_request = false, framing_started = false;
     std::size_t payload_credit_bytes = 0U;
     std::shared_ptr<ConnectionRecord> record = std::make_shared<ConnectionRecord>();
+    // The I/O thread's poller token while it owns the connection; that thread alone uses it.
+    std::uint64_t io_token = 0U;
     bool worker_queued = false;
     bool irreversible_reply = false;
     // A statement its worker parsed, started and published; it runs next.
@@ -107,6 +109,8 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         // here; `held` is a push read after them that waits for their frame.
         FeedChunksMerge merge;
         std::shared_ptr<const FeedEntry> held;
+        // A successful WATCH AREA reply waiting behind these old-area pushes.
+        std::shared_ptr<const std::string> area_reply{};
     };
     void Run();
     void WakeCatchUp() noexcept;

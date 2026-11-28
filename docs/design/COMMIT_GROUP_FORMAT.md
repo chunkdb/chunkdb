@@ -2,7 +2,7 @@
 
 This layout implements the pure record admission required by [#136](https://github.com/chunkdb/chunkdb/issues/136) and the [commit group contract](COMMIT_GROUPS.md).
 It publishes no files and grants no recovery, durability or feature activation by itself.
-It is planned and not active in this build: the `commit_groups` feature is not registered, so no store admits these records.
+It is planned and not active in this build: owners stay INACTIVE, so no store admits these records.
 When groups are activated, the owner admits the feature and complete directory, table and WAL contexts before acting on these records.
 All integers are little-endian, signed coordinates use their two's-complement bits, and identities contain 16 bytes.
 Every reserved byte is zero and every codec requires the exact complete extent.

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <charconv>
 #include <stdexcept>
+#include <tuple>
 #include <limits>
 #include <type_traits>
 namespace chunkdb {
@@ -405,6 +406,13 @@ std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
 std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::shared_ptr<const std::string>& form) {
     // The array header, the coordinates and version, then the form as a bulk string or a null.
     return 4U + 3U * (static_cast<std::size_t>(dims) + 1U) + (form ? form->size() + 5U : 3U);
+}
+void SortFeedAreas(std::vector<FeedArea>& areas) {
+    std::sort(areas.begin(), areas.end(), [](const FeedArea& a, const FeedArea& b) {
+        return std::tie(a.first.x, a.first.y, a.first.z, a.last.x, a.last.y, a.last.z) <
+            std::tie(b.first.x, b.first.y, b.first.z, b.last.x, b.last.y, b.last.z);
+    });
+    areas.erase(std::unique(areas.begin(), areas.end()), areas.end());
 }
 bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord) {
     return InArea(coord, dims, areas);

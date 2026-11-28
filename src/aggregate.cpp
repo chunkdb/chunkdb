@@ -1,6 +1,8 @@
 #include "aggregate.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -48,6 +50,24 @@ void AppendWide(std::string& out, __int128 value) {
     if (negative) out += '-';
     out.append(digits.data() + at, digits.size() - at);
     out += "\r\n";
+}
+
+// The bits of `block`'s value of `fixed`, lowest bit first, as ReadValueBits
+// and DecodeColumnValue read them; the value's bits lie inside its column's
+// array, at most 9 bytes for 64 bits.
+[[nodiscard]] std::uint64_t RawValue(
+    const std::uint8_t* payload, const ChunkLayout::FixedColumn& fixed, std::size_t block) noexcept {
+    const std::size_t bit = fixed.values * 8U + block * fixed.width;
+    const std::uint8_t* at = payload + bit / 8U;
+    const auto shift = static_cast<unsigned>(bit % 8U);
+    const std::size_t bytes = (shift + fixed.width + 7U) / 8U;
+    std::uint64_t low = 0U;
+    for (std::size_t i = 0U; i < std::min<std::size_t>(bytes, 8U); ++i)
+        low |= static_cast<std::uint64_t>(at[i]) << (8U * i);
+    auto raw = low >> shift;
+    // A ninth byte holds bits only when the value starts inside the first.
+    if (bytes > 8U) raw |= static_cast<std::uint64_t>(at[8]) << (64U - shift);
+    return fixed.width >= 64U ? raw : raw & ((std::uint64_t{1} << fixed.width) - 1U);
 }
 
 }  // namespace
@@ -99,22 +119,25 @@ void Aggregator::AddValue(Accumulator& accumulator, const std::uint8_t* payload,
     const auto& fixed = *accumulator.fixed;
     if (fixed.validity != ChunkLayout::kNoValidity && ((payload[fixed.validity + block / 8U] >> (block % 8U)) & 1U) == 0U)
         return;
-    std::array<std::uint8_t, 8U> bytes{};
-    ReadValueBits(payload, fixed.values * 8U + block * fixed.width, bytes.data(), fixed.width);
-    const auto value = DecodeColumnValue(*accumulator.column, bytes.data());
+    // Read in place: no copy of the value's bits and no decoded value.
+    const auto raw = RawValue(payload, fixed, block);
+    const auto type = accumulator.column->type.kind;
     const auto kind = accumulator.function.kind;
     const bool first = accumulator.values == 0U;
     ++accumulator.values;
     if (accumulator.floating) {
-        const double number = std::holds_alternative<float>(value) ? static_cast<double>(std::get<float>(value))
-                                                                    : std::get<double>(value);
+        const double number = type == ColumnKind::kFloat32
+            ? static_cast<double>(std::bit_cast<float>(static_cast<std::uint32_t>(raw))) : std::bit_cast<double>(raw);
         if (kind == Kind::kSum || kind == Kind::kAvg) accumulator.number += number;
         else if (first || (kind == Kind::kMin ? Less(number, accumulator.number) : Less(accumulator.number, number)))
             accumulator.number = number;
         return;
     }
-    const __int128 integer = std::holds_alternative<std::uint64_t>(value)
-        ? static_cast<__int128>(std::get<std::uint64_t>(value)) : static_cast<__int128>(std::get<std::int64_t>(value));
+    // A signed value extends its top bit, as DecodeColumnValue does.
+    const bool negative = type == ColumnKind::kSigned && fixed.width < 64U && ((raw >> (fixed.width - 1U)) & 1U) != 0U;
+    const auto bits = negative ? raw | ~((std::uint64_t{1} << fixed.width) - 1U) : raw;
+    const __int128 integer = type == ColumnKind::kSigned
+        ? static_cast<__int128>(static_cast<std::int64_t>(bits)) : static_cast<__int128>(bits);
     if (kind == Kind::kSum || kind == Kind::kAvg) {
         if (__builtin_add_overflow(accumulator.integer, integer, &accumulator.integer))
             throw std::out_of_range(cql::AggregateFunctionName(accumulator.function) +

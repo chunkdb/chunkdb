@@ -30,6 +30,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
 #include "test_utils.hpp"
+#include "catalog_test_utils.hpp"
 #include "wal_replay.hpp"
 #include "wal_writer.hpp"
 
@@ -615,16 +616,17 @@ void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
     ScopedTempDir dir("chunkdb-wal-damage-before-end");
     const auto table_dir = dir.path() / "tables" / "default";
     const auto config = StoreConfig(table_dir, chunkdb::DurabilityMode::kFsyncWal);
+    auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(config);
+    catalog_config.data_dir = dir.path();
     {
-        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(config);
-        catalog_config.data_dir = dir.path();
         chunkdb::TableCatalog catalog(catalog_config);
+        (void)chunkdb::test::CreateBitsTable(catalog, kGeometryConfig);
     }
     const auto wal_path = chunkdb::ChunkWalPath(table_dir, kGeometry, {0, 0});
     {
-        chunkdb::ChunkStore store(config);
-        store.SetBlockBits(0, 0, "11110000");
-        store.SetBlockBits(1, 0, "00001111");
+        chunkdb::test::OwnedTableStore owner(catalog_config, "default");
+        owner.store().SetBlockBits(0, 0, "11110000");
+        owner.store().SetBlockBits(1, 0, "00001111");
     }
     auto wal = ReadFile(wal_path);
     wal[chunkdb::kWalHeaderSize + kFrameHeader + 9] ^= 0x01U;  // first frame's payload byte
@@ -644,18 +646,18 @@ void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
     // Exercise read-only replay before a failed writer admission leaves the
     // snapshot generation fenced for recovery.
     expect_refused([&] {
-        auto read_only = config;
+        auto read_only = catalog_config;
         read_only.access_mode = chunkdb::AccessMode::kReadOnly;
-        chunkdb::ChunkStore store(read_only);
-        (void)store.GetBlockBits(1, 0);
+        chunkdb::test::OwnedTableStore owner(read_only, "default");
+        (void)owner.store().GetBlockBits(1, 0);
     }, "rejected WAL");
     expect_refused([&] {
-        chunkdb::ChunkStore store(config);
-        (void)store.GetBlockBits(1, 0);
+        chunkdb::test::OwnedTableStore owner(catalog_config, "default");
+        (void)owner.store().GetBlockBits(1, 0);
     }, "damaged before its end");
     expect_refused([&] {
-        chunkdb::ChunkStore store(config);
-        (void)store.ScanPopulatedChunks(false, {}, 10);
+        chunkdb::test::OwnedTableStore owner(catalog_config, "default");
+        (void)owner.store().ScanPopulatedChunks(false, {}, 10);
     }, "damaged before its end");
 
     std::string output;

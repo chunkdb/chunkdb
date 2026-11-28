@@ -516,6 +516,16 @@ void CatalogOperationJournal() {
     std::filesystem::create_directories(dropped);
     std::filesystem::rename(fixture.root / "tables/default", dropped / journal.operation_name);
     assert(CatalogOperationMoved(fixture.root, journal));
+    // Matching the moved table's identity is insufficient if it belongs to another owner.
+    const auto moved_manifest = dropped / journal.operation_name / kStoreManifestFileName;
+    auto foreign_owner = fixture.table;
+    assert(foreign_owner.commit_owner);
+    foreign_owner.commit_owner->owner_id = NewStoreId();
+    Save(moved_manifest, SerializeStoreManifest(foreign_owner));
+    Reject([&] { RecoverMigrations(fixture.root, AccessMode::kReadWrite); });
+    assert(ReadMigrationJournal(fixture.root) && LoadFile(fixture.root / kUsersFileName) == users_before);
+    assert(fixture.Verify().second.find("migration_pending_invalid") != std::string::npos);
+    Save(moved_manifest, fixture.before);
     recover_moved(users_before, dropped);
     assert(!ReadMigrationJournal(fixture.root));
     assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_after);

@@ -1086,7 +1086,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 15);
+    Protocol::AppendArrayHeader(reply, 19);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1102,6 +1102,10 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "watch_catalog");
+    Protocol::AppendBulk(reply, "slot_areas");
+    Protocol::AppendBulk(reply, "scan_area");
+    Protocol::AppendBulk(reply, "watch_area_replace");
+    Protocol::AppendBulk(reply, "block_selection");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
