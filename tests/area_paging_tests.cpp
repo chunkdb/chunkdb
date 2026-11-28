@@ -12,6 +12,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "area_reply.hpp"
 #include "sectioned_chunk_form.hpp"
 #include "test_utils.hpp"
 
@@ -466,7 +467,53 @@ void LargestGeometryWithinBound(bool three) {
 }
 }  // namespace
 
+// A page admits cells by the measured framing sizes: each equals the size of
+// the framing as built, at every digit-count boundary and at the extremes.
+void MeasuredFramingSizes() {
+    std::vector<std::uint64_t> unsigned_values{0U, std::numeric_limits<std::uint64_t>::max(),
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()),
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1U};
+    for (std::uint64_t power = 1U; power <= 10000000000000000000ULL; power *= 10U) {
+        unsigned_values.insert(unsigned_values.end(), {power - 1U, power, power + 1U});
+        if (power > std::numeric_limits<std::uint64_t>::max() / 10U) break;
+    }
+    std::vector<std::int64_t> signed_values{std::numeric_limits<std::int64_t>::min(),
+        std::numeric_limits<std::int64_t>::min() + 1, std::numeric_limits<std::int64_t>::max()};
+    for (const auto value : unsigned_values) {
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) continue;
+        signed_values.push_back(static_cast<std::int64_t>(value));
+        signed_values.push_back(-static_cast<std::int64_t>(value));
+    }
+    for (const auto value : unsigned_values) {
+        std::string integer, header;
+        Protocol::AppendInteger(integer, value);
+        Protocol::AppendArrayHeader(header, static_cast<std::size_t>(value));
+        assert(detail::RespUnsignedBytes(value) == integer.size() && integer.size() == header.size());
+        for (const bool with_schema : {false, true})
+            for (const bool paged : {false, true}) {
+                assert(detail::AreaReplyPrefixBytes(with_schema, value, paged, 3U) ==
+                    detail::AreaReplyPrefix(with_schema, value, paged, 3U).size());
+                assert(detail::AreaReplyPrefixBytes(with_schema, 7U, paged, static_cast<std::size_t>(value)) ==
+                    detail::AreaReplyPrefix(with_schema, 7U, paged, static_cast<std::size_t>(value)).size());
+            }
+    }
+    for (const auto value : signed_values) {
+        std::string integer;
+        Protocol::AppendInteger(integer, value);
+        assert(detail::RespIntegerBytes(value) == integer.size());
+    }
+    for (std::size_t at = 0U; at + 2U < signed_values.size(); ++at) {
+        const ChunkCoord coord{signed_values[at], signed_values[at + 1U], signed_values[at + 2U]};
+        for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}})
+            for (const bool paged : {false, true})
+                for (const bool more : {false, true})
+                    assert(detail::AreaReplySuffixBytes(paged, more, coord, dims) ==
+                        detail::AreaReplySuffix(paged, more, coord, dims).size());
+    }
+}
+
 int main() {
+    MeasuredFramingSizes();
     EmptyProgressAndCompatibility();
     ThreeDimensionsAndProjection();
     ExactResponseBounds();

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <future>
 #include <limits>
+#include <new>
 #include <string_view>
 #include <thread>
 
@@ -618,6 +619,117 @@ void SeveralAreasShareOneProjection() {
     assert(txn_test::ThrowsAs<std::invalid_argument>([&] { (void)table->SubscribeFeed({.areas = {low, FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}}}); }));
 }
 
+void FailedChunkProjectionJoinKeepsCaptureMode() {
+    class FailJoin final : public FeedTestHook {
+      public:
+        void Run(Point point, std::uint64_t) override {
+            if (point == Point::kBeforeProjectionJoin) throw std::bad_alloc();
+        }
+    } fail_join;
+    ScopedTempDir dir("chunkdb-feed-failed-projection-join");
+    TableCatalog catalog(Config(dir.path()));
+    auto table = CreateDefault(catalog);
+    auto ordinary = table->SubscribeFeed();
+    FeedTestAccess::SetHook(*table, &fail_join);
+    const bool failed = txn_test::ThrowsAs<std::bad_alloc>([&] { (void)table->SubscribeFeed({.chunks = true}); });
+    FeedTestAccess::SetHook(*table, nullptr);
+    assert(failed);
+
+    auto lease = table->Acquire();
+    auto& store = lease->store();
+    store.SetBlock(0, 0, {{"bits", BitsValue{Bits(1U)}}});
+    const auto entry = Next(*ordinary);
+    assert(entry->kind == FeedEntry::Kind::kChange && !entry->chunk_forms_complete);
+}
+
+// WATCH AREA on a watching session replaces the areas of its watch after the
+// position it answers, and the watch then shares the projection of its new
+// filters; a refused replacement keeps the areas, and a full WATCH stays refused.
+void ReplaceWatchAreas() {
+    ScopedTempDir dir("chunkdb-feed-replace-areas");
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](const std::string& statement) { assert(engine.Execute(session, statement + "\r\n")[0] != '-'); };
+    run("CREATE TABLE t (n u8) CHUNK 2 x 2");
+    auto table = catalog->Find("t");
+    const FeedArea low{{0, 0}, {0, 0}}, high{{2, 2}, {2, 2}};
+    auto other = table->SubscribeFeed({.areas = {high}});
+    SessionState watching;
+    (void)engine.Execute(watching, "HELLO 3\r\n");
+    const auto none = engine.Execute(watching, "WATCH AREA 0 0 TO 0 0\r\n");
+    assert(none.starts_with("-ERR INVALID_ARGUMENT") && none.find("no watch is open") != std::string::npos);
+    assert(engine.Execute(watching, "WATCH t AREA 0 0 TO 0 0\r\n")[0] == '%');
+    run("SET BLOCK 0 0 IN t n = 1");
+    const auto first = Next(*watching.watch);
+    assert(first->blocks.size() == 1U && first->blocks[0].chunk == low.first);
+    const auto replaced = engine.Execute(watching, "WATCH AREA 2 2 TO 2 2\r\n");
+    assert(replaced[0] == '%' && replaced.ends_with("$8\r\nrevision\r\n:" + std::to_string(first->position.revision) + "\r\n"));
+    const auto* open = watching.watch.get();
+    assert(engine.Execute(watching, "WATCH AREA 0 0 0 TO 0 0 0\r\n").starts_with("-ERR INVALID_ARGUMENT"));
+    assert(engine.Execute(watching, "WATCH t AREA 0 0 TO 0 0\r\n").starts_with("-ERR INVALID_ARGUMENT"));
+    assert(watching.watch.get() == open);
+    run("BEGIN");
+    run("SET BLOCK 0 0 IN t n = 2");
+    run("SET BLOCK 4 4 IN t n = 3");
+    run("COMMIT");
+    const auto second = Next(*watching.watch);
+    assert(second->blocks.size() == 1U && second->blocks[0].chunk == high.first);
+    assert(Next(*other) == second);
+}
+
+// Areas replaced while writes flow: the watch keeps the old area through the
+// answered revision and the new one after it, and another watch of the old
+// area, its former group, still receives every change of that area.
+void ReplaceWatchAreasWhileWriting() {
+    ScopedTempDir dir("chunkdb-feed-replace-areas-writes");
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](SessionState& on, const std::string& statement) {
+        const auto reply = engine.Execute(on, statement + "\r\n");
+        assert(reply[0] != '-');
+        return reply;
+    };
+    const auto revision = [](const std::string& reply) { return std::stoull(reply.substr(reply.rfind(':') + 1U)); };
+    run(session, "CREATE TABLE t (n u8) CHUNK 2 x 2");
+    auto table = catalog->Find("t");
+    const FeedArea low{{0, 0}, {0, 0}}, high{{2, 2}, {2, 2}};
+    auto peer = table->SubscribeFeed({.areas = {low}});
+    SessionState watching;
+    (void)engine.Execute(watching, "HELLO 3\r\n");
+    assert(engine.Execute(watching, "WATCH t AREA 0 0 TO 0 0\r\n")[0] == '%');
+    constexpr int kWrites = 200;
+    std::thread writer([&] {
+        SessionState writes;
+        (void)engine.Execute(writes, "HELLO 3\r\n");
+        // Each area's value changes on every write, so each write is one change.
+        for (int i = 0; i < kWrites; ++i)
+            (void)run(writes, std::string("SET BLOCK ") + (i % 2 == 0 ? "0 0" : "4 4") + " IN t n = " + std::to_string(i / 2 + 1));
+    });
+    std::vector<std::shared_ptr<const FeedEntry>> entries;
+    for (int i = 0; i < 10; ++i) entries.push_back(Next(*watching.watch));
+    const auto replaced = revision(engine.Execute(watching, "WATCH AREA 2 2 TO 2 2\r\n"));
+    writer.join();
+    const auto last_high = revision(run(session, "SET BLOCK 4 4 IN t n = 255"));
+    const auto last_low = revision(run(session, "SET BLOCK 0 0 IN t n = 255"));
+    while (entries.back()->position.revision < last_high) entries.push_back(Next(*watching.watch));
+    assert(entries.back()->position.revision == last_high);
+    for (const auto& entry : entries) {
+        assert(entry->kind == FeedEntry::Kind::kChange && entry->blocks.size() == 1U);
+        assert(entry->blocks[0].chunk == (entry->position.revision <= replaced ? low.first : high.first));
+    }
+    std::size_t low_changes = 0U;
+    for (auto entry = Next(*peer);; entry = Next(*peer)) {
+        assert(entry->kind == FeedEntry::Kind::kChange && entry->blocks.size() == 1U && entry->blocks[0].chunk == low.first);
+        ++low_changes;
+        if (entry->position.revision == last_low) break;
+    }
+    assert(low_changes == static_cast<std::size_t>(kWrites / 2 + 1));
+}
+
 // A projection group keeps an item only while another member must still read
 // it, within its share of the feed budget and above the ring floor; an item
 // that is the ring entry itself does not outlive the ring.
@@ -825,6 +937,9 @@ int main(int argc, char** argv) {
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
     SeveralAreasShareOneProjection();
+    FailedChunkProjectionJoinKeepsCaptureMode();
+    ReplaceWatchAreas();
+    ReplaceWatchAreasWhileWriting();
     ProjectionGroupBounds();
     ProjectionGroupsShareTheBudget();
     ProjectionGroupFreesOutsideRing();

@@ -367,6 +367,10 @@ class CommandEngine {
     // `*`, or MANAGES USERS when the watch shows users: PERMISSION_DENIED, or
     // AUTH_REQUIRED once the user was dropped.
     [[nodiscard]] static std::string LostCatalogWatchReply(bool user_dropped);
+    // WATCH AREA ... on a connection that watches: the open watch without
+    // SLOT keeps a chunk inside any of `areas` from its next push on. The
+    // reply is `{epoch, revision}`, the last position read with the old areas.
+    [[nodiscard]] static std::string ReplaceWatchAreas(SessionState& session, const std::vector<FeedArea>& areas);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }

@@ -73,14 +73,17 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, and `block_selection`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, `slot_areas`, `scan_area`, `watch_area_replace`, and `block_selection`.
 Options become visible only after authentication succeeds.
 The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 The `watch_catalog` feature permits WATCH CATALOG and its `catalog` events.
-The `block_selection` feature permits the BLOCKS selection in GET, AGGREGATE and SCAN CHUNKS, the AREA and AROUND selections in SCAN CHUNKS, and WHERE in GET AREA and GET BLOCKS.
+The `slot_areas` feature permits several areas in CREATE SLOT and adds `areas` to the SHOW SLOTS filters.
+The `scan_area` feature permits SCAN CHUNKS with AREA or AREA AROUND.
+The `watch_area_replace` feature permits WATCH AREA on a streaming table watch without SLOT.
+The `block_selection` feature permits the BLOCKS selection in GET, AGGREGATE and SCAN CHUNKS and WHERE in GET AREA and GET BLOCKS.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -168,8 +171,8 @@ Never-written chunks and identities forgotten by tombstone compaction have null 
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
 Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
-With WHERE or a selection, the map adds `after` after `more` with the last chunk coordinate counted toward the page limit, or null when `more` is false.
-In a selected scan this cursor can lie outside the selection because the limit also counts candidates within the selection's x range that it excludes.
+With WHERE or BLOCKS, the map adds `after` after `more` with the last chunk coordinate counted toward the page limit, or null when `more` is false.
+With BLOCKS this cursor can lie outside the selected region because the limit also counts excluded candidates within its chunk x range.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
@@ -269,7 +272,10 @@ One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
 AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.
 
-Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
+Only UNWATCH, WATCH AREA, and ACK on a slot watch are accepted while streaming; another statement receives PROTOCOL and closes.
+WATCH AREA replaces the areas of a table watch without SLOT and replies `{epoch, revision}` after the pushes sent with the old areas, including buffered CHUNKS pushes.
+Later pushes carry changes after that revision in the new areas, as described in [feed statements](reference/FEED.md#returns).
+If the watch needs to resync while draining the old areas, the reply precedes the resync.
 Lines sent after WATCH before its reply are read by the stream the same way.
 UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
 ACK has no success reply and cannot exceed the last fully sent change, progress push or accepted start position.

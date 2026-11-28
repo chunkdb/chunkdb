@@ -4,6 +4,7 @@
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
 #include "backup.hpp"
+#include "chunk_vars_storage.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -551,6 +552,26 @@ template <typename Operation> bool Stops(Operation operation) {
     catch (const StatementStoppedError&) { return true; }
     return false;
 }
+void LoadedChunkBytesCountsRetainedBuffers() {
+    test::ScopedTempDir dir("chunkdb-loaded-chunk-bytes");
+    ChunkStore store(Config(dir.path(), DurabilityMode::kFsyncWal));
+    store.SetBlockBits(0, 0, "1000");
+    const auto resident = FeatureActivationTestAccess::Resident(store);
+    const auto fixed = sizeof(*resident) + resident->payload.capacity() + resident->presence_bitmap.capacity() +
+        resident->wal_batch.capacity();
+    const auto scratch = resident->scratch_before.capacity();
+    assert(scratch != 0U);
+    assert(store.LoadedChunkBytes() == fixed + scratch);
+    {
+        std::unique_lock lock(resident->mutex);
+        resident->vars.reserve(2U, 128U);
+    }
+    // An empty variable section can still retain both backing allocations.
+    assert(resident->vars.encoded_size() == 0U);
+    const auto vars = detail::ChunkVarsStorageAccess::BufferAllocationBytes(resident->vars);
+    assert(vars >= 128U + 2U * sizeof(std::uint32_t));
+    assert(store.LoadedChunkBytes() == fixed + scratch + vars);
+}
 // Chunk model statements wait for a contended chunk lock with their stop, and
 // stop at each chunk of a three-axis area, an identity scan and a read-only
 // coordinate index rebuild, even where no chunk lock is taken.
@@ -578,6 +599,7 @@ void ChunkModelStatementsStop() {
         };
         stops([&] { (void)store.TransformChunkState({0, 0, 0}, std::nullopt, false, [](ChunkState& state) { state.payload[0] = 2U; }); });
         stops([&] { (void)store.GetBlockWithVersion3DAt(*snapshot, 0, 0, 0); });
+        stops([&] { (void)store.LoadedChunkBytes(); });
         resident->mutex.unlock();
         assert(store.GetBlockBits3D(0, 0, 0) == "1000");
         StatementControl control(StatementControl::Clock::now(), 0U);
@@ -683,6 +705,7 @@ int main(int argc, char** argv) {
     CancellationInterruptsBackupAdmission();
     CheckpointFilesWaitStops();
     CheckpointBacklogWaitStopsOrResumes();
+    LoadedChunkBytesCountsRetainedBuffers();
     ChunkModelStatementsStop();
     ChunkModelCatalogAdmissionStops();
     TombstoneCompactionEntersItsDecision();

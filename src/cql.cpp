@@ -589,20 +589,14 @@ class Parser {
     bool FeedFilter(Filters& filters) {
         const auto column = Peek().column;
         if (Accept("area")) {
-            if constexpr (requires { filters.areas; }) {
-                if (!filters.areas.empty()) Fail(column, "AREA is given twice");
+            if (!filters.areas.empty()) Fail(column, "AREA is given twice");
+            filters.areas.push_back(FeedBounds());
+            while (AcceptToken(TokenKind::kComma)) {
+                const auto next = Peek().column;
+                Expect("area");
+                if (filters.areas.size() == kMaxFeedAreas) Fail(next, "a watch or slot takes at most 64 areas");
                 filters.areas.push_back(FeedBounds());
-                while (AcceptToken(TokenKind::kComma)) {
-                    const auto next = Peek().column;
-                    Expect("area");
-                    if (filters.areas.size() == kMaxFeedAreas) Fail(next, "a watch takes at most 64 areas");
-                    filters.areas.push_back(FeedBounds());
-                    if (filters.areas.back().dims != filters.areas.front().dims) Fail(next, "AREA dimensions differ");
-                }
-            } else {
-                if (filters.area) Fail(column, "AREA is given twice");
-                filters.area = FeedBounds();
-                if (Peek().kind == TokenKind::kComma) Fail(Peek().column, "a slot takes one AREA");
+                if (filters.areas.back().dims != filters.areas.front().dims) Fail(next, "AREA dimensions differ");
             }
         } else if (Accept("columns")) {
             if (filters.columns) Fail(column, "COLUMNS is given twice");
@@ -734,7 +728,7 @@ class Parser {
     }
 
     // After AREA, or BLOCKS with `blocks`: a TO b, or for AREA also AROUND c
-    // RADIUS r, into `out` (GetArea, Aggregate or Selection).
+    // RADIUS r, into `out` (GetArea or Aggregate).
     template <typename Out>
     void SelectionBody(Out& out, bool blocks) {
         out.blocks = blocks;
@@ -1511,6 +1505,12 @@ class Parser {
                 watch.catalog = true;
                 return watch;
             }
+            // WATCH AREA ... replaces the areas of an open watch. No option starts
+            // with a coordinate, so WATCH area ... still watches a table named area.
+            if (IsKeyword(Peek(), "area") && PeekSecond().kind == TokenKind::kInteger) {
+                (void)FeedFilter(watch);
+                return watch;
+            }
             watch.table = Name("a table name");
             while (true) {
                 const auto column = Peek().column;
@@ -1553,6 +1553,22 @@ class Parser {
             Expect("from");
             ScanChunks scan;
             scan.table = Name("a table name");
+            if (Accept("area")) {
+                scan.has_area = true;
+                auto& area = scan.area;
+                area.around = Accept("around");
+                area.dims = Point(area.first.x, area.first.y, area.first.z, true);
+                if (area.around) {
+                    Expect("radius");
+                    area.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+                } else {
+                    Expect("to");
+                    if (Point(area.last.x, area.last.y, area.last.z, true) != area.dims)
+                        Fail(1, "AREA endpoints have different dimensions");
+                    if (area.first.x > area.last.x || area.first.y > area.last.y || area.first.z > area.last.z)
+                        Fail(1, "AREA bounds are reversed");
+                }
+            }
             while (true) {
                 const auto column = Peek().column;
                 if (Accept("after")) {
@@ -1576,16 +1592,21 @@ class Parser {
                 } else if (Accept("where")) {
                     if (scan.where) Fail(column, "WHERE is given twice");
                     scan.where = Where();
-                } else if (const bool area = Accept("area"); area || Accept("blocks")) {
-                    if (scan.selection) Fail(column, "AREA or BLOCKS is given twice");
-                    SelectionBody(scan.selection.emplace(), !area);
+                } else if (Accept("blocks")) {
+                    if (scan.has_area || scan.blocks) Fail(column, "AREA or BLOCKS is given twice");
+                    auto& blocks = scan.blocks.emplace();
+                    blocks.dims = Point(blocks.first.x, blocks.first.y, blocks.first.z);
+                    Expect("to");
+                    if (Point(blocks.last.x, blocks.last.y, blocks.last.z) != blocks.dims)
+                        Fail(1, "BLOCKS endpoints have different dimensions");
                 } else break;
             }
-            if (scan.selection && scan.after && scan.selection->dims != scan.dims)
+            if (scan.after && ((scan.has_area && scan.area.dims != scan.dims) ||
+                                  (scan.blocks && scan.blocks->dims != scan.dims)))
                 Fail(1, "the AFTER cursor and the selection have different dimensions");
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
             if (scan.where && scan.since && !scan.with_data) Fail(1, "WHERE with SINCE requires WITH DATA");
-            if (scan.selection && scan.selection->blocks && scan.since && !scan.with_data)
+            if (scan.blocks && scan.since && !scan.with_data)
                 Fail(1, "BLOCKS with SINCE requires WITH DATA");
             return scan;
         }

@@ -41,6 +41,8 @@ struct FeedArea {
     std::uint8_t dims = 2;
     friend bool operator==(const FeedArea&, const FeedArea&) = default;
 };
+// Orders `areas` and removes repeats: one set of areas has one order.
+void SortFeedAreas(std::vector<FeedArea>& areas);
 
 struct FeedOptions {
     std::optional<FeedPosition> after{};
@@ -123,6 +125,10 @@ class FeedSubscription {
     // nullptr if nothing is available before timeout. kEnd is delivered once.
     [[nodiscard]] std::shared_ptr<const FeedEntry> Next(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+    // Keeps a chunk inside any of `areas` in the entries read after the
+    // returned position, which is the last one read; a slot reader cannot.
+    // The reader calls it, between reads.
+    [[nodiscard]] FeedPosition SetAreas(std::vector<FeedArea> areas);
 
   private:
     friend class ChangeFeed;

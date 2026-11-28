@@ -692,10 +692,6 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_returning_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_returning_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME returning_writes COMMAND chunkdb_returning_test)
-    add_executable(chunkdb_block_selection_test tests/block_selection_tests.cpp)
-    target_link_libraries(chunkdb_block_selection_test PRIVATE chunkdb_core)
-    target_include_directories(chunkdb_block_selection_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME block_selection COMMAND chunkdb_block_selection_test)
     add_executable(chunkdb_txn_engine_test tests/txn_engine_tests.cpp)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
@@ -777,6 +773,18 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_world_ops_regression_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_world_ops_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME world_ops_regression COMMAND chunkdb_world_ops_regression_test)
+
+    add_executable(chunkdb_version_clock_test tests/version_clock_tests.cpp)
+    target_link_libraries(chunkdb_version_clock_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_version_clock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME version_clock COMMAND chunkdb_version_clock_test)
+    add_test(NAME version_clock_crash COMMAND chunkdb_version_clock_test --crash-boundaries)
+    set_tests_properties(version_clock_crash PROPERTIES TIMEOUT 300)
+
+    add_executable(chunkdb_block_selection_test tests/block_selection_tests.cpp)
+    target_link_libraries(chunkdb_block_selection_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_block_selection_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME block_selection COMMAND chunkdb_block_selection_test)
 
     add_executable(
         chunkdb_read_only_intent_replay_test
@@ -1015,7 +1023,9 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
     target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)
-    target_include_directories(chunkdb_server_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(chunkdb_server_bench_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/bench)
     if(WIN32)
         target_link_libraries(chunkdb_server_bench_test PRIVATE ws2_32)
     endif()
@@ -1286,7 +1296,6 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_cql_engine_test
         chunkdb_conditional_writes_test
         chunkdb_returning_test
-        chunkdb_block_selection_test
         chunkdb_migrations_engine_test
         chunkdb_recover_table_test
         chunkdb_migrations_crash_test
@@ -1322,6 +1331,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_checkpoint_cycle_test
         chunkdb_world_ops_test
         chunkdb_world_ops_regression_test
+        chunkdb_version_clock_test
+        chunkdb_block_selection_test
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
@@ -1460,7 +1471,6 @@ if(CHUNKDB_BUILD_TESTS)
         cql_engine
         conditional_writes
         returning_writes
-        block_selection
         txn_engine
         chunk_write_memory
         crypto
@@ -1488,6 +1498,8 @@ if(CHUNKDB_BUILD_TESTS)
         wal_group_commit
         world_ops
         world_ops_regression
+        version_clock
+        block_selection
         read_only_intent_replay
         security_regression
         server_integration
@@ -1537,6 +1549,7 @@ if(CHUNKDB_BUILD_TESTS)
         commit_owner_artifact_io_crash
         commit_group_coordinator_crash
         recover_table
+        version_clock_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)

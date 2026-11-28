@@ -1,7 +1,6 @@
-// The BLOCKS selection of GET, AGGREGATE and SCAN CHUNKS, WHERE in GET AREA
-// and GET BLOCKS, and AREA, AROUND and BLOCKS in SCAN CHUNKS (#145,
-// docs/DESIGN-2.0.md E4 and E5): forms hold only the blocks that stay, and
-// chunks where none stays are left out.
+// The BLOCKS selection of GET, AGGREGATE and SCAN CHUNKS, and WHERE in GET AREA
+// and GET BLOCKS (#145, docs/DESIGN-2.0.md E4 and E5). Forms hold only the
+// matching blocks, and scans without SINCE omit chunks with no matching blocks.
 
 #include <cassert>
 #include <charconv>
@@ -243,29 +242,29 @@ ScanPage Scan(const std::string& reply) {
 void TestScanSelections() {
     Fixture f;
     Fill(f);
-    auto page = Scan(f.Run("SCAN CHUNKS FROM t AREA 1 0 TO 3 0"));
+    auto page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 4 0 TO 15 3"));
     assert((page.coords == std::vector<ChunkCoord>{{1, 0, 0}, {3, 0, 0}}) && page.after == "_\r\n");
-    page = Scan(f.Run("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1"));
+    page = Scan(f.Run("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1 WHERE EXISTS"));
     assert((page.coords == std::vector<ChunkCoord>{{0, 0, 0}, {1, 0, 0}}));
     page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 6 0 TO 13 0"));
     assert((page.coords == std::vector<ChunkCoord>{{1, 0, 0}, {3, 0, 0}}));
     page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS 8 0 TO 11 3"));
     assert(page.coords.empty());
     // Pages: LIMIT bounds the identities visited; continue AFTER `after`.
-    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 LIMIT 1"));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS -4 -4 TO 15 3 LIMIT 1"));
     assert((page.coords == std::vector<ChunkCoord>{{-1, -1, 0}}) && page.after == "*2\r\n:-1\r\n:-1\r\n");
-    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 AFTER -1 -1 LIMIT 2"));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS -4 -4 TO 15 3 AFTER -1 -1 LIMIT 2"));
     assert((page.coords == std::vector<ChunkCoord>{{0, 0, 0}, {1, 0, 0}}) && page.after == "*2\r\n:1\r\n:0\r\n");
-    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 -1 TO 3 0 AFTER 1 0 LIMIT 2"));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS -4 -4 TO 15 3 AFTER 1 0 LIMIT 2"));
     assert((page.coords == std::vector<ChunkCoord>{{3, 0, 0}}) && page.after == "_\r\n");
     // The first candidate's x is in range, but its y is outside the area.
-    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 0 TO 3 0 LIMIT 1"));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS -4 0 TO 15 3 LIMIT 1"));
     assert(page.coords.empty() && page.after == "*2\r\n:-1\r\n:-1\r\n");
-    page = Scan(f.Run("SCAN CHUNKS FROM t AREA -1 0 TO 3 0 AFTER -1 -1 LIMIT 1"));
+    page = Scan(f.Run("SCAN CHUNKS FROM t BLOCKS -4 0 TO 15 3 AFTER -1 -1 LIMIT 1"));
     assert((page.coords == std::vector<ChunkCoord>{{0, 0, 0}}) && page.after == "*2\r\n:0\r\n:0\r\n");
     // Without a selection the reply keeps its five keys.
     assert(f.Run("SCAN CHUNKS FROM t LIMIT 1").starts_with("%5\r\n"));
-    Error(f.Run("SCAN CHUNKS FROM t AREA 3 0 TO 1 0"), "INVALID_ARGUMENT");
+    Error(f.Run("SCAN CHUNKS FROM t BLOCKS 12 0 TO 4 0"), "INVALID_ARGUMENT");
     Error(f.Run("SCAN CHUNKS FROM t BLOCKS 0 0 0 TO 1 1 1"), "INVALID_ARGUMENT");
 }
 

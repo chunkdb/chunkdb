@@ -1,6 +1,7 @@
 #include "typed_chunk_form.hpp"
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -84,15 +85,18 @@ std::size_t MetadataBytes(const Geometry& geometry, const std::shared_ptr<const 
     return ValidateChunkColumns(geometry.chunk_schema(), metadata ? Span(metadata->bytes) : Span{});
 }
 
-void AddVar(Bytes& output, VarKey key, Span value, std::size_t bound) {
-    if (output.size() > bound || kVarEntryHeaderBytes > bound - output.size() ||
-        value.size() > bound - output.size() - kVarEntryHeaderBytes)
+// Appends one variable entry to the section that starts at `begin` in `output`.
+void AddVar(Bytes& output, std::size_t begin, VarKey key, Span value, std::size_t bound) {
+    const auto used = output.size() - begin;
+    if (used > bound || kVarEntryHeaderBytes > bound - used || value.size() > bound - used - kVarEntryHeaderBytes)
         Invalid("variable storage exceeds chunk limit");
     Put32(output, key.column_id);
     Put32(output, key.block_index);
     Put32(output, static_cast<std::uint32_t>(value.size()));
     output.insert(output.end(), value.begin(), value.end());
 }
+
+void AddVar(Bytes& output, VarKey key, Span value, std::size_t bound) { AddVar(output, 0U, key, value, bound); }
 
 struct EncodingPlan {
     std::shared_ptr<const ChunkColumnState> metadata;
@@ -148,53 +152,72 @@ std::vector<std::uint8_t> EncodeSectionedChunkState(
         Invalid("chunk form exceeds its byte limit");
     const auto& layout = geometry.layout();
     const auto blocks = geometry.ChunkBlockCount();
-    Bytes fixed, validity, descriptors;
-    fixed.reserve(plan.fixed_size); validity.reserve(plan.validity_size); descriptors.reserve(4U + 24U * plan.count);
-    Put32(descriptors, static_cast<std::uint32_t>(plan.count));
-    for (const auto index : plan.indexes) {
-        const auto& column = layout.schema().columns[index];
-        const auto* span = layout.FixedColumnAt(index);
-        if (span == nullptr) continue;
-        const auto length = (blocks * span->width + 7U) / 8U;
-        Put32(descriptors, column.id);
-        Put32(descriptors, span->width);
-        Put32(descriptors, static_cast<std::uint32_t>(fixed.size()));
-        Put32(descriptors, static_cast<std::uint32_t>(length));
-        Put32(descriptors, column.nullable ? static_cast<std::uint32_t>(validity.size()) : 0U);
-        Put32(descriptors, column.nullable ? static_cast<std::uint32_t>(state.presence_bitmap.size()) : 0U);
-        const auto values = Span(state.payload).subspan(span->values, length);
-        fixed.insert(fixed.end(), values.begin(), values.end());
-        if (column.nullable) {
-            const auto nulls = Span(state.payload).subspan(span->validity, state.presence_bitmap.size());
-            validity.insert(validity.end(), nulls.begin(), nulls.end());
-        }
-    }
-    Bytes vars;
-    vars.reserve(plan.variable_size);
-    for (const auto entry : state.vars) if (plan.selected_vars.contains(entry.key.column_id))
-        AddVar(vars, entry.key, entry.value, max_variable_bytes);
-    std::vector<ChunkFormSection> sections{{static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence), state.presence_bitmap}};
-    const auto add = [&](ChunkFormSectionKind kind, Span body) {
-        if (!body.empty()) sections.push_back({static_cast<std::uint16_t>(kind), body});
+    const Span payload(state.payload);
+    const auto presence_size = state.presence_bitmap.size();
+    const auto metadata_size = plan.metadata ? plan.metadata->bytes.size() : 0U;
+    // Each body is written straight into the form, in section order, so the
+    // chunk's bytes are copied once.
+    std::array<ChunkFormSectionLength, 7U> sections{};
+    std::size_t section_count = 0U;
+    const auto add = [&](ChunkFormSectionKind kind, std::size_t length) {
+        if (length != 0U) sections[section_count++] = {static_cast<std::uint16_t>(kind), length};
     };
-    add(ChunkFormSectionKind::kFixedValues, fixed);
-    add(ChunkFormSectionKind::kNullBits, validity);
-    add(ChunkFormSectionKind::kVariableValues, vars);
-    if (plan.metadata) add(ChunkFormSectionKind::kChunkColumns, plan.metadata->bytes);
-    add(ChunkFormSectionKind::kBlockSpans, descriptors);
-    Bytes scale_body;
-    if (scale != nullptr) {
-        Put32(scale_body, scale->factor);
-        // reduction:u16, then the reserved zero u16.
-        Put32(scale_body, static_cast<std::uint32_t>(scale->reduction));
-        add(ChunkFormSectionKind::kScale, scale_body);
-    }
+    sections[section_count++] = {static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence), presence_size};
+    add(ChunkFormSectionKind::kFixedValues, plan.fixed_size);
+    add(ChunkFormSectionKind::kNullBits, plan.validity_size);
+    add(ChunkFormSectionKind::kVariableValues, plan.variable_size);
+    add(ChunkFormSectionKind::kChunkColumns, metadata_size);
+    add(ChunkFormSectionKind::kBlockSpans, 4U + 24U * plan.count);
+    // scale:u32, reduction:u16, then the reserved zero u16.
+    if (scale != nullptr) add(ChunkFormSectionKind::kScale, 8U);
     ChunkFormHeader header;
     header.flags = static_cast<std::uint16_t>((projection.empty() ? 0U : kChunkFormProjected) |
                                              (private_state ? kChunkFormPrivate : 0U));
     header.schema_version = layout.schema().version;
     if (!private_state) { header.chunk_version = state.version; header.commit_time_ms = state.commit_time_ms; }
-    return SerializeChunkFormSections(header, sections, max_form_bytes);
+    Bytes out;
+    const auto total = AppendChunkFormHead(&out, header, std::span(sections.data(), section_count), max_form_bytes);
+    out.insert(out.end(), state.presence_bitmap.begin(), state.presence_bitmap.end());
+    for (const auto index : plan.indexes) {
+        const auto* span = layout.FixedColumnAt(index);
+        if (span == nullptr) continue;
+        const auto values = payload.subspan(span->values, (blocks * span->width + 7U) / 8U);
+        out.insert(out.end(), values.begin(), values.end());
+    }
+    for (const auto index : plan.indexes) {
+        const auto* span = layout.FixedColumnAt(index);
+        if (span == nullptr || !layout.schema().columns[index].nullable) continue;
+        const auto nulls = payload.subspan(span->validity, presence_size);
+        out.insert(out.end(), nulls.begin(), nulls.end());
+    }
+    const auto vars_begin = out.size();
+    for (const auto entry : state.vars) if (plan.selected_vars.contains(entry.key.column_id))
+        AddVar(out, vars_begin, entry.key, entry.value, max_variable_bytes);
+    if (metadata_size != 0U) out.insert(out.end(), plan.metadata->bytes.begin(), plan.metadata->bytes.end());
+    Put32(out, static_cast<std::uint32_t>(plan.count));
+    std::size_t fixed_at = 0U, validity_at = 0U;
+    for (const auto index : plan.indexes) {
+        const auto& column = layout.schema().columns[index];
+        const auto* span = layout.FixedColumnAt(index);
+        if (span == nullptr) continue;
+        const auto length = (blocks * span->width + 7U) / 8U;
+        Put32(out, column.id);
+        Put32(out, span->width);
+        Put32(out, static_cast<std::uint32_t>(fixed_at));
+        Put32(out, static_cast<std::uint32_t>(length));
+        Put32(out, column.nullable ? static_cast<std::uint32_t>(validity_at) : 0U);
+        Put32(out, column.nullable ? static_cast<std::uint32_t>(presence_size) : 0U);
+        fixed_at += length;
+        if (column.nullable) validity_at += presence_size;
+    }
+    if (scale != nullptr) {
+        Put32(out, scale->factor);
+        Put32(out, static_cast<std::uint32_t>(scale->reduction));
+    }
+    // The directory was written from the plan: bodies of other lengths would
+    // misplace every section after them.
+    if (out.size() != total) throw std::logic_error("chunk form bodies differ from their planned lengths");
+    return out;
 }
 
 ChunkState DecodeSectionedChunkState(

@@ -16,6 +16,9 @@ struct FeedSlotTestHook {
     enum class Point { kBeforeFlush, kBeforeSync, kBeforePersist, kAfterRetention, kFeedDisabled, kAfterAckPersist, kAfterDrain };
     virtual ~FeedSlotTestHook() = default;
     virtual void Run(Point point, std::uint64_t captured) = 0;
+    // Only the diagnostic timestamps use this clock.
+    virtual std::chrono::steady_clock::time_point SyncTime(std::chrono::steady_clock::time_point now) const noexcept { return now; }
+    virtual std::chrono::steady_clock::duration AckRetentionElapsed(std::chrono::steady_clock::duration elapsed) noexcept { return elapsed; }
 };
 struct FeedSlotTestAccess {
     static void Sync(Table& table);
@@ -74,9 +77,10 @@ class FeedSlots {
 
   private:
     friend struct FeedSlotTestAccess;
+    struct SyncTiming;
     void Persist(FeedSlotRecords next);
     void Run();
-    bool SyncImpl(std::uint64_t completed);
+    bool SyncImpl(std::uint64_t completed, SyncTiming& timing);
     void RecoverAliases();
     // Archive bytes retained after each written position, from one listing.
     [[nodiscard]] std::vector<std::uint64_t> RetainedBytes(const std::vector<std::uint64_t>& positions) const;

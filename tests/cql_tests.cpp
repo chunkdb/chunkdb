@@ -78,7 +78,7 @@ void TestChunkModelCoordinates() {
     const auto watch = Get<cql::Watch>("WATCH t AREA -1 -2 -3 TO 4 5 6");
     assert(watch.areas.size() == 1U && watch.areas[0].dims == 3U && watch.areas[0].first.z == -3 && watch.areas[0].last.z == 6);
     const auto slot = Get<cql::CreateSlot>("CREATE SLOT 's' ON t AREA 1 2 0 TO 3 4 0");
-    assert(slot.area && slot.area->dims == 3U && slot.area->first.z == 0);
+    assert(slot.areas.size() == 1U && slot.areas[0].dims == 3U && slot.areas[0].first.z == 0);
     ExpectError("GET BLOCK 1 2 9223372036854775808 FROM t", "z is out of range");
     ExpectError("GET CHUNK 1 2 3 4 FROM t", "expected FROM");
     ExpectError("GET AREA 1 2 TO 3 4 5 FROM t", "different dimensions");
@@ -140,10 +140,22 @@ void TestChunkModelScan() {
     ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1", "WHERE with SINCE requires WITH DATA");
     ExpectError("SCAN CHUNKS FROM t BLOCKS 0 0 TO 1 1 SINCE 0", "BLOCKS with SINCE requires WITH DATA");
     const auto area = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA 0 0 TO 1 1 SINCE 0");
-    assert(area.selection && !area.selection->blocks && !area.selection->around && area.since == 0U && !area.with_data);
+    assert(area.has_area && !area.area.around && area.since == 0U && !area.with_data);
     const auto around = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS 1 SINCE 0");
-    assert(around.selection && around.selection->around && around.since == 0U && !around.with_data);
+    assert(around.has_area && around.area.around && around.since == 0U && !around.with_data);
     ExpectError("SCAN CHUNKS FROM t WHERE n = 1 WHERE n = 2", "column 32: WHERE is given twice");
+    // AREA and AREA AROUND follow the table, in chunk coordinates.
+    const auto box = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA -1 2 TO 3 4 SINCE 5 LIMIT 2");
+    assert(box.has_area && !box.area.around && box.area.dims == 2U && box.since == 5U && box.limit == 2U);
+    assert(box.area.first.x == -1 && box.area.first.y == 2 && box.area.last.x == 3 && box.area.last.y == 4);
+    const auto ball = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA AROUND 1 -2 3 RADIUS 4 WITH DATA");
+    assert(ball.has_area && ball.area.around && ball.area.dims == 3U && ball.area.radius == 4 && ball.with_data);
+    assert(ball.area.first.x == 1 && ball.area.first.y == -2 && ball.area.first.z == 3);
+    assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").has_area);
+    ExpectError("SCAN CHUNKS FROM t AREA 3 0 TO 1 0", "AREA bounds are reversed");
+    ExpectError("SCAN CHUNKS FROM t AREA 0 0 TO 1 1 1", "AREA endpoints have different dimensions");
+    ExpectError("SCAN CHUNKS FROM t AREA AROUND 0 0 RADIUS -1", "a radius");
+    ExpectError("SCAN CHUNKS FROM t LIMIT 2 AREA 0 0 TO 1 1", "expected the end");
     ExpectError("SCAN CHUNKS FROM t WHERE", "column 25: expected a value, got the end of the statement");
     ExpectError("SCAN CHUNKS FROM t WHERE n = $2", "parameters must be numbered $1 to $2 without gaps");
     ExpectError("SCAN CHUNKS FROM t WHERE n = 1 n", "expected the end of the statement, got 'n'");
@@ -611,7 +623,7 @@ void TestAlterAndOtherStatements() {
 
 void TestWatch() {
     const auto filtered_create = Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t CHUNKS COLUMNS (b,a) NO BEFORE AREA -4 -3 TO 2 9");
-    assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.area->first.x == -4);
+    assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.areas.at(0).first.x == -4);
     assert(!filtered_create.owner);
     const auto owned = Get<cql::CreateSlot>("CREATE SLOT 's' ON t CHUNKS OWNER bot NO BEFORE");
     assert(owned.owner == "bot" && owned.chunks && owned.no_before);
@@ -657,7 +669,14 @@ void TestWatch() {
     ExpectError("WATCH world AREA 0 0 TO 1 1 AREA 2 2 TO 3 3", "AREA is given twice");
     ExpectError("WATCH world AREA 0 0 TO 1 1, COLUMNS a", "expected AREA");
     ExpectError("WATCH world AREA 0 0 TO 1 1, AREA 0 0 0 TO 1 1 1", "AREA dimensions differ");
-    ExpectError("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3", "a slot takes one AREA");
+    assert(Get<cql::CreateSlot>("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3").areas.size() == 2U);
+    // WATCH AREA without a table replaces the areas of an open watch; a table named area is still watched.
+    const auto replace = Get<cql::Watch>("WATCH AREA 0 0 TO 1 1, AREA -2 -2 TO -1 -1");
+    assert(!replace.catalog && replace.table.empty() && replace.areas.size() == 2U && replace.areas[1].first.x == -2);
+    assert(Get<cql::Watch>("WATCH area").table == "area");
+    const auto named = Get<cql::Watch>("WATCH area AREA 0 0 TO 1 1");
+    assert(named.table == "area" && named.areas.size() == 1U);
+    ExpectError("WATCH AREA 0 0 TO 1 1 COLUMNS a", "expected the end of the statement");
     std::string many = "WATCH world AREA 0 0 TO 0 0";
     for (std::size_t i = 1U; i < chunkdb::kMaxFeedAreas; ++i) many += ", AREA 0 0 TO 0 0";
     assert(Get<cql::Watch>(many).areas.size() == chunkdb::kMaxFeedAreas);
@@ -811,12 +830,12 @@ void TestSelections() {
     assert(!Get<cql::Aggregate>("AGGREGATE AREA 0 0 TO 9 9 FROM t COUNT(*)").blocks);
 
     const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM t BLOCKS 0 0 TO 31 31 WITH DATA AFTER 0 0 LIMIT 5");
-    assert(scan.selection && scan.selection->blocks && !scan.selection->around && scan.selection->x1 == 31);
-    assert(scan.selection->dims == 2U && scan.after && scan.with_data);
-    const auto around = Get<cql::ScanChunks>("SCAN CHUNKS FROM t LIMIT 3 AREA AROUND 1 2 3 RADIUS 4 WHERE a = $1", 1);
-    assert(around.selection && around.selection->around && around.selection->dims == 3U);
-    assert(around.selection->z0 == 3 && around.selection->radius == 4 && around.where);
-    assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").selection);
+    assert(!scan.has_area && scan.blocks && scan.blocks->last.x == 31);
+    assert(scan.blocks->dims == 2U && scan.after && scan.with_data);
+    const auto around = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AREA AROUND 1 2 3 RADIUS 4 LIMIT 3 WHERE a = $1", 1);
+    assert(around.has_area && around.area.around && around.area.dims == 3U);
+    assert(around.area.first.z == 3 && around.area.radius == 4 && around.where);
+    assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").blocks);
     ExpectError("SCAN CHUNKS FROM t AREA 0 0 TO 1 1 BLOCKS 0 0 TO 1 1", "AREA or BLOCKS is given twice");
     ExpectError("SCAN CHUNKS FROM t AREA 0 0 0 TO 1 1 1 AFTER 0 0",
         "the AFTER cursor and the selection have different dimensions");
