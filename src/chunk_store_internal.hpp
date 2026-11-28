@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -198,6 +199,8 @@ void SplitChunkStateBytes(
 // never consulted.
 #ifdef CHUNKDB_FAILPOINTS
 inline constexpr bool kFailpointsCompiled = true;
+// Called just before a barrier tries to take its serialization lock.
+void SetBarrierBeforeLockHookForTests(const std::function<void()>* hook) noexcept;
 #else
 inline constexpr bool kFailpointsCompiled = false;
 #endif

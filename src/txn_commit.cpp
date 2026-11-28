@@ -351,16 +351,32 @@ void ChunkStore::AppendTxnFrameLocked(
         out.open(wal_path, std::ios::binary | std::ios::app);
     }
     if (!out.is_open()) {
-        throw BuildWalOpenError(wal_path, errno);
+        throw BuildWalOpenError(wal_path, out.error());
+    }
+    // A full file system: half of the frame reaches the file, then the write
+    // fails with ENOSPC.
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TXN_APPEND_ENOSPC_ONCE")) {
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size() / 2U));
+        out.flush();
+        throw std::system_error(ENOSPC, std::generic_category(),
+            "injected ENOSPC while appending a transaction frame to WAL " + wal_path.string());
     }
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     out.flush();
     if (!out.good()) {
-        throw std::runtime_error("failed to append a transaction frame to WAL " + wal_path.string());
+        throw std::system_error(out.error(), std::generic_category(),
+            "failed to append a transaction frame to WAL " + wal_path.string());
     }
     out.close();
-    if (out.fail()) {
-        throw std::runtime_error("failed to close WAL " + wal_path.string() + " after a transaction frame");
+    int close_error = out.error();
+    if constexpr (kFailpointsCompiled) {
+        if (close_error == 0 && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TXN_APPEND_CLOSE_ENOSPC_ONCE")) {
+            close_error = ENOSPC;
+        }
+    }
+    if (close_error != 0) {
+        throw std::system_error(close_error, std::generic_category(),
+            "failed to close WAL " + wal_path.string() + " after a transaction frame");
     }
     SyncFilePath(wal_path);
     if (new_wal) {

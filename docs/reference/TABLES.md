@@ -131,8 +131,10 @@ CREATE TABLE, ALTER TABLE ... RENAME TO and RESTORE TABLE also refuse the name `
 | `var_max_chunk_bytes` | Encoded text and bytes per chunk; default 1048576 bytes. |
 | `feed_buffer_bytes` | Live feed history and output; default 67108864 bytes. |
 | `slot_max_bytes` | Retained history per durable slot; default 1073741824 bytes. |
+| `max_disk_bytes` | Bytes the table's files may take before its writes answer `DISK_FULL reason=max_disk_bytes`; unset by default, and `0` removes it. |
 
 Feed and slot limits must be positive.
+DESCRIBE lists `max_disk_bytes` only when the table sets it; see [Server flags](../SERVER_FLAGS.md#disk-space) for when it is checked.
 Unset limits inherit server defaults each time the table opens; explicit table values persist across restarts.
 DESCRIBE reports effective limits; changing another option preserves whether a limit inherits.
 See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaults and ranges.

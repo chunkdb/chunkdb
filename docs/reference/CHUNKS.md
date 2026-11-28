@@ -175,6 +175,7 @@ SHOW TABLE STATS needs READ on the table, or MONITOR.
 `chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
 `cache_bytes` estimates the memory of loaded chunk objects and their retained payload, presence, text and bytes values and offsets, chunk columns, WAL batch, and write scratch buffers.
 Shared chunk-column state is counted for each loaded chunk that references it.
+The server's cache byte limit uses this estimate at each load and checkpoint, while SHOW TABLE STATS measures the current buffers.
 `history_bytes` counts the chunk states kept for open transactions; `open_transactions` counts the open transactions that have used the table; one that a limit ended no longer counts.
 `files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
 Of `disk_bytes`, `image_bytes` and `wal_bytes` count live chunk images and WALs at their canonical coordinate paths.

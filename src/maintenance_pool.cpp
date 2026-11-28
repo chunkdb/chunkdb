@@ -92,10 +92,12 @@ void MaintenancePool::Run() {
         {
             std::lock_guard lock(mutex_);
             task->running_ = false;
-            task->failure_ = failure;
             if (!failure && (more || task->again_)) Enqueue(task);
-            // A waiter may release the last owner reference once it sees the
-            // turn end, so the worker never destroys the callback state.
+            // The task owns the failure: a waiter may release its last
+            // reference once it sees the turn end, so the worker never
+            // destroys the exception the waiter rethrows.
+            task->failure_ = std::move(failure);
+            // Likewise the worker never destroys the callback state.
             task.reset();
         }
         cv_.notify_all();

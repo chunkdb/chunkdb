@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "chunkdb/byte_budget.hpp"
 #include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/backup_gate.hpp"
 #include "chunkdb/area_selector.hpp"
@@ -261,6 +262,9 @@ struct TableOptions {
     // Absent limits inherit the catalog defaults when the table opens.
     std::optional<std::size_t> feed_buffer_bytes{};
     std::optional<std::size_t> slot_max_bytes{};
+    // The most bytes the table's files may take before its writes are
+    // refused with DISK_FULL; absent for no limit.
+    std::optional<std::size_t> max_disk_bytes{};
 };
 
 class StoreResources;
@@ -270,6 +274,34 @@ class MaintenanceTask;
 class ChunkCacheFullError : public std::runtime_error {
   public:
     ChunkCacheFullError() : std::runtime_error("large-chunk cache capacity reached") {}
+};
+
+// A write refused before it changed anything because the disk is nearly full
+// (--min-free-disk-bytes) or the table reached its max_disk_bytes option.
+class DiskFullError : public std::runtime_error {
+  public:
+    DiskFullError(std::string reason, std::vector<std::pair<std::string, std::string>> keys, const std::string& message)
+        : std::runtime_error(message), reason_(std::move(reason)), keys_(std::move(keys)) {}
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+    [[nodiscard]] const std::vector<std::pair<std::string, std::string>>& keys() const noexcept { return keys_; }
+
+  private:
+    std::string reason_;
+    std::vector<std::pair<std::string, std::string>> keys_;
+};
+
+// Byte limits the tables of one server share; zero turns a limit off.
+struct ServerByteLimits {
+    // Memory of the chunks in the cache, as measured when a chunk loads and
+    // at each of its checkpoints; past it eviction runs as past
+    // max_loaded_chunks.
+    std::size_t cache_max_bytes = 0U;
+    // Live change-feed buffers of every table, on top of each table's
+    // feed_buffer_bytes.
+    std::size_t feed_total_bytes = 0U;
+    // Chunk states kept for open transactions in every table, on top of each
+    // table's txn_history_bytes.
+    std::size_t txn_history_total_bytes = 0U;
 };
 class ProcessLock;
 class CommitOwnerContext;
@@ -337,6 +369,8 @@ struct StoreConfig {
     // are then ignored for a shared one.
     // The maintenance worker count also belongs to the shared resources.
     std::shared_ptr<StoreResources> resources = nullptr;
+    // The byte limits of budgets of its own; ignored for shared resources.
+    ServerByteLimits byte_limits{};
     // False when the caller already holds the writer lock of the data
     // directory this store belongs to (a table of a data directory).
     bool acquire_process_lock = true;
@@ -571,9 +605,12 @@ class ConditionFailedError : public std::runtime_error {
 // unknown (any other write error means "not applied").
 class WriteOutcomeUnknownError : public std::runtime_error {
   public:
-    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation };
+    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation, kBarrierSync };
     explicit WriteOutcomeUnknownError(std::string message, Stage stage = Stage::kPublication)
         : std::runtime_error(std::move(message)), stage_(stage) {}
+    WriteOutcomeUnknownError(const WriteOutcomeUnknownError& error, std::shared_ptr<const std::string> table) noexcept
+        : std::runtime_error(error), stage_(error.stage_), table_(std::move(table)) {}
+    [[nodiscard]] std::string_view table() const noexcept { return table_ ? std::string_view(*table_) : std::string_view{}; }
     [[nodiscard]] std::string_view stage() const noexcept {
         switch (stage_) {
             case Stage::kConditionalCommitSync: return "conditional_commit_sync";
@@ -581,12 +618,15 @@ class WriteOutcomeUnknownError : public std::runtime_error {
             case Stage::kTransactionCommitSync: return "transaction_commit_sync";
             case Stage::kSlotRecords: return "slot_records";
             case Stage::kFeatureActivation: return "feature_activation";
+            case Stage::kBarrierSync: return "barrier_sync";
             case Stage::kPublication: return "write_publication";
         }
         return "write_publication";
     }
   private:
     Stage stage_;
+    // Copies of a prepared outcome error after publication must never allocate.
+    std::shared_ptr<const std::string> table_{};
 };
 
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
@@ -1361,6 +1401,12 @@ class ChunkStore {
         std::atomic<bool> wal_stream_initialized{false};
 
         std::atomic<std::uint64_t> last_access_tick{0};
+        // What the chunk counts toward StoreResources::CacheBytes; changed
+        // under `mutex` (RechargeCacheLocked) and released by its deleter.
+        std::size_t cache_charge = 0;
+        // Set before the cache publishes the chunk; a temporary off-cache
+        // copy (COMPACT TOMBSTONES, a slot baseline) is never charged.
+        bool cache_owned = false;
         mutable RegularChunkMutex mutex;
     };
 
@@ -1620,7 +1666,8 @@ class ChunkStore {
     std::vector<ChunkCoord> maintenance_checkpoint_queue_;
     std::unordered_set<ChunkCoord, ChunkCoordHash> maintenance_checkpoint_queued_keys_;
     bool maintenance_eviction_requested_ = false;
-    bool maintenance_stop_ = false;
+    // Also sampled by a worker choosing victims across stores.
+    std::atomic<bool> maintenance_stop_{false};
     std::shared_ptr<MaintenancePool> maintenance_pool_;
     std::shared_ptr<MaintenanceTask> maintenance_task_;
     // Notified when a background checkpoint stops owning a chunk's files.
@@ -1657,6 +1704,9 @@ class ChunkStore {
         };
         std::mutex mutex;
         std::unordered_map<ChunkCoord, Entry, ChunkCoordHash> entries;
+        // The shared cache byte count (StoreResources::CacheBytes), which a
+        // dying instance leaves by its cache_charge.
+        std::shared_ptr<std::atomic<std::uint64_t>> cache_bytes;
     };
     // Owns every RegularChunk the cache loads. It shares the registry rather
     // than pointing at the store, because the WAL stream pool of another
@@ -1701,6 +1751,12 @@ class ChunkStore {
     // Loads a read-only store's cached chunk again when the table changed
     // since it was read (chunk_cache.cpp).
     void RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChunk& chunk);
+    [[nodiscard]] static std::size_t ChunkCacheAllocationBytes(const RegularChunk& chunk) noexcept;
+    // Measures the chunk's memory again and moves the shared cache byte
+    // count by the difference; under the chunk's lock, or before it is shared.
+    void RechargeCacheLocked(RegularChunk& chunk) noexcept;
+    // Whether the shared cache passed --cache-max-bytes; false without it.
+    [[nodiscard]] bool CacheBytesOverLimit() const noexcept;
 
     [[nodiscard]] std::vector<std::uint8_t> EmptyPayload() const;
     [[nodiscard]] std::vector<std::uint8_t> EmptyPresenceBitmap() const;
@@ -1767,6 +1823,7 @@ class ChunkStore {
     [[nodiscard]] bool TryEvictCandidate(
         const EvictionCandidate& candidate,
         bool respect_recency,
+        bool background,
         std::size_t* removed,
         std::vector<LargeChunkCoord>* maybe_empty_large_chunks);
     // Recorded tick of the next eviction candidate of this store, refilling
@@ -1781,7 +1838,7 @@ class ChunkStore {
         std::vector<LargeChunkCoord> maybe_empty_large_chunks);
     // Brings the cache shared through resources_ back under its budget by
     // evicting the coldest chunks of any store sharing it.
-    void MaybeEvictChunks();
+    void MaybeEvictChunks(bool background = false);
     void RequestEviction();
 
     [[nodiscard]] std::shared_ptr<RegularChunk> TryGetLoadedChunk(const ChunkCoord& chunk_coord) const;
@@ -1894,6 +1951,8 @@ class ChunkStore {
     void StartMaintenanceThread();
     void StopMaintenanceThread() noexcept;
     bool MaintenanceStep();
+    [[nodiscard]] bool CanRunBackgroundEviction() const;
+    [[nodiscard]] bool EnqueueBackgroundEviction(bool defer_while_stopped = false);
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
     // Waits, releasing `lock`, while a background checkpoint owns the
@@ -2205,7 +2264,7 @@ class StoreResources {
   public:
     // max_open_wal_streams is lowered to fit the process file limit.
     StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams,
-                   std::size_t maintenance_workers = 8);
+                   std::size_t maintenance_workers = 8, const ServerByteLimits& byte_limits = {});
 
     StoreResources(const StoreResources&) = delete;
     StoreResources& operator=(const StoreResources&) = delete;
@@ -2217,6 +2276,17 @@ class StoreResources {
     // Chunks cached by all stores.
     [[nodiscard]] std::uint64_t LoadedChunkCount() const noexcept {
         return loaded_chunks_.load(std::memory_order_relaxed);
+    }
+    // Memory of the chunks cached by all stores (ServerByteLimits).
+    [[nodiscard]] std::uint64_t CacheBytes() const noexcept {
+        return cache_bytes_->load(std::memory_order_relaxed);
+    }
+    // Zero when the cache has no byte limit.
+    [[nodiscard]] std::size_t max_cache_bytes() const noexcept { return max_cache_bytes_; }
+    // Null when the limit is off.
+    [[nodiscard]] const std::shared_ptr<ServerByteBudget>& feed_budget() const noexcept { return feed_budget_; }
+    [[nodiscard]] const std::shared_ptr<ServerByteBudget>& txn_history_budget() const noexcept {
+        return txn_history_budget_;
     }
     [[nodiscard]] std::uint64_t LargeChunkCount() const noexcept {
         return large_chunks_count_.load(std::memory_order_relaxed);
@@ -2237,6 +2307,8 @@ class StoreResources {
     const std::size_t maintenance_workers_;
     std::mutex maintenance_pool_mutex_;
     std::shared_ptr<MaintenancePool> maintenance_pool_;
+    // Set before any catalog stores register. Standalone stores have no catalog fence.
+    std::shared_ptr<const std::atomic<bool>> catalog_fenced_{};
 
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;
@@ -2265,6 +2337,11 @@ class StoreResources {
 
     std::size_t max_loaded_chunks_;
     std::size_t max_large_chunks_;
+    const std::size_t max_cache_bytes_;
+    const std::shared_ptr<std::atomic<std::uint64_t>> cache_bytes_ =
+        std::make_shared<std::atomic<std::uint64_t>>(0U);
+    const std::shared_ptr<ServerByteBudget> feed_budget_;
+    const std::shared_ptr<ServerByteBudget> txn_history_budget_;
     std::size_t max_open_wal_streams_;
     std::atomic<std::uint64_t> large_chunks_count_{0};
     std::atomic<std::uint64_t> large_chunks_refusals_{0};

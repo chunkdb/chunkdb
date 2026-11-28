@@ -20,9 +20,14 @@
 namespace chunkdb {
 
 StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams,
-                               std::size_t maintenance_workers)
+                               std::size_t maintenance_workers, const ServerByteLimits& byte_limits)
     : maintenance_workers_(maintenance_workers), max_loaded_chunks_(max_loaded_chunks),
       max_large_chunks_(0U),
+      max_cache_bytes_(byte_limits.cache_max_bytes),
+      feed_budget_(byte_limits.feed_total_bytes == 0U ? nullptr
+                                                       : std::make_shared<ServerByteBudget>(byte_limits.feed_total_bytes)),
+      txn_history_budget_(byte_limits.txn_history_total_bytes == 0U
+              ? nullptr : std::make_shared<ServerByteBudget>(byte_limits.txn_history_total_bytes)),
       max_open_wal_streams_(max_open_wal_streams) {
     if (maintenance_workers_ == 0U) throw std::invalid_argument("maintenance_workers must be positive");
     if (max_loaded_chunks_ == 0) {

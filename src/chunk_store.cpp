@@ -4,7 +4,6 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
-#include "chunk_vars_storage.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
@@ -37,7 +36,6 @@
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
-#include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -385,7 +383,8 @@ ChunkStore::ChunkStore(StoreConfig config)
           config.resources != nullptr
               ? std::move(config.resources)
               : std::make_shared<StoreResources>(
-                    config.max_loaded_chunks, config.max_open_wal_streams, config.maintenance_workers)),
+                    config.max_loaded_chunks, config.max_open_wal_streams, config.maintenance_workers,
+                    config.byte_limits)),
       acquire_process_lock_(config.acquire_process_lock),
       initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
@@ -413,7 +412,8 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (config.txn_history_bytes == 0) {
         throw std::invalid_argument("txn_history_bytes must be > 0");
     }
-    txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes);
+    txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes, resources_->txn_history_budget());
+    live_chunk_instances_->cache_bytes = resources_->cache_bytes_;
 
 
     const auto recovery_start = std::chrono::steady_clock::now();
@@ -561,7 +561,7 @@ ChunkStore::ChunkStore(StoreConfig config)
 
     owner_admission_.reset();
     resources_->RegisterStore(this);
-    if (background_maintenance_ && access_mode_ != AccessMode::kReadOnly) {
+    if ((background_maintenance_ || resources_->max_cache_bytes() != 0U) && access_mode_ != AccessMode::kReadOnly) {
         try {
             StartMaintenanceThread();
         } catch (...) {
@@ -664,6 +664,7 @@ void ChunkStore::RequireStoreStillOnDisk() const {
 }
 
 ChunkStore::~ChunkStore() {
+    maintenance_stop_.store(true, std::memory_order_release);
     if (feed_slots_) feed_slots_->Stop();
     // First, so no eviction pass of another store works on this one while it
     // shuts down. Its chunks leave the shared cache with it.
@@ -728,11 +729,7 @@ std::uint64_t ChunkStore::LoadedChunkBytes() const {
                 chunk = it->second;
             }
             auto lock = LockStatementChunkShared(chunk->mutex);
-            bytes += sizeof(RegularChunk) + chunk->payload.capacity() + chunk->presence_bitmap.capacity() +
-                detail::ChunkVarsStorageAccess::BufferAllocationBytes(chunk->vars) +
-                chunk->wal_batch.capacity() + chunk->scratch_before.capacity();
-            if (chunk->chunk_columns)
-                bytes += sizeof(ChunkColumnState) + chunk->chunk_columns->bytes.capacity();
+            bytes += ChunkCacheAllocationBytes(*chunk);
         }
     }
     return bytes;

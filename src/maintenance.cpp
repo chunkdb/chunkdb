@@ -7,6 +7,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
 #include "maintenance_pool.hpp"
+#include "snapshot_generation.hpp"
 
 namespace chunkdb {
 
@@ -26,10 +27,14 @@ void LogBestEffort(LogAction&& action) noexcept {
 }  // namespace
 
 void ChunkStore::StartMaintenanceThread() {
+    if (access_mode_ == AccessMode::kReadOnly || (!background_maintenance_ && resources_->max_cache_bytes() == 0U)) return;
     std::lock_guard lock(maintenance_mutex_);
+    if (maintenance_task_) return;
     maintenance_pool_ = resources_->MaintenanceWorkers();
     maintenance_task_ = maintenance_pool_->MakeTask([this] { return MaintenanceStep(); });
-    maintenance_stop_ = false;
+    maintenance_stop_.store(false, std::memory_order_release);
+    if (maintenance_eviction_requested_ && !maintenance_pool_->Notify(maintenance_task_))
+        maintenance_eviction_requested_ = false;
 }
 
 void ChunkStore::StopMaintenanceThread() noexcept {
@@ -37,7 +42,7 @@ void ChunkStore::StopMaintenanceThread() noexcept {
     std::shared_ptr<MaintenancePool> pool;
     {
         std::lock_guard lock(maintenance_mutex_);
-        maintenance_stop_ = true;
+        maintenance_stop_.store(true, std::memory_order_release);
         task = maintenance_task_;
         pool = maintenance_pool_;
     }
@@ -57,6 +62,30 @@ void ChunkStore::StopMaintenanceThread() noexcept {
     maintenance_pool_.reset();
 }
 
+bool ChunkStore::CanRunBackgroundEviction() const {
+    const auto& catalog_fenced = resources_->catalog_fenced_;
+    return !maintenance_stop_.load(std::memory_order_acquire) &&
+        !(catalog_fenced && catalog_fenced->load(std::memory_order_acquire)) &&
+        !durability_poisoned_.load(std::memory_order_acquire) &&
+        (!snapshot_generation_mapping_ || !snapshot_generation_mapping_->IsFailed());
+}
+
+bool ChunkStore::EnqueueBackgroundEviction(bool defer_while_stopped) {
+    std::lock_guard lock(maintenance_mutex_);
+    if (maintenance_stop_.load(std::memory_order_relaxed)) {
+        // Exclusive catalog work can checkpoint while the store task is
+        // paused. Its restart will submit this request, or the store closes.
+        if (defer_while_stopped) maintenance_eviction_requested_ = true;
+        return false;
+    }
+    if (!maintenance_task_) return false;
+    if (maintenance_eviction_requested_) return true;
+    maintenance_eviction_requested_ = true;
+    if (maintenance_pool_->Notify(maintenance_task_)) return true;
+    maintenance_eviction_requested_ = false;
+    return false;
+}
+
 bool ChunkStore::MaintenanceStep() {
     ChunkCoord chunk_coord{};
     bool have_checkpoint = false;
@@ -68,7 +97,7 @@ bool ChunkStore::MaintenanceStep() {
             maintenance_checkpoint_queue_.erase(maintenance_checkpoint_queue_.begin());
             maintenance_checkpoint_queued_keys_.erase(chunk_coord);
             have_checkpoint = true;
-        } else if (maintenance_eviction_requested_) {
+        } else if (maintenance_eviction_requested_ && !maintenance_stop_.load(std::memory_order_relaxed)) {
             maintenance_eviction_requested_ = false;
             run_eviction = true;
         } else {
@@ -88,7 +117,7 @@ bool ChunkStore::MaintenanceStep() {
         // whole block (including the best-effort logging, which can throw
         // under memory pressure) is contained so nothing escapes the turn.
         try {
-            MaybeEvictChunks();
+            MaybeEvictChunks(/*background=*/true);
         } catch (const std::exception& e) {
             stats_background_eviction_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
@@ -112,13 +141,14 @@ bool ChunkStore::MaintenanceStep() {
         }
     }
     std::lock_guard lock(maintenance_mutex_);
-    return !maintenance_checkpoint_queue_.empty() || maintenance_eviction_requested_;
+    return !maintenance_checkpoint_queue_.empty() ||
+        (maintenance_eviction_requested_ && !maintenance_stop_.load(std::memory_order_relaxed));
 }
 
 bool ChunkStore::EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord) {
     {
         std::lock_guard lock(maintenance_mutex_);
-        if (maintenance_stop_ || !maintenance_task_) {
+        if (maintenance_stop_.load(std::memory_order_relaxed) || !maintenance_task_) {
             return false;
         }
         if (maintenance_checkpoint_queued_keys_.contains(chunk_coord)) {

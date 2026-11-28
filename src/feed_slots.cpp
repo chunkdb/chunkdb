@@ -595,6 +595,7 @@ bool FeedSlots::SyncImpl(std::uint64_t completed, SyncTiming& timing) {
     };
     const auto began = now();
     std::unique_lock barrier_lock(store_.wal_barrier_mutex_);
+    store_.ThrowIfDurabilityPoisoned();
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeFlush, completed);
     std::vector<std::shared_ptr<ChunkStore::LargeChunk>> large_chunks;
     {

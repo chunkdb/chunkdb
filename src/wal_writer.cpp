@@ -20,6 +20,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
+#include "durability_io.hpp"
 #include "wal_stream_pool.hpp"
 #include "feed_slots.hpp"
 #include "feed_prefix.hpp"
@@ -547,6 +548,15 @@ void ChunkStore::FlushWalBatch(
             output.flush();
             ExitAbruptly(86);
         }
+        // A full file system: half of the batch reaches the file, then the
+        // write fails with ENOSPC.
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_APPEND_ENOSPC_ONCE")) {
+            output.write(reinterpret_cast<const char*>(chunk->wal_batch.data()),
+                static_cast<std::streamsize>(chunk->wal_batch.size() / 2U));
+            output.flush();
+            throw std::system_error(ENOSPC, std::generic_category(),
+                "injected ENOSPC while appending a WAL record batch: " + chunk->wal_path.string());
+        }
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
             static_cast<std::streamsize>(chunk->wal_batch.size()));
@@ -566,6 +576,12 @@ void ChunkStore::FlushWalBatch(
             chunk->wal_boundary_durable = false;
         }
         if (force_sync) {
+            if constexpr (kFailpointsCompiled) {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE")) {
+                    throw SyncFailedError(std::system_error(EIO, std::generic_category(),
+                        "injected WAL batch fsync failure"));
+                }
+            }
             SyncFilePath(chunk->wal_path);
             if (first_create) {
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
@@ -898,11 +914,16 @@ void ChunkStore::FlushWalBatchForEviction(
                 TruncateWalTail(chunk_coord, chunk, pre_flush_size, force_sync);
                 snapshot_write.Finish();
             } catch (const std::exception& repair_error) {
-                PoisonDurability(
-                    "WAL append repair failed for chunk (" +
-                    std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) + "): " + repair_error.what());
+                const std::string reason = "WAL append repair failed for chunk (" +
+                    std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + "): " + repair_error.what();
+                PoisonDurability(reason);
                 chunk->wal_repair_failed = true;
+                // Not the original error: a DISK_FULL reply would invite a
+                // retry on a table that now refuses changes. The batch holds
+                // acknowledged writes only, so the statement itself applied
+                // nothing.
+                throw std::runtime_error(
+                    reason + "; the store is fail-closed until RECOVER TABLE or a restart");
             }
             throw;
         }

@@ -11,6 +11,7 @@
 #include <stop_token>
 #include <thread>
 
+#include "chunkdb/byte_budget.hpp"
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/geometry.hpp"
 
@@ -97,7 +98,9 @@ class FeedProjectionGroup {
 
 class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
   public:
-    ChangeFeed(StoreId epoch, std::size_t budget);
+    // `total`, when given, is the live feed limit shared by every table
+    // (--feed-total-bytes); each byte this feed holds counts toward both.
+    ChangeFeed(StoreId epoch, std::size_t budget, std::shared_ptr<ServerByteBudget> total = nullptr);
     ~ChangeFeed();
     void Resume(ChunkStore& store);
     void Pause();
@@ -200,6 +203,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
 
     const StoreId epoch_;
     std::atomic<std::size_t> budget_;
+    const std::shared_ptr<ServerByteBudget> total_;
     std::shared_ptr<FeedProducerRegistry> producers_;
     void ClearProducerBuffers();
     // Raw node/buffer capacity (staged, queued and cached) plus typed ring entries.

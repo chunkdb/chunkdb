@@ -173,6 +173,7 @@ add_library(chunkdb_core STATIC
     src/world_read.cpp
     src/world_read_3d.cpp
     src/zrle.cpp
+    src/table_disk_guard.cpp
 )
 
 target_include_directories(chunkdb_core
@@ -416,7 +417,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_value_format commit_owner_artifact_io commit_owner_bootstrap commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_value_format commit_owner_artifact_io commit_owner_bootstrap commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh byte_budgets)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1375,6 +1376,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_kill_test
         chunkdb_txn_concurrency_test
         chunkdb_docs_check_test
+        chunkdb_byte_budgets_test
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)

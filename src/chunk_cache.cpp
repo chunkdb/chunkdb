@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_vars_storage.hpp"
 #include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
+#include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -117,7 +119,33 @@ void ChunkStore::RegularChunkDeleter::operator()(RegularChunk* chunk) const noex
             registry->entries.erase(it);
         }
     }
+    if (registry->cache_bytes) registry->cache_bytes->fetch_sub(chunk->cache_charge, std::memory_order_relaxed);
     delete chunk;
+}
+
+std::size_t ChunkStore::ChunkCacheAllocationBytes(const RegularChunk& chunk) noexcept {
+    std::size_t bytes = sizeof(RegularChunk) + chunk.payload.capacity() + chunk.presence_bitmap.capacity() +
+        detail::ChunkVarsStorageAccess::BufferAllocationBytes(chunk.vars) +
+        chunk.wal_batch.capacity() + chunk.scratch_before.capacity();
+    if (chunk.chunk_columns)
+        bytes += sizeof(ChunkColumnState) + chunk.chunk_columns->bytes.capacity();
+    return bytes;
+}
+
+void ChunkStore::RechargeCacheLocked(RegularChunk& chunk) noexcept {
+    if (!chunk.cache_owned) return;
+    const std::size_t charge = ChunkCacheAllocationBytes(chunk);
+    if (charge == chunk.cache_charge) return;
+    auto& bytes = *resources_->cache_bytes_;
+    if (charge > chunk.cache_charge) bytes.fetch_add(charge - chunk.cache_charge, std::memory_order_relaxed);
+    else bytes.fetch_sub(chunk.cache_charge - charge, std::memory_order_relaxed);
+    chunk.cache_charge = charge;
+}
+
+bool ChunkStore::CacheBytesOverLimit() const noexcept {
+    const auto& resources = *resources_;
+    return resources.max_cache_bytes_ != 0U &&
+        resources.cache_bytes_->load(std::memory_order_relaxed) > resources.max_cache_bytes_;
 }
 
 std::size_t ChunkStore::LiveChunkInstanceEntriesForTests() const {
@@ -224,6 +252,8 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected->wal_header_written = loaded.wal_header_written;
             selected->wal_path = loaded.wal_path;
             selected->read_only_generation = loaded.read_only_generation;
+            selected->cache_owned = true;
+            RechargeCacheLocked(*selected);
             const auto published = large_chunk->chunks.emplace(chunk_coord, selected).first;
             ScopeExit rollback_chunk([&] { large_chunk->chunks.erase(published); });
             // Two live objects for one chunk mean writes made through the
@@ -272,7 +302,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     }
     if (!inserted) TouchChunk(selected);
     if (inserted) {
-        if (loaded_now > resources_->max_loaded_chunks_) {
+        if (loaded_now > resources_->max_loaded_chunks_ || CacheBytesOverLimit()) {
             RequestEviction();
         }
     }
@@ -322,6 +352,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     chunk.wal_header_written = loaded.wal_header_written;
     chunk.wal_path = loaded.wal_path;
     chunk.read_only_generation = loaded.read_only_generation;
+    RechargeCacheLocked(chunk);
 }
 
 std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {

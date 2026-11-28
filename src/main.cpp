@@ -146,6 +146,15 @@ void PrintUsage() {
         << "      Transactions: how long one stays open (5000), the bytes of the\n"
         << "      chunks one writes (16 MiB) and all open ones write (256 MiB), and\n"
         << "      the bytes per table of chunk states kept for them (64 MiB).\n"
+        << "  --cache-max-bytes <n>\n"
+        << "  --feed-total-bytes <n>\n"
+        << "  --txn-history-total-bytes <n>\n"
+        << "      Byte limits across all tables of cached chunks, live feed buffers and\n"
+        << "      chunk states kept for transactions; 0 (default) sets no limit.\n"
+        << "  --min-free-disk-bytes <n>\n"
+        << "  --disk-check-ms <ms>\n"
+        << "      Refuse data writes with DISK_FULL while the data directory's file system\n"
+        << "      has fewer bytes available (0, default: off), checked every 1000 ms.\n"
         << "  --log-level <info|warn|error>\n"
         << "  --audit-log <path>\n"
         << "      Logins and administrative statements as JSON Lines; SIGHUP reopens the file.\n"
@@ -202,6 +211,8 @@ int main(int argc, char** argv) {
         chunkdb::ServerConfig server_config;
         chunkdb::StoreConfig store_config;
         chunkdb::EngineConfig engine_config;
+        std::uint64_t min_free_disk_bytes = 0U;
+        std::size_t disk_check_ms = 1000U;
 
         store_config.data_dir = "data";
         store_config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
@@ -317,6 +328,16 @@ int main(int argc, char** argv) {
                 engine_config.txn_max_bytes = ParseSize(require_value("--txn-max-bytes"), "txn-max-bytes");
             } else if (arg == "--txn-total-bytes") {
                 engine_config.txn_total_bytes = ParseSize(require_value("--txn-total-bytes"), "txn-total-bytes");
+            } else if (arg == "--cache-max-bytes" || arg == "--feed-total-bytes" ||
+                       arg == "--txn-history-total-bytes" || arg == "--min-free-disk-bytes") {
+                // Zero turns a limit off; 2^60 bounds the arithmetic around it.
+                const auto parsed = ParseBounded(require_value(arg.c_str()), arg.c_str(), 0U, std::size_t{1} << 60U);
+                if (arg == "--cache-max-bytes") store_config.byte_limits.cache_max_bytes = parsed;
+                else if (arg == "--feed-total-bytes") store_config.byte_limits.feed_total_bytes = parsed;
+                else if (arg == "--txn-history-total-bytes") store_config.byte_limits.txn_history_total_bytes = parsed;
+                else min_free_disk_bytes = parsed;
+            } else if (arg == "--disk-check-ms") {
+                disk_check_ms = ParseBounded(require_value("--disk-check-ms"), "--disk-check-ms", 1U, 86400000U);
             } else if (arg == "--txn-history-bytes") {
                 store_config.txn_history_bytes = ParseSize(require_value("--txn-history-bytes"), "txn-history-bytes");
             } else if (arg == "--log-level") {
@@ -590,6 +611,8 @@ int main(int argc, char** argv) {
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
         catalog_config.feed_buffer_bytes = server_config.feed_buffer_bytes;
         catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
+        catalog_config.min_free_disk_bytes = min_free_disk_bytes;
+        catalog_config.disk_check_interval = std::chrono::milliseconds(disk_check_ms);
         std::shared_ptr<chunkdb::TableCatalog> catalog;
         try {
             catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));

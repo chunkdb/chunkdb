@@ -233,6 +233,7 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
 bool ChunkStore::TryEvictCandidate(
     const EvictionCandidate& candidate,
     bool respect_recency,
+    bool background,
     std::size_t* removed,
     std::vector<LargeChunkCoord>* maybe_empty_large_chunks) {
     std::shared_ptr<LargeChunk> large_chunk;
@@ -270,16 +271,22 @@ bool ChunkStore::TryEvictCandidate(
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
         AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
+        if (background && !CanRunBackgroundEviction()) return false;
         // Its WAL past the last good point is not committed state, so memory
         // is the only right copy until a restart repairs the WAL.
         if (regular_chunk->wal_repair_failed) {
             return false;
         }
         const bool had_pending_wal = !regular_chunk->wal_batch.empty();
-        FlushWalBatchForEviction(
-            candidate.chunk_coord,
-            regular_chunk,
-            durability_mode_ != DurabilityMode::kRelaxed);
+        try {
+            FlushWalBatchForEviction(candidate.chunk_coord, regular_chunk,
+                durability_mode_ != DurabilityMode::kRelaxed);
+        } catch (const WriteOutcomeUnknownError& error) {
+            if (error.stage() != "wal_append_repair") throw;
+            // The batch belongs to earlier writes. The statement that
+            // triggered eviction has yet to make any change.
+            throw std::runtime_error("eviction could not repair its WAL: " + std::string(error.what()));
+        }
         // A poisoned store refuses checkpoints (CheckpointChunk); its chunks
         // are still evicted, keeping their WAL for the next load.
         if (regular_chunk->deferred_wal_compaction && IsCheckpointDue(regular_chunk) &&
@@ -314,6 +321,7 @@ bool ChunkStore::TryEvictCandidate(
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
         AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
+        if (background && !CanRunBackgroundEviction()) return false;
         if (regular_chunk->wal_repair_failed || !regular_chunk->wal_batch.empty()) {
             return false;
         }
@@ -405,19 +413,34 @@ void ChunkStore::FinishEvictedChunks(
     }
 }
 
-void ChunkStore::MaybeEvictChunks() {
+void ChunkStore::MaybeEvictChunks(bool background) {
     StoreResources& resources = *resources_;
     const auto loaded_hint = resources.loaded_chunks_.load(std::memory_order_relaxed);
-    if (loaded_hint <= resources.max_loaded_chunks_) {
+    // The count limit uses the count this caller saw, as without a byte limit.
+    if (loaded_hint <= resources.max_loaded_chunks_ && !CacheBytesOverLimit()) {
         return;
     }
 
     const std::size_t lower_watermark = EvictionLowerWatermark(resources.max_loaded_chunks_);
-    const std::size_t required = loaded_hint > lower_watermark ? loaded_hint - lower_watermark : 0;
-    if (required == 0) {
+    const std::size_t required = loaded_hint > resources.max_loaded_chunks_ && loaded_hint > lower_watermark
+        ? loaded_hint - lower_watermark : 0;
+    // The byte limit has the same hysteresis: a pass that starts above it
+    // ends at most max_cache_bytes - max_cache_bytes / 16 when it can.
+    const std::size_t max_bytes = resources.max_cache_bytes_;
+    const std::uint64_t bytes_target = max_bytes - std::min<std::size_t>(max_bytes, std::max<std::size_t>(max_bytes / 16U, 1U));
+    const auto bytes_over = [&] {
+        return max_bytes != 0U && resources.cache_bytes_->load(std::memory_order_relaxed) > bytes_target;
+    };
+    std::size_t bytes_estimate = 0;
+    const auto bytes = max_bytes == 0U ? 0U : resources.cache_bytes_->load(std::memory_order_relaxed);
+    if (bytes > bytes_target) {
+        const auto average = std::max<std::uint64_t>(bytes / std::max<std::uint64_t>(loaded_hint, 1U), 1U);
+        bytes_estimate = static_cast<std::size_t>((bytes - bytes_target) / average) + 1U;
+    }
+    if (required == 0 && bytes_estimate == 0) {
         return;
     }
-    const std::size_t probe_budget = std::max<std::size_t>(64, required * 16);
+    const std::size_t probe_budget = std::max<std::size_t>(64, (required + bytes_estimate) * 16);
 
     // The budget is shared: victims come from every store using it, coldest
     // first by the shared access clock, so a busy store takes the memory an
@@ -433,9 +456,13 @@ void ChunkStore::MaybeEvictChunks() {
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
     std::shared_lock stores_lock(resources.stores_mutex_);
+    // The registry keeps all victims alive until the pass exits. A worker
+    // that was waiting for it may have lost admission in the meantime.
+    if (background && !CanRunBackgroundEviction()) return;
     std::vector<Victim> victims;
     victims.reserve(resources.stores_.size());
     for (ChunkStore* store : resources.stores_) {
+        if (background && !store->CanRunBackgroundEviction()) continue;
         if (store != this &&
             store->eviction_skip_until_ms_.load(std::memory_order_relaxed) > now_ms) {
             continue;
@@ -456,7 +483,8 @@ void ChunkStore::MaybeEvictChunks() {
         for (auto& victim : victims) {
             victim.exhausted = false;
         }
-        while (removed < required && probes < probe_budget && own_failure == nullptr) {
+        while ((removed < required || bytes_over()) && probes < probe_budget && own_failure == nullptr) {
+            if (background && !CanRunBackgroundEviction()) break;
             Victim* coldest = nullptr;
             std::uint64_t coldest_tick = 0;
             for (auto& victim : victims) {
@@ -486,6 +514,7 @@ void ChunkStore::MaybeEvictChunks() {
                 (void)coldest->store->TryEvictCandidate(
                     candidate,
                     respect_recency,
+                    background,
                     &coldest->removed,
                     &coldest->maybe_empty_large_chunks);
             } catch (const std::exception& e) {
@@ -544,27 +573,22 @@ void ChunkStore::RequestEviction() {
         return;
     }
 
-    // Backpressure: while background maintenance catches up, the cache may
-    // exceed the configured bound by at most one hysteresis band. Beyond
-    // that, the loading thread evicts inline to preserve the hard bound.
+    // Above one hysteresis band the loading thread applies backpressure
+    // inline. Pinned or failed chunks can still prevent reaching the target.
     const std::size_t max_loaded_chunks = resources_->max_loaded_chunks_;
     const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks);
     const std::size_t hysteresis = max_loaded_chunks - std::min(lower_watermark, max_loaded_chunks);
     const std::size_t hard_bound = max_loaded_chunks + std::max<std::size_t>(hysteresis, 1);
-    if (resources_->loaded_chunks_.load(std::memory_order_relaxed) > hard_bound) {
+    const std::size_t max_bytes = resources_->max_cache_bytes_;
+    const bool bytes_past_hard_bound = max_bytes != 0U &&
+        resources_->cache_bytes_->load(std::memory_order_relaxed) >
+            max_bytes + std::max<std::size_t>(max_bytes / 16U, 1U);
+    if (resources_->loaded_chunks_.load(std::memory_order_relaxed) > hard_bound || bytes_past_hard_bound) {
         MaybeEvictChunks();
         return;
     }
 
-    {
-        std::lock_guard lock(maintenance_mutex_);
-        if (!maintenance_stop_ && maintenance_task_) {
-            maintenance_eviction_requested_ = true;
-            if (maintenance_pool_->Notify(maintenance_task_)) return;
-            maintenance_eviction_requested_ = false;
-        }
-    }
-    MaybeEvictChunks();
+    if (!EnqueueBackgroundEviction()) MaybeEvictChunks();
 }
 
 }  // namespace chunkdb

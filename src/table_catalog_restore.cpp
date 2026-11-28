@@ -287,7 +287,14 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
             throw TableFencedError("table '" + names[i] + "' is fenced: " + reason + "; run RECOVER TABLE " + names[i]);
     }
     // Everything acknowledged becomes durable under the old names first.
-    for (auto& store : stores) store->WalBarrier();
+    // A failed barrier stops the swap before it can exchange the names.
+    for (std::size_t i = 0U; i < stores.size(); ++i) {
+        try {
+            stores[i]->WalBarrier();
+        } catch (const WriteOutcomeUnknownError& error) {
+            throw WriteOutcomeUnknownError(error, {tables[i], &tables[i]->name()});
+        }
+    }
     const std::array<std::filesystem::path, 2U> dirs{tables[0]->dir_, tables[1]->dir_};
     // Made now, so that fencing does not allocate.
     std::array<FenceNode, 2U> fences{PrepareFence(tables[0], names[0], kFenceSwapUnknown),

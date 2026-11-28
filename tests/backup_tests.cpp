@@ -50,7 +50,8 @@ struct BackupTestAccess {
     static void Evict(ChunkStore& store, ChunkCoord coord) {
         std::size_t removed = 0;
         std::vector<LargeChunkCoord> empty;
-        assert(store.TryEvictCandidate({store.geometry_.ChunkToLarge(coord), coord, 0}, false, &removed, &empty));
+        assert(store.TryEvictCandidate({.large_coord = store.geometry_.ChunkToLarge(coord), .chunk_coord = coord, .recorded_tick = 0U},
+            /*respect_recency=*/false, /*background=*/false, &removed, &empty));
         store.FinishEvictedChunks(removed, std::move(empty));
     }
     static auto Exclusive(Table& table) { return table.BeginExclusive(); }

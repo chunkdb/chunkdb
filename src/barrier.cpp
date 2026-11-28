@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
@@ -24,6 +26,10 @@
 namespace chunkdb {
 
 namespace {
+
+#ifdef CHUNKDB_FAILPOINTS
+std::atomic<const std::function<void()>*> barrier_before_lock_hook_for_tests{nullptr};
+#endif
 
 // A durable sync mostly waits for the device. On Linux a journaling file
 // system (ext4, XFS) commits syncs that arrive together in one journal
@@ -35,8 +41,9 @@ constexpr std::size_t kMaxBarrierSyncThreads = 16;
 constexpr std::size_t kSyncsPerBarrierThread = 8;
 
 // Calls `sync` on every path, from the calling thread and the threads above.
-// After the first failure no thread starts another sync, and that failure is
-// rethrown once every thread has stopped.
+// After the first failure no thread starts another sync. If an in-flight
+// sync call also failed, prefer it over an open or close error so the store
+// knows it must fail closed.
 template <typename Sync>
 void SyncEach(const std::vector<std::filesystem::path>& paths, const Sync& sync) {
     const std::size_t thread_count =
@@ -51,6 +58,15 @@ void SyncEach(const std::vector<std::filesystem::path>& paths, const Sync& sync)
     std::atomic<bool> failed{false};
     std::mutex failure_mutex;
     std::exception_ptr failure;
+    bool sync_failed = false;
+    const auto record_failure = [&](bool failed_sync_call) {
+        std::lock_guard lock(failure_mutex);
+        if (!failure || (failed_sync_call && !sync_failed)) {
+            failure = std::current_exception();
+            sync_failed = failed_sync_call;
+        }
+        failed.store(true, std::memory_order_release);
+    };
     const auto work = [&]() noexcept {
         while (!failed.load(std::memory_order_acquire)) {
             const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
@@ -59,13 +75,10 @@ void SyncEach(const std::vector<std::filesystem::path>& paths, const Sync& sync)
             }
             try {
                 sync(paths[index]);
+            } catch (const SyncFailedError&) {
+                record_failure(true);
             } catch (const std::exception&) {
-                // Rethrown by the calling thread below.
-                std::lock_guard lock(failure_mutex);
-                if (failure == nullptr) {
-                    failure = std::current_exception();
-                }
-                failed.store(true, std::memory_order_release);
+                record_failure(false);
             }
         }
     };
@@ -774,15 +787,37 @@ void ChunkStore::PauseReadOnlySnapshotForTests(
     read_only_snapshot_pause_reached_ = false;
 }
 
+#ifdef CHUNKDB_FAILPOINTS
+void SetBarrierBeforeLockHookForTests(const std::function<void()>* hook) noexcept {
+    barrier_before_lock_hook_for_tests.store(hook, std::memory_order_release);
+}
+#endif
+
 void ChunkStore::WalBarrier() {
     if (access_mode_ == AccessMode::kReadOnly) {
         return;
     }
+    // Serialize barriers so each caller's success covers everything
+    // acknowledged before its own call began. A preceding barrier may have
+    // poisoned the store while this one was waiting.
+#ifdef CHUNKDB_FAILPOINTS
+    if (auto* hook = barrier_before_lock_hook_for_tests.load(std::memory_order_acquire)) (*hook)();
+#endif
+    std::lock_guard barrier_lock(wal_barrier_mutex_);
     ThrowIfDurabilityPoisoned();
 
-    // Serialize barriers so each caller's success covers everything
-    // acknowledged before its own call began.
-    std::lock_guard barrier_lock(wal_barrier_mutex_);
+    const auto fail_sync = [this](const SyncFailedError& error, UnsyncedArtifacts* drained = nullptr) {
+        // A failed sync may have dropped dirty pages. A later sync can then
+        // succeed without making those writes durable. Fence before any
+        // bookkeeping or diagnostic formatting that can allocate.
+        durability_poisoned_.store(true, std::memory_order_release);
+        if (drained != nullptr) RestoreUnsynced(std::move(*drained));
+        PoisonDurability(std::string("a FLUSH WAL sync failed: ") + error.what());
+        throw WriteOutcomeUnknownError(
+            std::string("writes acknowledged before this barrier may or may not be durable: ") + error.what() +
+                "; the store is fail-closed until RECOVER TABLE or a restart",
+            WriteOutcomeUnknownError::Stage::kBarrierSync);
+    };
 
     // Step 1: write every loaded chunk's pending in-memory WAL batch. Any
     // failure aborts the barrier and reaches the caller. A batch is written
@@ -809,7 +844,11 @@ void ChunkStore::WalBarrier() {
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
             AwaitChunkFilesLocked(chunk_lock, *chunk);
-            FlushWalBatch(coord, chunk, /*force_sync=*/chunk->wal_boundary_durable);
+            try {
+                FlushWalBatch(coord, chunk, /*force_sync=*/chunk->wal_boundary_durable);
+            } catch (const SyncFailedError& error) {
+                fail_sync(error);
+            }
         }
     }
 
@@ -914,8 +953,13 @@ void ChunkStore::WalBarrier() {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected barrier sync failure");
         }
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE")) {
+            throw SyncFailedError(std::system_error(EIO, std::generic_category(), "injected barrier fsync failure"));
+        }
         (void)SyncUnsynced(drained);
         if (drained.overflow) stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
+    } catch (const SyncFailedError& error) {
+        fail_sync(error, &drained);
     } catch (...) {
         // Restore the drained bookkeeping so a retried barrier still covers
         // the artifacts this one failed to sync.

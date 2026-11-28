@@ -61,6 +61,7 @@ inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
 inline constexpr std::uint16_t kOptionCommitOwnerScope = 16;        // checked 40-byte immutable scope
+inline constexpr std::uint16_t kOptionMaxDiskBytes = 12;           // u64, > 0; absent for no limit
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel};

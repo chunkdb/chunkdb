@@ -56,11 +56,12 @@ A long scan beside heavy writes therefore costs memory up to `--txn-history-byte
 | Private written chunks per transaction | 16777216 bytes, `--txn-max-bytes` |
 | Private written chunks across transactions | 268435456 bytes, `--txn-total-bytes` |
 | Earlier chunk states per table | 67108864 bytes, `--txn-history-bytes` |
+| Earlier chunk states across tables | no limit, `--txn-history-total-bytes` |
 
 Exceeding a chunk-count, area-response or write-memory limit rejects the statement and leaves the transaction open without adding its reads or writes.
 SET CHUNK is checked against the written-chunk and write-memory limits before the form is decoded, by the smallest size the chunk state it writes can take.
 A form over a limit receives INVALID_ARGUMENT for that limit, even when it is also malformed.
-History pressure ends the oldest transactions with CONFLICT.
+History pressure ends the oldest transactions with CONFLICT; past `--txn-history-total-bytes`, those of the table whose write needs room.
 A table change or expired duration also ends the transaction's work.
 Past its duration, a transaction that has run a table statement ends with the next statement the connection runs, PING and DESCRIBE included, or earlier when another transaction needs its share of `--txn-total-bytes`.
 An idle connection closes after `--idle-connection-timeout-ms` even with a transaction open, which rolls it back.

@@ -75,6 +75,7 @@ Store your applied position together with your output, and ignore repeated posit
 | --- | --- |
 | Watches per server | 64, `--max-watches` |
 | Live history per table | 67108864 bytes, `feed_buffer_bytes` |
+| Live history across tables | no limit, `--feed-total-bytes` |
 | Queued watch output per table, split into watch shares | 67108864 bytes, `feed_buffer_bytes` |
 | Queued slot changes larger than a share, per table | 67108864 bytes, `feed_buffer_bytes` |
 | Retained history per slot | 1073741824 bytes, `slot_max_bytes` |
@@ -82,6 +83,8 @@ Store your applied position together with your output, and ignore repeated posit
 | Slot durable-frontier sync interval | 100 ms, `--slot-sync-ms` |
 
 Slow ordinary watches resync when the live history budget is exceeded.
+Past `--feed-total-bytes`, a table drops its own oldest live history first, and its watches resync when a change still does not fit.
+One table holds at most its own `feed_buffer_bytes` of that total, so a slow watch on one table can leave the others that much less.
 Each watch queues output within its share of `feed_buffer_bytes`, and slot changes larger than a share use one more table pool of that size.
 So queued output per table stays within twice `feed_buffer_bytes`, apart from frames admitted before a new watch reduced the shares.
 A waiting slot watch keeps its encoded change or schema event only while it fits the share or is next for the pool, so at most one waiting change or schema event larger than a share per table is held outside these limits.

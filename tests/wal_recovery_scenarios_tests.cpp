@@ -743,7 +743,21 @@ void TestMacosDurabilityUsesFullSync() {
         chunkdb::ChunkStore store(relaxed);
         store.SetBlockBits(0, 0, "00000011");
         assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", [&] { store.WalBarrier(); }));
-        store.WalBarrier();
+        // A failed sync leaves the store fail-closed: a retried sync could
+        // succeed after the dirty pages were dropped.
+        bool retried = false;
+        try {
+            store.WalBarrier();
+            retried = true;
+        } catch (const std::exception&) {
+        }
+        assert(!retried);
+    }
+    {
+        // Recovery reads what the files hold.
+        chunkdb::ChunkStore reopened(relaxed);
+        reopened.SetBlockBits(1, 0, "00000001");
+        reopened.WalBarrier();
     }
     std::filesystem::remove_all(strict_dir);
     std::filesystem::remove_all(relaxed_dir);

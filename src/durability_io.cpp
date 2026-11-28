@@ -370,7 +370,7 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
     const BOOL closed = CloseHandle(handle);
     const DWORD close_error = closed != 0 ? ERROR_SUCCESS : GetLastError();
     if (synced == 0) {
-        throw BuildWin32Error("failed to sync file", path, sync_error);
+        throw SyncFailedError(BuildWin32Error("failed to sync file", path, sync_error));
     }
     if (closed == 0) {
         throw BuildWin32Error("failed to close synced file", path, close_error);
@@ -412,7 +412,7 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
             if (flush_error != ERROR_ACCESS_DENIED &&
                 flush_error != ERROR_INVALID_HANDLE &&
                 flush_error != ERROR_INVALID_FUNCTION) {
-                throw BuildWin32Error("failed to sync directory", path, flush_error);
+                throw SyncFailedError(BuildWin32Error("failed to sync directory", path, flush_error));
             }
             LogWindowsDirectorySyncUnavailableOnce(
                 path,
@@ -461,7 +461,7 @@ void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
 #if defined(__APPLE__)
     if (full_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE")) {
-            throw BuildErrnoError("failed to F_FULLFSYNC file", path, EIO);
+            throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC file", path, EIO));
         }
         if (::fcntl(fd, F_FULLFSYNC, 0) == 0) {
             return;
@@ -470,11 +470,11 @@ void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
         // F_FULLFSYNC can be unsupported on some macOS filesystems/devices.
         // Fall back to fsync while surfacing non-capability errors.
         if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
-            throw BuildErrnoError("failed to F_FULLFSYNC file", path, fullsync_error);
+            throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC file", path, fullsync_error));
         }
     }
     if (::fsync(fd) != 0) {
-        throw BuildErrnoError("failed to fsync file", path, errno);
+        throw SyncFailedError(BuildErrnoError("failed to fsync file", path, errno));
     }
 #else
     (void)full_sync;
@@ -482,11 +482,11 @@ void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
         const int data_sync_error = errno;
         if (data_sync_error == EINVAL) {
             if (::fsync(fd) != 0) {
-                throw BuildErrnoError("failed to fsync file", path, errno);
+                throw SyncFailedError(BuildErrnoError("failed to fsync file", path, errno));
             }
             return;
         }
-        throw BuildErrnoError("failed to fdatasync file", path, data_sync_error);
+        throw SyncFailedError(BuildErrnoError("failed to fdatasync file", path, data_sync_error));
     }
 #endif
 }
@@ -718,20 +718,20 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
         // As for files: a directory entry is durable only once the drive's
         // cache is flushed too.
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
-            throw BuildErrnoError("failed to F_FULLFSYNC directory", path, EIO);
+            throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC directory", path, EIO));
         }
         if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
             const int fullsync_error = errno;
             if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
-                throw BuildErrnoError("failed to F_FULLFSYNC directory", path, fullsync_error);
+                throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC directory", path, fullsync_error));
             }
             if (::fsync(fd) != 0) {
-                throw BuildErrnoError("failed to sync directory", path, errno);
+                throw SyncFailedError(BuildErrnoError("failed to sync directory", path, errno));
             }
         }
 #else
         if (::fsync(fd) != 0) {
-            throw BuildErrnoError("failed to sync directory", path, errno);
+            throw SyncFailedError(BuildErrnoError("failed to sync directory", path, errno));
         }
 #endif
         CloseFdChecked(fd, path, "failed to close synced directory");
@@ -777,17 +777,17 @@ void SyncOwnerFileDescriptor(int fd, const std::filesystem::path& label) {
 void SyncOwnerDirectoryDescriptor(int fd, const std::filesystem::path& label) {
 #if defined(__APPLE__)
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
-        throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, EIO);
+        throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC owner directory", label, EIO));
     }
     if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
         const int error = errno;
         if (error != EINVAL && error != ENOTSUP && error != ENOTTY) {
-            throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, error);
+            throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC owner directory", label, error));
         }
-        if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+        if (::fsync(fd) != 0) throw SyncFailedError(BuildErrnoError("failed to sync owner directory", label, errno));
     }
 #else
-    if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+    if (::fsync(fd) != 0) throw SyncFailedError(BuildErrnoError("failed to sync owner directory", label, errno));
 #endif
     NoteDirectorySynced(label);
 }

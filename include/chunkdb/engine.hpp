@@ -532,6 +532,10 @@ class CommandEngine {
     // a later one on another table is refused, and a table altered or
     // dropped since ends the transaction (TransactionConflictError).
     [[nodiscard]] Table::Lease TxnLease(SessionState& session, const std::string& table);
+    // TxnLease inside a transaction, which COMMIT checks; otherwise
+    // AcquireNamedTable for a data write, refused with DISK_FULL while
+    // TableCatalog::RequireDiskRoom refuses the table.
+    [[nodiscard]] Table::Lease WriteLease(SessionState& session, const std::string& table);
     // Adds chunks to the transaction's read set, or throws past its limit
     // leaving it as it was.
     void TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const;

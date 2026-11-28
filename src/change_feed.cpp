@@ -96,7 +96,7 @@ bool ChangeFeed::ReclaimSpare(std::size_t needed) noexcept {
         while (cached != nullptr) {
             auto* next = cached->next;
             const auto used = bytes_.load(std::memory_order_relaxed);
-            if (needed > budget_ || used > budget_ - needed) {
+            if (needed > budget_ || used > budget_ - needed || (total_ && total_->WouldExceed(needed))) {
                 // Take and this reclamation own the same non-waiting flag.
                 // Only they edit the allocation list; this node is detached
                 // from the idle stack and cannot be acquired by its writer.
@@ -136,13 +136,15 @@ void ChangeFeed::Producer::Collect() noexcept {
     }
 }
 
-ChangeFeed::ChangeFeed(StoreId epoch, std::size_t budget)
-    : epoch_(epoch), budget_(budget) {
+ChangeFeed::ChangeFeed(StoreId epoch, std::size_t budget, std::shared_ptr<ServerByteBudget> total)
+    : epoch_(epoch), budget_(budget), total_(std::move(total)) {
     if (budget == 0U) throw std::invalid_argument("feed buffer bytes must be positive");
 }
 ChangeFeed::~ChangeFeed() {
     Pause();
     ClearProducerBuffers();
+    // What the ring still holds leaves the shared total with the feed.
+    if (total_) total_->Release(bytes_.exchange(0U, std::memory_order_relaxed));
 }
 FeedProducerRegistry::FeedProducerRegistry() : id_(g_feed_id.fetch_add(1) + 1U) {}
 FeedProducerRegistry::~FeedProducerRegistry() {
@@ -228,9 +230,16 @@ bool ChangeFeed::Reserve(std::size_t bytes) noexcept {
     do {
         if (bytes > budget_ || used > budget_ - bytes) return false;
     } while (!bytes_.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
+    if (total_ && !total_->TryReserve(bytes)) {
+        bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+        return false;
+    }
     return true;
 }
-void ChangeFeed::Release(std::size_t bytes) noexcept { bytes_.fetch_sub(bytes, std::memory_order_relaxed); }
+void ChangeFeed::Release(std::size_t bytes) noexcept {
+    bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+    if (total_) total_->Release(bytes);
+}
 bool ChangeFeed::ReserveCapture(std::size_t bytes) noexcept {
     if (Reserve(bytes)) return true;
     if (bytes > budget_) return false;
@@ -389,7 +398,8 @@ void ChangeFeed::End(const char* ended) {
     // End runs after the exclusive lease drained and the sender joined.
     ClearProducerBuffers();
     producers_.reset();
-    bytes_.store(0U, std::memory_order_relaxed);
+    const auto left = bytes_.exchange(0U, std::memory_order_relaxed);
+    if (total_) total_->Release(left);
     cv_.notify_all();
     Notify();
 }

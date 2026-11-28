@@ -331,16 +331,27 @@ MIGRATION_MISMATCH identifies different text under a recorded migration name.
 CHECK_FAILED includes `check`, the CHECK constraint a write or ADD CHECK found false; nothing changes.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `BUSY reason=large_chunk_cache_full` means a new large-chunk cache container could not fit in the shared pool; the request applied no mutation.
+`DISK_FULL reason=min_free_disk` refuses a request before it changes anything and reports `available` and `limit` when free space is below `--min-free-disk-bytes`.
+`DISK_FULL reason=max_disk_bytes` also leaves the request unapplied and reports `table`, `used` and `limit` when the table's files reach its option.
+`DISK_FULL reason=disk_full` means the file system reported no space and leaves ordinary block and chunk writes and transaction commits unapplied ([durability](DURABILITY_CONTRACT.md#disk-full)).
+A catalog change can report `reason=disk_full` after publication, such as when a rename completes but its directory sync fails, so inspect the catalog state before retrying.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
 SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner).
-Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
+The six keys in the `filters` map are `area`, `areas`, `column_ids`, `columns`, `no_before`, and `chunks`.
 
-Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
+`area` holds the bounds when there is exactly one area and is null otherwise.
+`areas` lists the distinct area bounds sorted by first coordinate and then by last coordinate, and is null when there is no area filter.
+Projected names and IDs are aligned arrays in declared order.
+Both fields are null when there is no projection.
 A dropped column keeps its ID and has a null display name.
-Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are booleans.
+Area bounds are signed `[x0,y0,x1,y1]` in 2D or `[x0,y0,z0,x1,y1,z1]` in 3D, with inclusive endpoints.
+Both flags are booleans.
 VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
+An unknown barrier outcome from FLUSH WAL or SWAP TABLES also includes the affected `table`.
+FLUSH WAL waits for all serving tables' barriers and reports an unknown outcome if any occurred, otherwise it reports the first definite error.
+SWAP TABLES stops at its first failed barrier.
 INTERNAL reports other operational failures without exposing internal diagnostics.
 
 ```text
