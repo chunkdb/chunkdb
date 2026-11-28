@@ -131,7 +131,10 @@ class ParameterFrameDecoder {
   public:
     explicit ParameterFrameDecoder(ParameterFrameRules rules);
     // False needs more input, without blocking or consuming a later request.
-    bool Consume(PendingLineBuffer& pending, std::size_t max_line_bytes);
+    // `charged`: the kept frame bytes the caller has charged; a kept frame's
+    // body is read only once every kept length a header gave is charged.
+    bool Consume(PendingLineBuffer& pending, std::size_t max_line_bytes,
+        std::size_t charged = std::numeric_limits<std::size_t>::max());
     [[nodiscard]] bool complete() const noexcept { return frame_ == rules_.frame_count || total_exceeded_; }
     [[nodiscard]] bool total_exceeded() const noexcept { return total_exceeded_; }
     [[nodiscard]] const std::string& rejection() const noexcept { return rejection_; }
@@ -142,6 +145,8 @@ class ParameterFrameDecoder {
     // The bytes held for the frame being read: about twice what has
     // arrived at most, and never more than its header gave.
     [[nodiscard]] std::size_t retained_capacity() const noexcept { return value_.capacity(); }
+    // The lengths the headers of kept frames gave so far.
+    [[nodiscard]] std::size_t kept_bytes() const noexcept { return kept_; }
   private:
     enum class Phase { kHeader, kBody, kTerminator };
     void FinishFrame();
@@ -149,7 +154,7 @@ class ParameterFrameDecoder {
     std::vector<std::optional<std::string>> parameters_;
     std::string value_, rejection_;
     Phase phase_ = Phase::kHeader;
-    std::size_t frame_ = 0U, remaining_ = 0U, total_ = 0U, opaque_total_ = 0U, pieces_ = 0U;
+    std::size_t frame_ = 0U, remaining_ = 0U, total_ = 0U, opaque_total_ = 0U, pieces_ = 0U, kept_ = 0U;
     bool opaque_ = false, total_exceeded_ = false;
 };
 
