@@ -383,7 +383,8 @@ Archived WALs are closed segments and require complete valid framing throughout;
 Persisted revisions survive eviction and restart; a missing chunk artifact gets a fresh revision when loaded.
 The store clock reserves ranges of 65536 tokens durably before issuing tokens and advances past any recovered revision at or above its ceiling.
 When half a range is left below the ceiling, a separate thread writes the next ceiling with the same syncs; writers below the ceiling do not wait for it, and no token of the new range is issued before its write completes.
-A writer that reaches the ceiling waits for that write; if it failed, the writer writes the record itself, and a failure of that write fails its mutation with nothing changed.
+A writer that reaches the ceiling waits until a durable range has a token it can use.
+If an extension fails, a writer at the ceiling tries the synced write itself and rejects its mutation before changing data if that write fails.
 A crash during an extension leaves the previous or the new ceiling, both above every issued token, so a restart skips at most one and a half ranges.
 When no further range fits below 2^64, every later write is refused with `chunk version clock exhausted` and the clock never wraps.
 

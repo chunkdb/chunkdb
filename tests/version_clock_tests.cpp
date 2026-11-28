@@ -5,17 +5,23 @@
 // its ceiling, and a crash during an extension leaves a valid clock above
 // every issued token.
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/logging.hpp"
 #include "test_utils.hpp"
 
 #ifndef _WIN32
@@ -26,6 +32,48 @@ namespace {
 
 constexpr std::uint64_t kRange = 65536;
 constexpr std::uint64_t kLead = kRange / 2U;
+constexpr auto kWaitTimeout = std::chrono::seconds(10);
+
+class WaitHook final : public chunkdb::VersionClockWaitTestHook {
+  public:
+    explicit WaitHook(bool hold_after_publish = false) : hold_after_publish_(hold_after_publish) {}
+
+    void Run(Point point) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeWait) {
+            waiting_ = true;
+            changed_.notify_all();
+        } else if (hold_after_publish_) {
+            published_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [this] { return resumed_; });
+        }
+    }
+
+    void WaitForWriter() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, kWaitTimeout, [this] { return waiting_; }));
+    }
+
+    void WaitForPublication() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, kWaitTimeout, [this] { return published_; }));
+    }
+
+    void ResumeAfterPublication() {
+        std::lock_guard lock(mutex_);
+        resumed_ = true;
+        changed_.notify_all();
+    }
+
+  private:
+    const bool hold_after_publish_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool waiting_ = false;
+    bool published_ = false;
+    bool resumed_ = false;
+};
 
 chunkdb::StoreConfig Config(const std::filesystem::path& path) {
     chunkdb::StoreConfig config;
@@ -78,13 +126,11 @@ std::uint64_t HoldExtension(chunkdb::ChunkStore& store) {
     return ceiling;
 }
 
-bool IsInjectedFailure(const std::exception& error) {
-    return std::string(error.what()).find("injected version clock extension failure") != std::string::npos;
-}
-
 void TestWritersBelowTheCeilingDoNotWait() {
     chunkdb::test::ScopedTempDir dir("chunkdb-version-clock-early");
+    WaitHook hook;
     chunkdb::ChunkStore store(Config(dir.path()));
+    store.SetVersionClockWaitHookForTests(&hook);
     const auto ceiling = HoldExtension(store);
     const auto waited_us = store.RuntimeStats().version_clock_wait_us;
 
@@ -100,7 +146,8 @@ void TestWritersBelowTheCeilingDoNotWait() {
     // A writer at the ceiling waits for the write in flight and writes no
     // record itself.
     auto waiter = std::async(std::launch::async, [&] { return store.ReserveChunkVersionForTests(); });
-    assert(waiter.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
+    hook.WaitForWriter();
+    assert(waiter.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
     store.ResumeVersionClockExtensionForTests(false);
     assert(waiter.get() == ceiling);
     assert(store.VersionClockCeilingForTests() == ceiling + kRange);
@@ -110,50 +157,62 @@ void TestWritersBelowTheCeilingDoNotWait() {
     assert(stats.version_clock_wait_us > waited_us);
 }
 
+void TestWaiterUsesPublishedRangeWhileNextExtensionIsHeld() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-version-clock-successive");
+    WaitHook hook(/*hold_after_publish=*/true);
+    chunkdb::ChunkStore store(Config(dir.path()));
+    store.SetVersionClockWaitHookForTests(&hook);
+    const auto ceiling = HoldExtension(store);
+    ReserveThrough(store, ceiling - kLead + 1U, ceiling - 1U);
+
+    auto waiter = std::async(std::launch::async, [&] { return store.ReserveChunkVersionForTests(); });
+    hook.WaitForWriter();
+    store.ResumeVersionClockExtensionForTests(false);
+    hook.WaitForPublication();
+
+    const auto next = ceiling + kRange;
+    ReserveThrough(store, ceiling, next - kLead - 1U);
+    store.ArmVersionClockExtensionPauseForTests();
+    assert(store.ReserveChunkVersionForTests() == next - kLead);
+    assert(store.WaitForVersionClockExtensionPauseForTests());
+
+    hook.ResumeAfterPublication();
+    assert(waiter.wait_for(kWaitTimeout) == std::future_status::ready);
+    assert(waiter.get() == next - kLead + 1U);
+    assert(PersistedCeiling(dir.path()) == next);
+    store.ResumeVersionClockExtensionForTests(false);
+}
+
 void TestFailedExtensionIsWrittenByTheWriterAtTheCeiling() {
     chunkdb::test::ScopedTempDir dir("chunkdb-version-clock-fail");
+    WaitHook hook;
     chunkdb::ChunkStore store(Config(dir.path()));
+    store.SetVersionClockWaitHookForTests(&hook);
 
     // The writer waiting at the ceiling writes the record when the early
     // write fails; the failed write is not counted.
     const auto ceiling = HoldExtension(store);
     ReserveThrough(store, ceiling - kLead + 1U, ceiling - 1U);
+    std::atomic<unsigned> failed_warnings{0};
+    const auto log_level = chunkdb::GetLogLevel();
+    chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
+    chunkdb::SetLogSinkForTests([&](const std::string& line) {
+        if (line.find("version clock extension failed") != std::string::npos) {
+            failed_warnings.fetch_add(1U, std::memory_order_relaxed);
+            throw std::bad_alloc();
+        }
+    });
     auto waiter = std::async(std::launch::async, [&] { return store.ReserveChunkVersionForTests(); });
-    assert(waiter.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
+    hook.WaitForWriter();
     store.ResumeVersionClockExtensionForTests(true);
     assert(waiter.get() == ceiling);
+    chunkdb::ResetLogSinkForTests();
+    chunkdb::SetLogLevel(log_level);
+    assert(failed_warnings.load(std::memory_order_relaxed) == 1U);
     const auto next = ceiling + kRange;
     assert(store.VersionClockCeilingForTests() == next);
     assert(PersistedCeiling(dir.path()) == next);
     assert(store.RuntimeStats().version_clock_extensions == 2U);
-
-    // When the writer's own write fails too, the mutation fails, changes
-    // nothing, and the next one writes the record.
-    ReserveThrough(store, ceiling + 1U, next - kLead - 1U);
-    store.ArmVersionClockExtensionPauseForTests();
-    assert(store.ReserveChunkVersionForTests() == next - kLead);
-    assert(store.WaitForVersionClockExtensionPauseForTests());
-    ReserveThrough(store, next - kLead + 1U, next - 1U);
-    auto failing = std::async(std::launch::async, [&] {
-        try {
-            store.SetBlockBits(4, 0, "00011");
-        } catch (const std::runtime_error& error) {
-            return IsInjectedFailure(error);
-        }
-        return false;
-    });
-    assert(failing.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
-    // Armed again, the pause fails the writer's write without holding it.
-    store.ArmVersionClockExtensionPauseForTests();
-    store.ResumeVersionClockExtensionForTests(true);
-    assert(failing.get());
-    assert(store.GetBlockBits(4, 0) == "00000");
-    assert(store.VersionClockCeilingForTests() == next);
-    assert(PersistedCeiling(dir.path()) == next);
-    store.SetBlockBits(4, 0, "00011");
-    assert(store.GetChunkVersion(1, 0) == next);
-    assert(PersistedCeiling(dir.path()) == next + kRange);
-    assert(store.RuntimeStats().version_clock_extensions == 3U);
 }
 
 // Closing the store waits for the extension in flight; its ceiling is durable
@@ -173,29 +232,50 @@ void TestCloseWaitsForTheExtensionInFlight() {
 
 void SetFailpoint(const char* key) {
 #ifdef _WIN32
-    _putenv_s(key, "1");
+    assert(_putenv_s(key, "1") == 0);
 #else
-    setenv(key, "1", 1);
+    assert(setenv(key, "1", 1) == 0);
 #endif
 }
 
-// Child: takes tokens up to the ceiling while an extension is held, or while
-// one crashes in its write, and ends during that extension.
+void TestFailedDirectorySyncKeepsPreviousCeiling() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-version-clock-dir-sync");
+    chunkdb::ChunkStore store(Config(dir.path()));
+    const auto ceiling = store.VersionClockCeilingForTests();
+    const auto before = store.RuntimeStats();
+    SetFailpoint("CHUNKDB_FAILPOINT_VERSION_EXTENSION_AFTER_REPLACE_BEFORE_DIR_SYNC_ONCE");
+    bool failed = false;
+    try {
+        store.SetBlockBits(0, 0, "00011");
+    } catch (const std::runtime_error& error) {
+        failed = std::string_view(error.what()).starts_with("injected atomic write failure after replace before directory sync");
+    }
+    assert(failed);
+    assert(PersistedCeiling(dir.path()) == ceiling + kRange);
+    assert(store.VersionClockCeilingForTests() == ceiling);
+    assert(store.GetChunkVersion(0, 0) == 0U);
+    assert(store.GetBlockBits(0, 0) == "00000");
+    const auto after = store.RuntimeStats();
+    assert(after.version_clock_extensions == before.version_clock_extensions);
+    assert(after.version_clock_wait_us > before.version_clock_wait_us);
+
+    store.SetBlockBits(0, 0, "00011");
+    assert(store.GetChunkVersion(0, 0) == ceiling);
+    assert(store.VersionClockCeilingForTests() == ceiling + kRange);
+    assert(store.RuntimeStats().version_clock_extensions == before.version_clock_extensions + 1U);
+}
+
+// Fill the current range before letting the extension reach its crash point.
 int RunCrashChild(const std::filesystem::path& data_dir, const std::string& point) {
     chunkdb::ChunkStore store(Config(data_dir));
-    if (point == "held") {
-        const auto ceiling = HoldExtension(store);
-        ReserveThrough(store, ceiling - kLead + 1U, ceiling - 1U);
-        chunkdb::ExitAbruptly(86);
-    }
-    assert(point == "before-replace");
-    const auto first = store.ReserveChunkVersionForTests();
-    const auto ceiling = first + kRange;
-    SetFailpoint("CHUNKDB_FAILPOINT_CRASH_VERSION_EXTENSION_BEFORE_REPLACE_ONCE");
-    // The extension started half a range below the ceiling ends the process
-    // after writing its temporary file; this thread then waits at the ceiling.
-    ReserveThrough(store, first + 1U, ceiling - 1U);
-    (void)store.ReserveChunkVersionForTests();
+    const auto ceiling = HoldExtension(store);
+    ReserveThrough(store, ceiling - kLead + 1U, ceiling - 1U);
+    if (point == "held") chunkdb::ExitAbruptly(86);
+    assert(point == "before-replace" || point == "after-replace");
+    SetFailpoint(point == "before-replace" ? "CHUNKDB_FAILPOINT_CRASH_VERSION_EXTENSION_BEFORE_REPLACE_ONCE"
+                                          : "CHUNKDB_FAILPOINT_CRASH_VERSION_EXTENSION_AFTER_REPLACE_ONCE");
+    store.ResumeVersionClockExtensionForTests(false);
+    // Closing joins the worker; returning 3 means it missed its crash point.
     return 3;
 }
 
@@ -221,9 +301,7 @@ void RunCrashChildProcess(const char* executable, const std::filesystem::path& d
 }
 
 void TestCrashDuringTheExtensionLeavesAValidClock(const char* executable) {
-    for (const auto* point : {"held", "before-replace"}) {
-        const bool before_replace = std::string(point) == "before-replace";
-        if (before_replace && !chunkdb::kFailpointsCompiled) continue;
+    for (const std::string_view point : {"held", "before-replace", "after-replace"}) {
         chunkdb::test::ScopedTempDir dir("chunkdb-version-clock-crash");
         {
             chunkdb::ChunkStore store(Config(dir.path()));
@@ -232,13 +310,15 @@ void TestCrashDuringTheExtensionLeavesAValidClock(const char* executable) {
         // The child's first token is the ceiling it opens with, and every
         // token it issues is below one range above it.
         const auto opened = PersistedCeiling(dir.path());
-        RunCrashChildProcess(executable, dir.path(), point);
-        assert(PersistedCeiling(dir.path()) == opened + kRange);
-        assert(HasClockTempFile(dir.path()) == before_replace);
+        RunCrashChildProcess(executable, dir.path(), point.data());
+        // A process exit leaves a completed rename visible to the next opener.
+        const auto expected = opened + (point == "after-replace" ? 2U : 1U) * kRange;
+        assert(PersistedCeiling(dir.path()) == expected);
+        assert(HasClockTempFile(dir.path()) == (point == "before-replace"));
         chunkdb::ChunkStore reopened(Config(dir.path()));
         assert(!HasClockTempFile(dir.path()));
         assert(reopened.GetBlockBits(0, 0) == "10101");
-        assert(reopened.ReserveChunkVersionForTests() == opened + kRange);
+        assert(reopened.ReserveChunkVersionForTests() == expected);
     }
 }
 
@@ -248,9 +328,14 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--crash-child") {
         return RunCrashChild(argv[2], argv[3]);
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--crash-boundaries") {
+        TestCrashDuringTheExtensionLeavesAValidClock(argv[0]);
+        return 0;
+    }
     TestWritersBelowTheCeilingDoNotWait();
+    TestWaiterUsesPublishedRangeWhileNextExtensionIsHeld();
     TestFailedExtensionIsWrittenByTheWriterAtTheCeiling();
+    TestFailedDirectorySyncKeepsPreviousCeiling();
     TestCloseWaitsForTheExtensionInFlight();
-    TestCrashDuringTheExtensionLeavesAValidClock(argv[0]);
     return 0;
 }

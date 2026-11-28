@@ -5,6 +5,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <random>
 #include <shared_mutex>
 #include <stdexcept>
@@ -323,20 +324,34 @@ void ChunkStore::WriteVersionClockCeiling(std::uint64_t ceiling) {
         /*fsync_file=*/true,
         /*fsync_directory=*/true,
         /*out_replaced=*/nullptr,
-        /*after_rename_failpoint=*/nullptr,
         // Clock bookkeeping must not consume the generic ATOMICWRITE
-        // failpoints a test armed for a data-path write; the clock has
-        // its own VERSION_RESERVE_FAIL_ONCE hook.
+        // failpoints a test armed for a data-path write.
+        /*after_rename_failpoint=*/kFailpointsCompiled ?
+            "CHUNKDB_FAILPOINT_VERSION_EXTENSION_AFTER_REPLACE_BEFORE_DIR_SYNC_ONCE" : nullptr,
         /*enable_generic_failpoints=*/false,
         /*before_replace=*/[] {
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_VERSION_EXTENSION_BEFORE_REPLACE_ONCE")) ExitAbruptly(86);
-        });
+        },
+        /*after_replace_crash_failpoint=*/"CHUNKDB_FAILPOINT_CRASH_VERSION_EXTENSION_AFTER_REPLACE_ONCE");
 }
 
 void ChunkStore::AdvanceVersionClockCeilingLocked(std::unique_lock<std::mutex>& lock, std::uint64_t minimum) {
     if (version_clock_extension_in_flight_) {
-        // One writer of the record at a time: wait for the one in flight.
-        version_clock_extended_.wait(lock, [this] { return !version_clock_extension_in_flight_; });
+        VersionClockWaitTestHook* hook = nullptr;
+        if constexpr (kFailpointsCompiled) {
+            hook = version_clock_wait_hook_.load(std::memory_order_acquire);
+            if (hook != nullptr) hook->Run(VersionClockWaitTestHook::Point::kBeforeWait);
+        }
+        version_clock_extended_.wait(lock, [this, minimum, hook, &lock] {
+            const bool covered = version_clock_ceiling_.load(std::memory_order_relaxed) > minimum;
+            if (hook != nullptr && covered) {
+                lock.unlock();
+                hook->Run(VersionClockWaitTestHook::Point::kCeilingPublished);
+                lock.lock();
+            }
+            // Another extension may have started by the time this writer wakes.
+            return covered || !version_clock_extension_in_flight_;
+        });
         return;
     }
     if (minimum > std::numeric_limits<std::uint64_t>::max() - kVersionClockReservationBatch) {
@@ -344,17 +359,19 @@ void ChunkStore::AdvanceVersionClockCeilingLocked(std::unique_lock<std::mutex>& 
     }
     const std::uint64_t ceiling = minimum + kVersionClockReservationBatch;
     version_clock_extension_in_flight_ = true;
+    // A failed write leaves the ceiling in place and lets the next waiter try.
+    struct FinishExtension {
+        ChunkStore& store;
+        std::unique_lock<std::mutex>& lock;
+        ~FinishExtension() {
+            if (!lock.owns_lock()) lock.lock();
+            store.version_clock_extension_in_flight_ = false;
+            store.version_clock_extended_.notify_all();
+        }
+    } finish{*this, lock};
     lock.unlock();
     const auto started = std::chrono::steady_clock::now();
-    try {
-        WriteVersionClockCeiling(ceiling);
-    } catch (...) {
-        // The ceiling stays; the next writer at it writes the record again.
-        lock.lock();
-        version_clock_extension_in_flight_ = false;
-        version_clock_extended_.notify_all();
-        throw;
-    }
+    WriteVersionClockCeiling(ceiling);
     const auto elapsed_us = MicrosecondsSince(started);
     lock.lock();
     // Counted before the ceiling is published, so a reader of the ceiling
@@ -362,8 +379,6 @@ void ChunkStore::AdvanceVersionClockCeilingLocked(std::unique_lock<std::mutex>& 
     stats_version_clock_extensions_.fetch_add(1U, std::memory_order_relaxed);
     stats_version_clock_extension_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
     version_clock_ceiling_.store(ceiling, std::memory_order_release);
-    version_clock_extension_in_flight_ = false;
-    version_clock_extended_.notify_all();
 }
 
 void ChunkStore::StartVersionClockExtension(std::uint64_t ceiling) {
@@ -381,13 +396,15 @@ void ChunkStore::StartVersionClockExtensionLocked(std::uint64_t ceiling) {
     // mutex as its last locked step, so joining it does not wait on the
     // mutex held here.
     if (version_clock_extender_.joinable()) version_clock_extender_.join();
-    version_clock_extension_in_flight_ = true;
+    // A writer at the ceiling can still sync the record if the worker cannot start.
     try {
         version_clock_extender_ = std::thread([this, ceiling] { RunVersionClockExtension(ceiling); });
     } catch (const std::system_error&) {
-        // No thread: the writer that reaches the ceiling writes the record.
-        version_clock_extension_in_flight_ = false;
+        return;
+    } catch (const std::bad_alloc&) {
+        return;
     }
+    version_clock_extension_in_flight_ = true;
 }
 
 void ChunkStore::RunVersionClockExtension(std::uint64_t ceiling) noexcept {
@@ -400,9 +417,15 @@ void ChunkStore::RunVersionClockExtension(std::uint64_t ceiling) noexcept {
     } catch (const std::exception& error) {
         // Nothing was issued from the next range. The writer that reaches
         // the ceiling writes the record itself and gets its own error.
-        LogMessage(
-            LogLevel::kWarn, LogComponent::kStore, "version clock extension failed; writers at the ceiling retry it",
-            {{"data_dir", data_dir_.string()}, {"error", error.what()}});
+        // Failure to format or emit the warning cannot prevent that retry.
+        try {
+            LogMessage(
+                LogLevel::kWarn, LogComponent::kStore, "version clock extension failed; writers at the ceiling retry it",
+                {{"data_dir", data_dir_.string()}, {"error", error.what()}});
+        } catch (const std::bad_alloc&) {
+        } catch (const std::length_error&) {
+        } catch (const std::runtime_error&) {
+        }
     }
     const auto elapsed_us = MicrosecondsSince(started);
     {
@@ -489,16 +512,17 @@ std::uint64_t ChunkStore::NextChunkVersion() {
             // clock unchanged, when the write fails or no higher ceiling
             // exists. The wait counts from here, so a writer blocked behind
             // another writer's extension counts too.
-            const auto waiting = std::chrono::steady_clock::now();
-            {
-                std::unique_lock lock(version_clock_mutex_);
+            struct RecordWait {
+                std::atomic<std::uint64_t>& total;
+                std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+                ~RecordWait() { total.fetch_add(MicrosecondsSince(started), std::memory_order_relaxed); }
+            } waiting{stats_version_clock_wait_us_};
+            std::unique_lock lock(version_clock_mutex_);
+            candidate = version_clock_.load(std::memory_order_seq_cst);
+            if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+                AdvanceVersionClockCeilingLocked(lock, candidate);
                 candidate = version_clock_.load(std::memory_order_seq_cst);
-                if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
-                    AdvanceVersionClockCeilingLocked(lock, candidate);
-                    candidate = version_clock_.load(std::memory_order_seq_cst);
-                }
             }
-            stats_version_clock_wait_us_.fetch_add(MicrosecondsSince(waiting), std::memory_order_relaxed);
             continue;
         }
         // Sequentially consistent: a write loads the open-transaction count

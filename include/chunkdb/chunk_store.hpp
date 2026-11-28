@@ -45,6 +45,7 @@ class SnapshotGenerationMapping;
 class ChunkCoordinateIndex;
 struct ChunkCoordinateNode;
 struct ChunkIndexRecord;
+struct VersionClockWaitTestHook;
 
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
@@ -204,7 +205,7 @@ struct StoreRuntimeStats {
     std::uint64_t txn_history_copied_bytes = 0;
     std::uint64_t txn_history_bytes = 0;
     // Durable writes of the version clock ceiling and their total time, and
-    // the time writers waited for a ceiling, each waiting writer counted.
+    // each writer's time spent obtaining a ceiling, including failed attempts.
     std::uint64_t version_clock_extensions = 0;
     std::uint64_t version_clock_extension_us = 0;
     std::uint64_t version_clock_wait_us = 0;
@@ -1116,6 +1117,10 @@ class ChunkStore {
     void ArmVersionClockExtensionPauseForTests();
     [[nodiscard]] bool WaitForVersionClockExtensionPauseForTests();
     void ResumeVersionClockExtensionForTests(bool fail);
+    // Install while no clock waiters are running and keep it alive until they finish.
+    void SetVersionClockWaitHookForTests(VersionClockWaitTestHook* hook) noexcept {
+        version_clock_wait_hook_.store(hook, std::memory_order_release);
+    }
     // Takes the next version token, as a mutation does.
     [[nodiscard]] std::uint64_t ReserveChunkVersionForTests() { return NextChunkVersion(); }
     // The durable ceiling no issued token reaches.
@@ -1531,6 +1536,7 @@ class ChunkStore {
     bool version_clock_pause_reached_ = false;
     bool version_clock_pause_resumed_ = false;
     bool version_clock_pause_fail_ = false;
+    std::atomic<VersionClockWaitTestHook*> version_clock_wait_hook_{nullptr};
     std::atomic<bool> wal_open_pause_armed_{false};
     std::atomic<bool> wal_dir_prepare_pause_armed_{false};
     bool wal_dir_prepare_pause_reached_ = false;

@@ -777,6 +777,8 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_version_clock_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_version_clock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME version_clock COMMAND chunkdb_version_clock_test)
+    add_test(NAME version_clock_crash COMMAND chunkdb_version_clock_test --crash-boundaries)
+    set_tests_properties(version_clock_crash PROPERTIES TIMEOUT 300)
 
     add_executable(
         chunkdb_read_only_intent_replay_test
@@ -1537,6 +1539,7 @@ if(CHUNKDB_BUILD_TESTS)
         commit_owner_artifact_io_crash
         commit_group_coordinator_crash
         recover_table
+        version_clock_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)
