@@ -572,7 +572,7 @@ void TestFailedNameMoveVersions(bool swap, const char* point, bool raised) {
         }
     }
     {
-        txn_test::ScopedEnv fail(point, "1");
+        chunkdb::txn_test::ScopedEnv fail(point, "1");
         ExpectError(f.Run(swap ? "SWAP TABLES bank, other" : "ALTER TABLE bank RENAME TO moved"), "INTERNAL");
     }
     for (std::size_t j = 0U; j < coords.size(); ++j) {
